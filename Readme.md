@@ -1,4 +1,4 @@
-# Log-Based Attack Detection Framework
+# Log-Based Attack Detection (LBAD) framework
 
 This repository provides a framework for detecting and classifying attacks in system logs using FastText embeddings and traditional machine learning algorithms.
 
