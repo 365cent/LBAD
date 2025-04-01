@@ -1,21 +1,21 @@
-# Log-Based Attack Detection (LBAD) framework
+# Log-Based Attack Detection (LBAD) Framework
 
-This repository provides a framework for detecting and classifying attacks in system logs using FastText embeddings and traditional machine learning algorithms.
+A robust framework for detecting and classifying attacks in system logs using advanced embedding techniques and machine learning models.
 
 ## Overview
 
-The framework addresses challenges in log-based attack detection by:
-- Representing unstructured log data with FastText embeddings.
-- Applying machine learning models (Random Forest, XGBoost, SVM) for attack classification.
-- Exploring advanced techniques like GAN-based data augmentation and Granite embeddings.
+LBAD tackles challenges in log-based attack detection by:
+- Representing unstructured log data with FastText and Word2Vec embeddings.
+- Leveraging machine learning models (Random Forest, XGBoost, SVM) for accurate classification.
+- Mitigating class imbalance with GAN-based data augmentation.
 
 ## Features
 
 - **Log Preprocessing**: Tokenization, normalization, and filtering of raw logs.
-- **FastText Embeddings**: Semantic representation of log entries.
-- **Machine Learning Models**: Random Forest, XGBoost, and SVM for classification.
-- **Optional Enhancements**: GAN-based augmentation and Granite embeddings.
-- **Evaluation Metrics**: Precision, recall, F1-score, and ROC-AUC for imbalanced datasets.
+- **Embedding Generation**: FastText and Word2Vec for semantic vector representations.
+- **Machine Learning Models**: Random Forest, XGBoost, and SVM optimized for imbalanced datasets.
+- **Data Augmentation**: GAN-based synthetic data generation.
+- **Evaluation Metrics**: Precision, recall, F1-score, and ROC-AUC.
 
 ## Getting Started
 
@@ -41,14 +41,14 @@ The framework addresses challenges in log-based attack detection by:
 
 ### Complete Pipeline
 
-Run the entire pipeline with a single command:
+Run the entire workflow:
 ```bash
 make all
 ```
 
 ### Individual Components
 
-- **Preprocessing**: Parse and normalize logs
+- **Preprocessing**:
   ```bash
   make preprocess
   ```
@@ -62,14 +62,14 @@ make all
 - **Machine Learning**:
   ```bash
   make ml        # Run all ML models
-  make ml-rf     # Run Random Forest classifier
-  make ml-xgb    # Run XGBoost classifier
-  make ml-svm    # Run SVM classifier
+  make ml-rf     # Random Forest classifier
+  make ml-xgb    # XGBoost classifier
+  make ml-svm    # SVM classifier
   ```
 
 - **Data Augmentation**:
   ```bash
-  make gan       # Run GAN-based data augmentation
+  make gan
   ```
 
 ### Cleanup
@@ -84,33 +84,33 @@ make clean-all   # Remove all generated data
 
 ```
 .
-├── logs/                       # Raw log from AIT Log Data Set V2.0
-├── labels/                     # Labels from AIT Log Data Set V2.0
+├── logs/                       # Raw log dataset
+├── labels/                     # Ground truth annotations
 ├── src/                        # Source code
 │   ├── preprocessing.py        # Log preprocessing
 │   ├── preprocess_testing.py   # Testing for preprocessing
 │   ├── fasttext_embedding.py   # FastText embedding generation
 │   ├── word2vec_embedding.py   # Word2Vec embedding generation
 │   ├── embedding_testing.py    # Testing for embeddings
-│   ├── ml_models.py            # Machine learning model training
+│   ├── ml_models.py            # Machine learning models
 │   ├── gan_augmentation.py     # GAN-based data augmentation
 │   ├── granite_embedding.py.dist # Granite embedding implementation (placeholder)
-│   └── main.py                 # Main workflow orchestration
+│   └── main.py                 # Workflow orchestration
 ├── Makefile                    # Build automation
 └── requirements.txt            # Dependencies
 ```
 
 ## Evaluation Metrics
 
-- **Precision**: Avoid false positives.
-- **Recall**: Detect all attack instances.
-- **F1-Score**: Balance between precision and recall.
-- **ROC-AUC**: Distinguish between normal and attack classes.
+- **Precision**: Reduces false positives.
+- **Recall**: Ensures comprehensive attack detection.
+- **F1-Score**: Balances precision and recall.
+- **ROC-AUC**: Measures classification performance across thresholds.
 
 ## Advanced Techniques
 
-- **GAN-Based Augmentation**: Address class imbalance by generating synthetic log entries.
-- **Granite Embeddings**: Capture structural relationships in log data for complex attack patterns.
+- **GAN Augmentation**: Generates synthetic data to address class imbalance.
+- **Embedding Optimization**: FastText and Word2Vec for efficient log representation.
 
 ## License
 
@@ -131,6 +131,6 @@ If you use this framework in your research, please cite:
 
 ## Acknowledgments
 
-- **FastText**: For embedding implementation.
+- **FastText & Word2Vec**: For embedding implementations.
 - **AIT Log Data Set**: For benchmark datasets.
 - **Open-Source Community**: For tools and libraries.
