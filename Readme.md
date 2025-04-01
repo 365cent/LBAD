@@ -74,10 +74,8 @@ make clean
 
 ```
 .
-├── processed/              # Processed log data
-├── embeddings/             # Generated embeddings
-├── models/                 # Trained models
-├── results/                # Evaluation results
+├── logs/                   # Raw log from AIT Log Data Set V2.0
+├── labels/                 # Labels from AIT Log Data Set V2.0
 ├── src/                    # Source code
 │   ├── preprocessing.py    # Log preprocessing
 │   ├── fasttext_embedding.py # FastText embedding generation
