@@ -28,8 +28,8 @@ The framework addresses challenges in log-based attack detection by:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/log-attack-detection.git
-   cd log-attack-detection
+   git clone https://github.com/365cent/LBAD.git
+   cd LBAD
    ```
 
 2. Install dependencies:
@@ -106,11 +106,11 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 If you use this framework in your research, please cite:
 ```
 @misc{log_attack_detection,
-  author = {Your Name},
+  author = {365cent},
   title = {Log-Based Attack Detection Framework},
   year = {2025},
   publisher = {GitHub},
-  url = {https://github.com/yourusername/log-attack-detection}
+  url = {https://github.com/365cent/LBAD}
 }
 ```
 
