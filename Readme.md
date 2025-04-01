@@ -56,33 +56,53 @@ make all
 - **Embedding Generation**:
   ```bash
   make embed     # FastText embeddings
+  make word2vec  # Word2Vec embeddings
   ```
 
 - **Machine Learning**:
   ```bash
-  make test      # Run testing script
+  make ml        # Run all ML models
+  make ml-rf     # Run Random Forest classifier
+  make ml-xgb    # Run XGBoost classifier
+  make ml-svm    # Run SVM classifier
+  ```
+
+- **Data Augmentation**:
+  ```bash
+  make gan       # Run GAN-based data augmentation
   ```
 
 ### Cleanup
 
 Remove generated files:
 ```bash
-make clean
+make clean       # Remove cache files
+make clean-all   # Remove all generated data
 ```
 
 ## Project Structure
 
 ```
 .
-├── logs/                   # Raw log from AIT Log Data Set V2.0
-├── labels/                 # Labels from AIT Log Data Set V2.0
-├── src/                    # Source code
-│   ├── preprocessing.py    # Log preprocessing
-│   ├── fasttext_embedding.py # FastText embedding generation
-│   ├── testing.py          # Testing script
-│   └── main.py             # Main workflow orchestration
-├── Makefile                # Build automation
-└── requirements.txt        # Dependencies
+├── logs/                       # Raw log from AIT Log Data Set V2.0
+├── labels/                     # Labels from AIT Log Data Set V2.0
+├── processed/                  # Processed log data
+├── embeddings/                 # Embedding vectors
+├── models/                     # Trained ML and GAN models
+├── results/                    # Evaluation results and visualizations
+├── augmented/                  # GAN-generated synthetic data
+├── src/                        # Source code
+│   ├── preprocessing.py        # Log preprocessing
+│   ├── preprocess_testing.py   # Testing for preprocessing
+│   ├── fasttext_embedding.py   # FastText embedding generation
+│   ├── word2vec_embedding.py   # Word2Vec embedding generation
+│   ├── embedding_testing.py    # Testing for embeddings
+│   ├── ml_models.py            # Machine learning model training
+│   ├── gan_augmentation.py     # GAN-based data augmentation
+│   ├── granite_embedding.py.dist # Granite embedding implementation (placeholder)
+│   └── main.py                 # Main workflow orchestration
+├── Makefile                    # Build automation
+└── requirements.txt            # Dependencies
 ```
 
 ## Evaluation Metrics
