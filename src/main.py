@@ -26,9 +26,10 @@ RESULTS_DIR = BASE_DIR / "results"
 LOGS_DIR = BASE_DIR / "logs"
 LABELS_DIR = BASE_DIR / "labels"
 AUGMENTED_DIR = BASE_DIR / "augmented"
+EVAL_DIR = BASE_DIR / "evaluation"
 
 # Ensure directories exist
-for directory in [PROCESSED_DIR, EMBEDDING_DIR, MODEL_DIR, RESULTS_DIR, AUGMENTED_DIR]:
+for directory in [PROCESSED_DIR, EMBEDDING_DIR, MODEL_DIR, RESULTS_DIR, AUGMENTED_DIR, EVAL_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 def run_script(script_name, description, args=None):
@@ -70,20 +71,17 @@ def parse_arguments():
     parser.add_argument('--test', action='store_true',
                         help='Run testing utilities')
     
-    parser.add_argument('--ml', action='store_true',
-                        help='Train and evaluate machine learning models')
-    
-    parser.add_argument('--ml-model', choices=['rf', 'xgb', 'svm', 'all', 'fast'],
-                        default='fast', help='ML model to train (default: fast = rf+xgb)')
-    
-    parser.add_argument('--include-svm', action='store_true',
-                        help='Include SVM model (can be very slow)')
-    
     parser.add_argument('--gan', action='store_true',
                         help='Run GAN-based data augmentation')
     
-    parser.add_argument('--evaluate-only', action='store_true',
-                        help='Only evaluate existing ML models (no training)')
+    parser.add_argument('--evaluate', action='store_true',
+                        help='Run GAN evaluation')
+    
+    parser.add_argument('--eval-model', choices=['rf', 'xgb', 'all'],
+                        default='all', help='Models to evaluate (default: all)')
+    
+    parser.add_argument('--eval-data', choices=['original', 'augmented', 'both'],
+                        default='both', help='Data to evaluate (default: both)')
     
     parser.add_argument('--all', action='store_true',
                         help='Run all steps')
@@ -98,13 +96,13 @@ def main():
     args = parse_arguments()
     
     # If --all is specified or no arguments provided, run all steps
-    if args.all or not any([args.preprocess, args.fasttext, args.word2vec, args.test, args.ml, args.gan]):
+    if args.all or not any([args.preprocess, args.fasttext, args.word2vec, args.test, args.gan, args.evaluate]):
         args.preprocess = True
         args.test = False
         args.fasttext = True
         args.word2vec = True
-        args.ml = True
         args.gan = True
+        args.evaluate = True
     
     # Track successful steps
     successful = []
@@ -136,46 +134,7 @@ def main():
             print("Exiting due to FastText embedding failure")
             return
     
-    # Step 4a: Machine Learning Models with FastText embeddings
-    if args.ml and args.fasttext and ('fasttext' in successful or not args.fasttext):
-        # Run Random Forest model
-        if args.ml_model in ['rf', 'fast', 'all']:
-            ml_args = ['--model', 'rf']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'FastText-based Random Forest Model', ml_args):
-                successful.append('ml-fasttext-rf')
-            elif not args.skip_errors:
-                print("Exiting due to FastText RF ML failure")
-                return
-        
-        # Run XGBoost model
-        if args.ml_model in ['xgb', 'fast', 'all']:
-            ml_args = ['--model', 'xgb']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'FastText-based XGBoost Model', ml_args):
-                successful.append('ml-fasttext-xgb')
-            elif not args.skip_errors:
-                print("Exiting due to FastText XGBoost ML failure")
-                return
-        
-        # Run SVM separately if requested
-        if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
-            print("\nRunning SVM model separately (this may take a while)...")
-            ml_args = ['--model', 'svm', '--include-svm']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'FastText-based SVM Model', ml_args):
-                successful.append('ml-fasttext-svm')
-            elif not args.skip_errors:
-                print("Exiting due to FastText SVM failure")
-                return
-    
-    # Step 5a: GAN Augmentation with FastText embeddings
+    # Step 4a: GAN Augmentation with FastText embeddings
     if args.gan and args.fasttext and ('fasttext' in successful or not args.fasttext):
         if run_script('gan_augmentation.py', 'FastText-based GAN Augmentation'):
             successful.append('gan-fasttext')
@@ -194,51 +153,29 @@ def main():
             print("Exiting due to Word2Vec embedding failure")
             return
     
-    # Step 4b: Machine Learning Models with Word2Vec embeddings
-    if args.ml and args.word2vec and ('word2vec' in successful or not args.word2vec):
-        # Run Random Forest model
-        if args.ml_model in ['rf', 'fast', 'all']:
-            ml_args = ['--model', 'rf']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'Word2Vec-based Random Forest Model', ml_args):
-                successful.append('ml-word2vec-rf')
-            elif not args.skip_errors:
-                print("Exiting due to Word2Vec RF ML failure")
-                return
-        
-        # Run XGBoost model
-        if args.ml_model in ['xgb', 'fast', 'all']:
-            ml_args = ['--model', 'xgb']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'Word2Vec-based XGBoost Model', ml_args):
-                successful.append('ml-word2vec-xgb')
-            elif not args.skip_errors:
-                print("Exiting due to Word2Vec XGBoost ML failure")
-                return
-        
-        # Run SVM separately if requested
-        if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
-            print("\nRunning SVM model separately (this may take a while)...")
-            ml_args = ['--model', 'svm', '--include-svm']
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', 'Word2Vec-based SVM Model', ml_args):
-                successful.append('ml-word2vec-svm')
-            elif not args.skip_errors:
-                print("Exiting due to Word2Vec SVM failure")
-                return
-    
-    # Step 5b: GAN Augmentation with Word2Vec embeddings
+    # Step 4b: GAN Augmentation with Word2Vec embeddings
     if args.gan and args.word2vec and ('word2vec' in successful or not args.word2vec):
         if run_script('gan_augmentation.py', 'Word2Vec-based GAN Augmentation'):
             successful.append('gan-word2vec')
         elif not args.skip_errors:
             print("Exiting due to Word2Vec GAN failure")
+            return
+    
+    # Evaluation
+    # ==========
+    
+    # Step 5: Evaluate GAN augmentation
+    if args.evaluate and (any('gan-' in step for step in successful) or not args.gan):
+        eval_args = []
+        if args.eval_model != 'all':
+            eval_args.extend(['--models', args.eval_model])
+        if args.eval_data != 'both':
+            eval_args.extend(['--data', args.eval_data])
+            
+        if run_script('gan_evaluation.py', 'GAN Augmentation Evaluation', eval_args):
+            successful.append('evaluation')
+        elif not args.skip_errors:
+            print("Exiting due to evaluation failure")
             return
     
     # Summary
@@ -249,11 +186,13 @@ def main():
         print("No steps were executed successfully.")
     
     # Print final results location
-    if any('ml-' in step for step in successful):
-        print(f"\nML results available in: {RESULTS_DIR}")
+    if 'evaluation' in successful:
+        print(f"\nEvaluation results available in: {EVAL_DIR}")
     
     if any('gan-' in step for step in successful):
         print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
+    
+    print(f"All results available in project directory: {BASE_DIR}")
 
 if __name__ == "__main__":
     main()
