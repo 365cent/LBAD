@@ -196,18 +196,30 @@ def main():
     
     # Step 4b: Machine Learning Models with Word2Vec embeddings
     if args.ml and args.word2vec and ('word2vec' in successful or not args.word2vec):
-        # Run fast models first (RF & XGB)
-        if args.ml_model in ['fast', 'all']:
-            ml_args = ['--model', 'fast']
+        # Run Random Forest model
+        if args.ml_model in ['rf', 'fast', 'all']:
+            ml_args = ['--model', 'rf']
             if args.evaluate_only:
                 ml_args.append('--evaluate-only')
                 
-            if run_script('ml_models.py', 'Word2Vec-based Fast ML Models (RF+XGB)', ml_args):
-                successful.append('ml-word2vec-fast')
+            if run_script('ml_models.py', 'Word2Vec-based Random Forest Model', ml_args):
+                successful.append('ml-word2vec-rf')
             elif not args.skip_errors:
-                print("Exiting due to Word2Vec fast ML failure")
+                print("Exiting due to Word2Vec RF ML failure")
                 return
+        
+        # Run XGBoost model
+        if args.ml_model in ['xgb', 'fast', 'all']:
+            ml_args = ['--model', 'xgb']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
                 
+            if run_script('ml_models.py', 'Word2Vec-based XGBoost Model', ml_args):
+                successful.append('ml-word2vec-xgb')
+            elif not args.skip_errors:
+                print("Exiting due to Word2Vec XGBoost ML failure")
+                return
+        
         # Run SVM separately if requested
         if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
             print("\nRunning SVM model separately (this may take a while)...")
@@ -219,18 +231,6 @@ def main():
                 successful.append('ml-word2vec-svm')
             elif not args.skip_errors:
                 print("Exiting due to Word2Vec SVM failure")
-                return
-        
-        # Run specific model if requested (and not already run)
-        if args.ml_model in ['rf', 'xgb'] and args.ml_model not in ['fast', 'all']:
-            ml_args = ['--model', args.ml_model]
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', f'Word2Vec-based {args.ml_model.upper()} Model', ml_args):
-                successful.append(f'ml-word2vec-{args.ml_model}')
-            elif not args.skip_errors:
-                print(f"Exiting due to Word2Vec {args.ml_model.upper()} failure")
                 return
     
     # Step 5b: GAN Augmentation with Word2Vec embeddings
