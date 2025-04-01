@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Granite Embedding for Log Data
+-----------------------------
+This script implements Granite embedding for log data,
+combining word embeddings with graph-based representations.
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import pickle
+import networkx as nx
+from gensim.models import FastText
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+
+# Define constants
+DATA_DIR = "processed_data"  # Directory containing processed log data
+EMBEDDING_DIR = "embeddings"  # Directory containing embeddings
+MODEL_DIR = "models"  # Directory to store trained models
+RESULTS_DIR = "results"  # Directory to store evaluation results
+RANDOM_SEED = 42  # For reproducibility
+
+# Create output directories if they don't exist
+os.makedirs(EMBEDDING_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def load_processed_data(file_path):
+    """
+    Load preprocessed log data from CSV file.
+    
+    Args:
+        file_path (str): Path to the CSV file
+        
+    Returns:
+        pd.DataFrame: DataFrame containing preprocessed log data
+    """
+    df = pd.read_csv(file_path)
+    
+    # Convert string representation of tokens back to list if needed
+    if 'tokens' in df.columns and isinstance(df['tokens'].iloc[0], str):
+        df['tokens'] = df['tokens'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+    
+    return df
+
+def load_fasttext_model(model_path):
+    """
+    Load a trained FastText model.
+    
+    Args:
+        model_path (str): Path to the saved model
+        
+    Returns:
+        FastText: Loaded FastText model
+    """
+    model = FastText.load(model_path)
+    print(f"FastText model loaded from {model_path}")
+    return model
+
+def build_log_graph(df, window_size=5):
+    """
+    Build a graph representation of log data.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing preprocessed log data
+        window_size (int): Window size for co-occurrence
+        
+    Returns:
+        nx.Graph: Graph representation of log data
+    """
+    print("Building log graph...")
+    G = nx.Graph()
+    
+    # Add nodes for each unique token
+    all_tokens = set()
+    for tokens in df['tokens']:
+        if isinstance(tokens, list):
+            all_tokens.update(tokens)
+    
+    for token in all_tokens:
+        G.add_node(token)
+    
+    # Add edges for co-occurring tokens within window
+    for tokens in tqdm(df['tokens'], desc="Processing log entries"):
+        if not isinstance(tokens, list) or len(tokens) < 2:
+            continue
+        
+        for i in range(len(tokens)):
+            for j in range(i+1, min(i+window_size+1, len(tokens))):
+                token1 = tokens[i]
+                token2 = tokens[j]
+                
+                # Add edge or increment weight if edge already exists
+                if G.has_edge(token1, token2):
+                    G[token1][token2]['weight'] += 1
+                else:
+                    G.add_edge(token1, token2, weight=1)
+    
+    print(f"Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    return G
+
+def compute_node_centrality(G):
+    """
+    Compute centrality measures for graph nodes.
+    
+    Args:
+        G (nx.Graph): Graph representation of log data
+        
+    Returns:
+        dict: Dictionary of node centrality measures
+    """
+    print("Computing node centrality measures...")
+    
+    # Compute degree centrality
+    degree_centrality = nx.degree_centrality(G)
+    
+    # Compute eigenvector centrality (may fail for disconnected graphs)
+    try:
+        eigenvector_centrality = nx.eigenvector_centrality(G, max_iter=1000)
+    except:
+        print("Warning: Eigenvector centrality computation failed, using degree centrality instead")
+        eigenvector_centrality = degree_centrality
+    
+    # Compute betweenness centrality for a sample of nodes (full computation can be slow)
+    if G.number_of_nodes() > 1000:
+        print("Computing approximate betweenness centrality (sampling nodes)...")
+        betweenness_centrality = nx.betweenness_centrality(G, k=min(500, G.number_of_nodes()))
+    else:
+        betweenness_centrality = nx.betweenness_centrality(G)
+    
+    # Combine centrality measures
+    centrality = {}
+    for node in G.nodes():
+        centrality[node] = {
+            'degree': degree_centrality.get(node, 0),
+            'eigenvector': eigenvector_centrality.get(node, 0),
+            'betweenness': betweenness_centrality.get(node, 0)
+        }
+    
+    return centrality
+
+def generate_granite_embeddings(df, fasttext_model, centrality, embedding_dim=100):
+    """
+    Generate Granite embeddings by combining FastText with graph-based features.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing preprocessed log data
+        fasttext_model: Trained FastText model
+        centrality (dict): Dictionary of node centrality measures
+        embedding_dim (int): Dimension of the FastText embeddings
+        
+    Returns:
+        np.ndarray: Granite embeddings matrix
+    """
+    print("Generating Granite embeddings...")
+    
+    # Initialize embeddings matrix
+    n_samples = len(df)
+    # FastText embeddings + 3 centrality measures
+    granite_dim = embedding_dim + 3
+    granite_embeddings = np.zeros((n_samples, granite_dim))
+    
+    # Generate embeddings for each log entry
+    for i, tokens in enumerate(tqdm(df['tokens'], desc="Processing log entries")):
+        if not isinstance(tokens, list) or not tokens:
+            continue
+        
+        # Get FastText embeddings for tokens
+        token_embeddings = []
+        for token in tokens:
+            if token in fasttext_model.wv:
+                token_embeddings.append(fasttext_model.wv[token])
+        
+        # If no tokens have embeddings, use zero vector
+        if not token_embeddings:
+            continue
+        
+        # Average the FastText embeddings
+        fasttext_embedding = np.mean(token_embeddings, axis=0)
+        
+        # Get centrality features for tokens
+        degree_centralities = []
+        eigenvector_centralities = []
+        betweenness_centralities = []
+        
+        for token in tokens:
+            if token in centrality:
+                degree_centralities.append(centrality[token]['degree'])
+                eigenvector_centralities.append(centrality[token]['eigenvector'])
+                betweenness_centralities.append(centrality[token]['betweenness'])
+        
+        # Average the centrality measures
+        avg_degree = np.mean(degree_centralities) if degree_centralities else 0
+        avg_eigenvector = np.mean(eigenvector_centralities) if eigenvector_centralities else 0
+        avg_betweenness = np.mean(betweenness_centralities) if betweenness_centralities else 0
+        
+        # Combine FastText embeddings with centrality measures
+        granite_embedding = np.concatenate([
+            fasttext_embedding,
+            [avg_degree, avg_eigenvector, avg_betweenness]
+        ])
+        
+        granite_embeddings[i] = granite_embedding
+    
+    return granite_embeddings
+
+def save_embeddings(embeddings, file_path):
+    """
+    Save embeddings to a file.
+    
+    Args:
+        embeddings (np.ndarray): Embeddings matrix
+        file_path (str): Path to save the embeddings
+    """
+    with open(file_path, 'wb') as f:
+        pickle.dump(embeddings, f)
+    print(f"Embeddings saved to {file_path}")
+
+def visualize_embeddings(embeddings, labels, output_file=None):
+    """
+    Visualize embeddings using t-SNE.
+    
+    Args:
+        embeddings (np.ndarray): Embeddings matrix
+        labels (list): List of labels for each embedding
+        output_file (str, optional): Path to save the visualization
+    """
+    # Convert labels to numeric for coloring
+    unique_labels = sorted(set(labels))
+    label_to_id = {label: i for i, label in enumerate(unique_labels)}
+    numeric_labels = [label_to_id[label] for label in labels]
+    
+    # Apply t-SNE for dimensionality reduction
+    print("Applying t-SNE for visualization...")
+    tsne = TSNE(n_components=2, random_state=RANDOM_SEED, perplexity=30)
+    reduced_embeddings = tsne.fit_transform(embeddings)
+    
+    # Create a DataFrame for plotting
+    df = pd.DataFrame({
+        'x': reduced_embeddings[:, 0],
+        'y': reduced_embeddings[:, 1],
+        'label': labels
+    })
+    
+    # Plot the embeddings
+    plt.figure(figsize=(12, 10))
+    sns.scatterplot(x='x', y='y', hue='label', data=df, palette='viridis', alpha=0.7)
+    plt.title('t-SNE Visualization of Granite Embeddings')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    if output_file:
+        plt.savefig(output_file, bbox_inches='tight', dpi=300)
+        print(f"Visualization saved to {output_file}")
+    else:
+        plt.show()
+
+def compare_embeddings(fasttext_embeddings, granite_embeddings, labels, output_file=None):
+    """
+    Compare FastText and Granite embeddings using t-SNE visualization.
+    
+    Args:
+        fasttext_embeddings (np.ndarray): FastText embeddings matrix
+        granite_embeddings (np.ndarray): Granite embeddings matrix
+        labels (list): List of labels for each embedding
+        output_file (str, optional): Path to save the visualization
+    """
+    # Sample a subset for visualization (t-SNE can be slow for large datasets)
+    sample_size = min(5000, len(labels))
+    sample_indices = np.random.choice(len(labels), sample_size, replace=False)
+    
+    fasttext_sample = fasttext_embeddings[sample_indices]
+    granite_sample = granite_embeddings[sample_indices]
+    labels_sample = [labels[i] for i in sample_indices]
+    
+    # Apply t-SNE for dimensionality reduction
+    print("Applying t-SNE for FastText embeddings...")
+    tsne_fasttext = TSNE(n_components=2, random_state=RANDOM_SEED, perplexity=30)
+    reduced_fasttext = tsne_fasttext.fit_transform(fasttext_sample)
+    
+    print("Applying t-SNE for Granite embeddings...")
+    tsne_granite = TSNE(n_components=2, random_state=RANDOM_SEED, perplexity=30)
+    reduced_granite = tsne_granite.fit_transform(granite_sample)
+    
+    # Create DataFrames for plotting
+    df_fasttext = pd.DataFrame({
+        'x': reduced_fasttext[:, 0],
+        'y': reduced_fasttext[:, 1],
+        'label': labels_sample
+    })
+    
+    df_granite = pd.DataFrame({
+        'x': reduced_granite[:, 0],
+        'y': reduced_granite[:, 1],
+        'label': labels_sample
+    })
+    
+    # Plot the embeddings
+    plt.figure(figsize=(20, 10))
+    
+    plt.subplot(1, 2, 1)
+    sns.scatterplot(x='x', y='y', hue='label', data=df_fasttext, palette='viridis', alpha=0.7)
+    plt.title('FastText Embeddings')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.subplot(1, 2, 2)
+    sns.scatterplot(x='x', y='y', hue='label', data=df_granite, palette='viridis', alpha=0.7)
+    plt.title('Granite Embeddings')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    if output_file:
+        plt.savefig(output_file, bbox_inches='tight', dpi=300)
+        print(f"Comparison visualization saved to {output_file}")
+    else:
+        plt.show()
+
+def visualize_graph(G, output_file=None, max_nodes=100):
+    """
+    Visualize the log graph.
+    
+    Args:
+        G (nx.Graph): Graph representation of log data
+        output_file (str, optional): Path to save the visualization
+        max_nodes (int): Maximum number of nodes to visualize
+    """
+    # If graph is too large, sample a subgraph
+    if G.number_of_nodes() > max_nodes:
+        print(f"Graph is too large ({G.number_of_nodes()} nodes), sampling {max_nodes} nodes...")
+        # Get top nodes by degree
+        degrees = dict(G.degree())
+        top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+        nodes = [node for node, _ in top_nodes]
+        G_sub = G.subgraph(nodes)
+    else:
+        G_sub = G
+    
+    # Compute layout
+    print("Computing graph layout...")
+    pos = nx.spring_layout(G_sub, seed=RANDOM_SEED)
+    
+    # Get edge weights for width
+    weights = [G_sub[u][v]['weight'] for u, v in G_sub.edges()]
+    
+    # Normalize weights for visualization
+    max_weight = max(weights)
+    normalized_weights = [0.5 + 2.0 * w / max_weight for w in weights]
+    
+    # Plot the graph
+    plt.figure(figsize=(12, 12))
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(G_sub, pos, node_size=100, alpha=0.7)
+    
+    # Draw edges with varying width based on weight
+    nx.draw_networkx_edges(G_sub, pos, width=normalized_weights, alpha=0.5)
+    
+    # Draw labels for high-degree nodes
+    high_degree_nodes = {node: node for node, degree in dict(G_sub.degree()).items() if degree > G_sub.number_of_nodes() / 10}
+    nx.draw_networkx_labels(G_sub, pos, labels=high_degree_nodes, font_size=8)
+    
+    plt.title(f'Log Graph Visualization (showing {G_sub.number_of_nodes()} nodes)')
+    plt.axis('off')
+    
+    if output_file:
+        plt.savefig(output_file, bbox_inches='tight', dpi=300)
+        print(f"Graph visualization saved to {output_file}")
+    else:
+        plt.show()
+
+def main():
+    """Main function to orchestrate the Granite embedding workflow."""
+    # Load preprocessed data
+    train_file = os.path.join(DATA_DIR, "train.csv")
+    val_file = os.path.join(DATA_DIR, "val.csv")
+    test_file = os.path.join(DATA_DIR, "test.csv")
+    
+    train_df = load_processed_data(train_file)
+    val_df = load_processed_data(val_file)
+    test_df = load_processed_data(test_file)
+    
+    print(f"Loaded {len(train_df)} training, {len(val_df)} validation, and {len(test_df)} test samples")
+    
+    # Load FastText model
+    fasttext_model_path = os.path.join(MODEL_DIR, "fasttext_model.bin")
+    fasttext_model = load_fasttext_model(fasttext_model_path)
+    
+    # Load FastText embeddings
+    fasttext_train_embeddings_path = os.path.join(EMBEDDING_DIR, "train_embeddings.pkl")
+    fasttext_val_embeddings_path = os.path.join(EMBEDDING_DIR, "val_embeddings.pkl")
+    fasttext_test_embeddings_path = os.path.join(EMBEDDING_DIR, "test_embeddings.pkl")
+    
+    with open(fasttext_train_embeddings_path, 'rb') as f:
+        fasttext_train_embeddings = pickle.load(f)
+    
+    with open(fasttext_val_embeddings_path, 'rb') as f:
+        fasttext_val_embeddings = pickle.load(f)
+    
+    with open(fasttext_test_embeddings_path, 'rb') as f:
+        fasttext_test_embeddings = pickle.load(f)
+    
+    print("FastText embeddings loaded")
+    
+    # Build log graph from training data
+    log_graph = build_log_graph(train_df)
+    
+    # Visualize the graph
+    graph_output_file = os.path.join(RESULTS_DIR, "log_graph_visualization.png")
+    visualize_graph(log_graph, output_file=graph_output_file)
+    
+    # Compute node centrality
+    centrality = compute_node_centrality(log_graph)
+    
+    # Generate Granite embeddings
+    granite_train_embeddings = generate_granite_embeddings(
+        train_df, fasttext_model, centrality, embedding_dim=fasttext_train_embeddings.shape[1]
+    )
+    
+    granite_val_embeddings = generate_granite_embeddings(
+        val_df, fasttext_model, centrality, embedding_dim=fasttext_val_embeddings.shape[1]
+    )
+    
+    granite_test_embeddings = generate_granite_embeddings(
+        test_df, fasttext_model, centrality, embedding_dim=fasttext_test_embeddings.shape[1]
+    )
+    
+    # Save Granite embeddings
+    granite_train_embeddings_path = os.path.join(EMBEDDING_DIR, "granite_train_embeddings.pkl")
+    granite_val_embeddings_path = os.path.join(EMBEDDING_DIR, "granite_val_embeddings.pkl")
+    granite_test_embeddings_path = os.path.join(EMBEDDING_DIR, "granite_test_embeddings.pkl")
+    
+    save_embeddings(granite_train_embeddings, granite_train_embeddings_path)
+    save_embeddings(granite_val_embeddings, granite_val_embeddings_path)
+    save_embeddings(granite_test_embeddings, granite_test_embeddings_path)
+    
+    # Visualize and compare embeddings
+    if 'label' in train_df.columns:
+        # Sample a subset for visualization
+        sample_size = min(5000, len(train_df))
+        sample_indices = np.random.choice(len(train_df), sample_size, replace=False)
+        
+        sample_fasttext_embeddings = fasttext_train_embeddings[sample_indices]
+        sample_granite_embeddings = granite_train_embeddings[sample_indices]
+        sample_labels = train_df['label'].iloc[sample_indices].tolist()
+        
+        # Visualize Granite embeddings
+        granite_viz_output_file = os.path.join(RESULTS_DIR, "granite_embedding_visualization.png")
+        visualize_embeddings(
+            sample_granite_embeddings, 
+            sample_labels, 
+            output_file=granite_viz_output_file
+        )
+        
+        # Compare FastText and Granite embeddings
+        comparison_output_file = os.path.join(RESULTS_DIR, "embedding_comparison.png")
+        compare_embeddings(
+            sample_fasttext_embeddings,
+            sample_granite_embeddings,
+            sample_labels,
+            output_file=comparison_output_file
+        )
+    
+    print("Granite embedding complete!")
+
+if __name__ == "__main__":
+    main()
