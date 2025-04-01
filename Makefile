@@ -88,10 +88,10 @@ clean:
 # Clean all generated files including embeddings, models, and results, then run clean, use with caution
 clean-all:
 	rm -rf processed
-	rm -rf embedding
+	rm -rf embeddings
 	rm -rf models
 	rm -rf results
-	rm -rf augmentation
+	rm -rf augmented
 	$(MAKE) clean
 
 .PHONY: all install preprocess test embed word2vec ml ml-rf ml-xgb ml-svm ml-evaluate gan clean help clean-all
