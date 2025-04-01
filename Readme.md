@@ -86,11 +86,6 @@ make clean-all   # Remove all generated data
 .
 ├── logs/                       # Raw log from AIT Log Data Set V2.0
 ├── labels/                     # Labels from AIT Log Data Set V2.0
-├── processed/                  # Processed log data
-├── embeddings/                 # Embedding vectors
-├── models/                     # Trained ML and GAN models
-├── results/                    # Evaluation results and visualizations
-├── augmented/                  # GAN-generated synthetic data
 ├── src/                        # Source code
 │   ├── preprocessing.py        # Log preprocessing
 │   ├── preprocess_testing.py   # Testing for preprocessing
