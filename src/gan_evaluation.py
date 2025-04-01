@@ -32,10 +32,6 @@ EMB = ROOT / 'embeddings'
 MOD = ROOT / 'models'
 RES = ROOT / 'results'
 AUG = ROOT / 'augmented'
-EVAL = ROOT / 'evaluation'
-
-# Create evaluation directory if it doesn't exist
-EVAL.mkdir(exist_ok=True)
 
 # For Apple Silicon optimization
 CPU_COUNT = os.cpu_count()
@@ -177,7 +173,7 @@ def evaluate_model(model, X_train, y_train, X_test, y_test, model_name, data_typ
     print(report)
     
     # Save report to file
-    with open(EVAL / f"{model_name}_{data_type}_report.txt", 'w') as f:
+    with open(RES / f"{model_name}_{data_type}_report.txt", 'w') as f:
         f.write(f"{model_name.upper()} - {data_type.capitalize()} Data\n")
         f.write("-" * 50 + "\n")
         f.write(report)
@@ -198,7 +194,7 @@ def evaluate_model(model, X_train, y_train, X_test, y_test, model_name, data_typ
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(EVAL / f"{model_name}_{data_type}_cm.png", dpi=300, bbox_inches='tight')
+    plt.savefig(RES / f"{model_name}_{data_type}_cm.png", dpi=300, bbox_inches='tight')
     plt.close()
     
     return {
@@ -252,7 +248,7 @@ def compare_metrics(original_metrics, augmented_metrics, model_name):
     df = df.sort_values('Change', key=abs, ascending=False)
     
     # Save the comparison to CSV
-    df.to_csv(EVAL / f"{model_name}_metric_comparison.csv", index=False)
+    df.to_csv(RES / f"{model_name}_metric_comparison.csv", index=False)
     
     # Create comparison chart for top classes with significant changes
     plt.figure(figsize=(12, 10))
@@ -268,7 +264,7 @@ def compare_metrics(original_metrics, augmented_metrics, model_name):
     plt.ylabel('Class')
     plt.grid(axis='x', alpha=0.3)
     plt.tight_layout()
-    plt.savefig(EVAL / f"{model_name}_f1_changes.png", dpi=300, bbox_inches='tight')
+    plt.savefig(RES / f"{model_name}_f1_changes.png", dpi=300, bbox_inches='tight')
     plt.close()
     
     # Create a summary of overall metrics
@@ -282,7 +278,7 @@ def compare_metrics(original_metrics, augmented_metrics, model_name):
     ])
     
     # Save the summary
-    summary.to_csv(EVAL / f"{model_name}_overall_summary.csv", index=False)
+    summary.to_csv(RES / f"{model_name}_overall_summary.csv", index=False)
     
     # Create overall metrics comparison chart
     plt.figure(figsize=(10, 6))
@@ -304,7 +300,7 @@ def compare_metrics(original_metrics, augmented_metrics, model_name):
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    plt.savefig(EVAL / f"{model_name}_overall_comparison.png", dpi=300, bbox_inches='tight')
+    plt.savefig(RES / f"{model_name}_overall_comparison.png", dpi=300, bbox_inches='tight')
     plt.close()
     
     # Return the summary
@@ -382,7 +378,7 @@ def main():
                               ignore_index=True)
         
         # Save combined summary
-        df_all.to_csv(EVAL / "all_models_comparison.csv", index=False)
+        df_all.to_csv(RES / "all_models_comparison.csv", index=False)
         
         # Create visualization comparing all models
         plt.figure(figsize=(12, 8))
@@ -411,10 +407,10 @@ def main():
         plt.legend()
         plt.grid(axis='y', alpha=0.3)
         plt.tight_layout()
-        plt.savefig(EVAL / "all_models_f1_comparison.png", dpi=300, bbox_inches='tight')
+        plt.savefig(RES / "all_models_f1_comparison.png", dpi=300, bbox_inches='tight')
         plt.close()
     
-    print(f"\nEvaluation complete! Results saved to {EVAL}")
+    print(f"\nEvaluation complete! Results saved to {RES}")
 
 if __name__ == '__main__':
     main()
