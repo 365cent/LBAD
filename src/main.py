@@ -138,18 +138,30 @@ def main():
     
     # Step 4a: Machine Learning Models with FastText embeddings
     if args.ml and args.fasttext and ('fasttext' in successful or not args.fasttext):
-        # Run fast models first (RF & XGB)
-        if args.ml_model in ['fast', 'all']:
-            ml_args = ['--model', 'fast']
+        # Run Random Forest model
+        if args.ml_model in ['rf', 'fast', 'all']:
+            ml_args = ['--model', 'rf']
             if args.evaluate_only:
                 ml_args.append('--evaluate-only')
                 
-            if run_script('ml_models.py', 'FastText-based Fast ML Models (RF+XGB)', ml_args):
-                successful.append('ml-fasttext-fast')
+            if run_script('ml_models.py', 'FastText-based Random Forest Model', ml_args):
+                successful.append('ml-fasttext-rf')
             elif not args.skip_errors:
-                print("Exiting due to FastText fast ML failure")
+                print("Exiting due to FastText RF ML failure")
                 return
+        
+        # Run XGBoost model
+        if args.ml_model in ['xgb', 'fast', 'all']:
+            ml_args = ['--model', 'xgb']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
                 
+            if run_script('ml_models.py', 'FastText-based XGBoost Model', ml_args):
+                successful.append('ml-fasttext-xgb')
+            elif not args.skip_errors:
+                print("Exiting due to FastText XGBoost ML failure")
+                return
+        
         # Run SVM separately if requested
         if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
             print("\nRunning SVM model separately (this may take a while)...")
@@ -161,18 +173,6 @@ def main():
                 successful.append('ml-fasttext-svm')
             elif not args.skip_errors:
                 print("Exiting due to FastText SVM failure")
-                return
-        
-        # Run specific model if requested (and not already run)
-        if args.ml_model in ['rf', 'xgb'] and args.ml_model not in ['fast', 'all']:
-            ml_args = ['--model', args.ml_model]
-            if args.evaluate_only:
-                ml_args.append('--evaluate-only')
-                
-            if run_script('ml_models.py', f'FastText-based {args.ml_model.upper()} Model', ml_args):
-                successful.append(f'ml-fasttext-{args.ml_model}')
-            elif not args.skip_errors:
-                print(f"Exiting due to FastText {args.ml_model.upper()} failure")
                 return
     
     # Step 5a: GAN Augmentation with FastText embeddings
