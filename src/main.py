@@ -73,8 +73,11 @@ def parse_arguments():
     parser.add_argument('--ml', action='store_true',
                         help='Train and evaluate machine learning models')
     
-    parser.add_argument('--ml-model', choices=['rf', 'xgb', 'svm', 'all'],
-                        default='all', help='ML model to train (default: all)')
+    parser.add_argument('--ml-model', choices=['rf', 'xgb', 'svm', 'all', 'fast'],
+                        default='fast', help='ML model to train (default: fast = rf+xgb)')
+    
+    parser.add_argument('--include-svm', action='store_true',
+                        help='Include SVM model (can be very slow)')
     
     parser.add_argument('--gan', action='store_true',
                         help='Run GAN-based data augmentation')
@@ -135,17 +138,42 @@ def main():
     
     # Step 4a: Machine Learning Models with FastText embeddings
     if args.ml and args.fasttext and ('fasttext' in successful or not args.fasttext):
-        ml_args = []
-        if args.ml_model != 'all':
-            ml_args.extend(['--model', args.ml_model])
-        if args.evaluate_only:
-            ml_args.append('--evaluate-only')
-            
-        if run_script('ml_models.py', 'FastText-based Machine Learning Models', ml_args):
-            successful.append('ml-fasttext')
-        elif not args.skip_errors:
-            print("Exiting due to FastText ML failure")
-            return
+        # Run fast models first (RF & XGB)
+        if args.ml_model in ['fast', 'all']:
+            ml_args = ['--model', 'fast']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', 'FastText-based Fast ML Models (RF+XGB)', ml_args):
+                successful.append('ml-fasttext-fast')
+            elif not args.skip_errors:
+                print("Exiting due to FastText fast ML failure")
+                return
+                
+        # Run SVM separately if requested
+        if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
+            print("\nRunning SVM model separately (this may take a while)...")
+            ml_args = ['--model', 'svm', '--include-svm']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', 'FastText-based SVM Model', ml_args):
+                successful.append('ml-fasttext-svm')
+            elif not args.skip_errors:
+                print("Exiting due to FastText SVM failure")
+                return
+        
+        # Run specific model if requested (and not already run)
+        if args.ml_model in ['rf', 'xgb'] and args.ml_model not in ['fast', 'all']:
+            ml_args = ['--model', args.ml_model]
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', f'FastText-based {args.ml_model.upper()} Model', ml_args):
+                successful.append(f'ml-fasttext-{args.ml_model}')
+            elif not args.skip_errors:
+                print(f"Exiting due to FastText {args.ml_model.upper()} failure")
+                return
     
     # Step 5a: GAN Augmentation with FastText embeddings
     if args.gan and args.fasttext and ('fasttext' in successful or not args.fasttext):
@@ -168,17 +196,42 @@ def main():
     
     # Step 4b: Machine Learning Models with Word2Vec embeddings
     if args.ml and args.word2vec and ('word2vec' in successful or not args.word2vec):
-        ml_args = []
-        if args.ml_model != 'all':
-            ml_args.extend(['--model', args.ml_model])
-        if args.evaluate_only:
-            ml_args.append('--evaluate-only')
-            
-        if run_script('ml_models.py', 'Word2Vec-based Machine Learning Models', ml_args):
-            successful.append('ml-word2vec')
-        elif not args.skip_errors:
-            print("Exiting due to Word2Vec ML failure")
-            return
+        # Run fast models first (RF & XGB)
+        if args.ml_model in ['fast', 'all']:
+            ml_args = ['--model', 'fast']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', 'Word2Vec-based Fast ML Models (RF+XGB)', ml_args):
+                successful.append('ml-word2vec-fast')
+            elif not args.skip_errors:
+                print("Exiting due to Word2Vec fast ML failure")
+                return
+                
+        # Run SVM separately if requested
+        if args.ml_model == 'svm' or args.include_svm or args.ml_model == 'all':
+            print("\nRunning SVM model separately (this may take a while)...")
+            ml_args = ['--model', 'svm', '--include-svm']
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', 'Word2Vec-based SVM Model', ml_args):
+                successful.append('ml-word2vec-svm')
+            elif not args.skip_errors:
+                print("Exiting due to Word2Vec SVM failure")
+                return
+        
+        # Run specific model if requested (and not already run)
+        if args.ml_model in ['rf', 'xgb'] and args.ml_model not in ['fast', 'all']:
+            ml_args = ['--model', args.ml_model]
+            if args.evaluate_only:
+                ml_args.append('--evaluate-only')
+                
+            if run_script('ml_models.py', f'Word2Vec-based {args.ml_model.upper()} Model', ml_args):
+                successful.append(f'ml-word2vec-{args.ml_model}')
+            elif not args.skip_errors:
+                print(f"Exiting due to Word2Vec {args.ml_model.upper()} failure")
+                return
     
     # Step 5b: GAN Augmentation with Word2Vec embeddings
     if args.gan and args.word2vec and ('word2vec' in successful or not args.word2vec):
@@ -196,10 +249,10 @@ def main():
         print("No steps were executed successfully.")
     
     # Print final results location
-    if any(step.startswith('ml-') for step in successful):
+    if any('ml-' in step for step in successful):
         print(f"\nML results available in: {RESULTS_DIR}")
     
-    if any(step.startswith('gan-') for step in successful):
+    if any('gan-' in step for step in successful):
         print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
 
 if __name__ == "__main__":
