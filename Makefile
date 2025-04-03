@@ -1,127 +1,81 @@
-# Makefile for Log Analysis Project
+# Makefile for Python Project
 
 # Variables
-PYTHON := python3
-PIP := pip3
-MAIN := ./src/main.py
-REQUIREMENTS := requirements.txt
+PYTHON := python
+PIP := pip
+REQ := requirements.txt
+SRC := ./src
+PREPROCESS := $(SRC)/preprocessing.py
+TEST := $(SRC)/testing.py
+FASTTEXT := $(SRC)/fasttext_embedding.py
+WORD2VEC := $(SRC)/word2vec_embedding.py
+TFIDF := $(SRC)/tfidf_embedding.py
+ML := $(SRC)/ml_models.py
+MAIN := $(SRC)/main.py
+GAN := $(SRC)/gan_augmentation.py
 
-# Help command
+# Help
 help:
 	@echo "Available targets:"
-	@echo "  all           - Run complete pipeline (preprocessing, all embeddings, ML models)"
-	@echo "  install       - Install dependencies in the current Python environment"
-	@echo "  preprocess    - Run log preprocessing"
-	@echo "  test          - Run preprocessing testing utilities"
-	@echo "  embeddings    - Generate all embedding types (FastText, Word2Vec, TF-IDF)"
-	@echo "  fasttext      - Generate FastText embeddings"
-	@echo "  word2vec      - Generate Word2Vec embeddings"
-	@echo "  tfidf         - Generate TF-IDF embeddings"
-	@echo "  ml            - Run all ML models on all available embeddings"
-	@echo "  ml-fasttext   - Run ML models with FastText embeddings"
-	@echo "  ml-word2vec   - Run ML models with Word2Vec embeddings"
-	@echo "  ml-tfidf      - Run ML models with TF-IDF embeddings"
-	@echo "  ml-rf         - Run Random Forest model on default embeddings"
-	@echo "  ml-xgb        - Run XGBoost model on default embeddings"
-	@echo "  ml-svm        - Run SVM model on default embeddings"
-	@echo "  ml-knn        - Run KNN model on default embeddings"
-	@echo "  ml-lr         - Run Logistic Regression model on default embeddings"
-	@echo "  ml-no-svm     - Run all models except SVM (faster processing)"
-	@echo "  highperf      - Run optimized high-performance pipeline with system optimizations"
-	@echo "  run-full-with-skip - Run full pipeline skipping errors"
-	@echo "  optimize-system - Apply system optimizations for ML workloads"
-	@echo "  clean         - Clean up temporary files and caches"
-	@echo "  clean-all     - Clean all generated files (use with caution)"
-	@echo "  help          - Display this help message"
+	@echo "  all              Run full pipeline"
+	@echo "  install          Install dependencies"
+	@echo "  preprocess       Run preprocessing"
+	@echo "  test             Run testing"
+	@echo "  fasttext         Run FastText embeddings"
+	@echo "  word2vec         Run Word2Vec embeddings"
+	@echo "  tfidf            Run TF-IDF embeddings"
+	@echo "  ml               Run all ML models (FastText)"
+	@echo "  ml-[rf|xgb|knn|lr]     Run specific ML model (FastText)"
+	@echo "  ml-word2vec      Run ML models (Word2Vec)"
+	@echo "  ml-tfidf         Run ML models (TF-IDF)"
+	@echo "  ml-w2v-[rf|xgb]  Run specific ML model (Word2Vec)"
+	@echo "  ml-tfidf-[rf|xgb] Run specific ML model (TF-IDF)"
+	@echo "  ml-evaluate      Evaluate without training"
+	@echo "  ml-all-embeddings Run ML with all embeddings"
+	@echo "  gan              Run GAN augmentation"
+	@echo "  clean            Remove cache files"
+	@echo "  clean-all        Remove all outputs + cache"
+	@echo "  help             Show this message"
 
-# Run full pipeline
-all:
-	$(PYTHON) $(MAIN) --all
+# Targets
+all:        ; $(PYTHON) $(MAIN)
+install:    ; $(PIP) install -r $(REQ)
+preprocess: ; $(PYTHON) $(PREPROCESS)
+test:       ; $(PYTHON) $(TEST)
+fasttext:   ; $(PYTHON) $(FASTTEXT)
+word2vec:   ; $(PYTHON) $(WORD2VEC)
+tfidf:      ; $(PYTHON) $(TFIDF)
 
-# Install dependencies
-install:
-	$(PIP) install -r $(REQUIREMENTS)
+ml:         ; $(PYTHON) $(ML) --embedding-type fasttext
+ml-rf:      ; $(PYTHON) $(ML) --model rf --embedding-type fasttext
+ml-xgb:     ; $(PYTHON) $(ML) --model xgb --embedding-type fasttext
+ml-knn:     ; $(PYTHON) $(ML) --model knn --embedding-type fasttext
+ml-lr:      ; $(PYTHON) $(ML) --model lr --embedding-type fasttext
 
-# Data preprocessing
-preprocess:
-	$(PYTHON) $(MAIN) --preprocess
+ml-word2vec:    ; $(PYTHON) $(ML) --embedding-type word2vec
+ml-tfidf:       ; $(PYTHON) $(ML) --embedding-type tfidf
+ml-w2v-rf:      ; $(PYTHON) $(ML) --model rf --embedding-type word2vec
+ml-w2v-xgb:     ; $(PYTHON) $(ML) --model xgb --embedding-type word2vec
+ml-tfidf-rf:    ; $(PYTHON) $(ML) --model rf --embedding-type tfidf
+ml-tfidf-xgb:   ; $(PYTHON) $(ML) --model xgb --embedding-type tfidf
 
-# Testing utilities
-test:
-	$(PYTHON) $(MAIN) --test
+ml-all-embeddings:
+	$(MAKE) ml
+	$(MAKE) ml-word2vec
+	$(MAKE) ml-tfidf
 
-# All embeddings
-embeddings: fasttext word2vec tfidf
+ml-evaluate: ; $(PYTHON) $(ML) --no-train
+gan:         ; $(PYTHON) $(GAN)
 
-fasttext:
-	$(PYTHON) $(MAIN) --fasttext
-
-word2vec:
-	$(PYTHON) $(MAIN) --word2vec
-
-tfidf:
-	$(PYTHON) $(MAIN) --tfidf
-
-# Machine Learning models
-ml:
-	$(PYTHON) $(MAIN) --ml --all-embeddings
-
-ml-fasttext:
-	$(PYTHON) $(MAIN) --ml --fasttext
-
-ml-word2vec:
-	$(PYTHON) $(MAIN) --ml --word2vec
-
-ml-tfidf:
-	$(PYTHON) $(MAIN) --ml --tfidf
-
-ml-rf:
-	$(PYTHON) $(MAIN) --ml --model rf
-
-ml-xgb:
-	$(PYTHON) $(MAIN) --ml --model xgb
-
-ml-svm:
-	$(PYTHON) $(MAIN) --ml --model svm
-
-ml-knn:
-	$(PYTHON) $(MAIN) --ml --model knn
-
-ml-lr:
-	$(PYTHON) $(MAIN) --ml --model lr
-
-# Run all models except SVM (faster processing)
-ml-no-svm:
-	$(PYTHON) $(MAIN) --ml --model rf,xgb,knn,lr
-
-# High-performance run with system optimizations
-highperf:
-	@echo "Running high-performance ML pipeline with system optimizations..."
-	@sudo purge
-	@sudo nice -n -20 $(PYTHON) $(MAIN) --all
-
-# Run full pipeline and skip errors
-run-full-with-skip:
-	$(PYTHON) $(MAIN) --all --skip-errors
-
-# System optimization script
-optimize-system:
-	@echo "Applying system optimizations for ML workloads..."
-	@sudo purge
-	@echo "Memory cache cleared"
-	@sudo killall mds_stores || true
-	@echo "Spotlight indexing temporarily paused"
-	@echo "System optimized for ML workloads"
-
-# Cleanup
 clean:
-	rm -rf __pycache__/
-	rm -rf *.pyc
+	rm -rf __pycache__/ *.pyc
 	find . -name "__pycache__" -type d -exec rm -rf {} +
 	find . -name "*.pyc" -delete
 
 clean-all:
-	rm -rf processed embeddings models results augmented evaluation
+	rm -rf processed embeddings models results augmented
 	$(MAKE) clean
 
-.PHONY: all install preprocess test embeddings fasttext word2vec tfidf ml ml-fasttext ml-word2vec ml-tfidf ml-rf ml-xgb ml-svm ml-knn ml-lr ml-no-svm highperf run-full-with-skip optimize-system clean clean-all help
+.PHONY: all install preprocess test fasttext word2vec tfidf ml ml-rf ml-xgb ml-knn ml-lr \
+        ml-word2vec ml-tfidf ml-w2v-rf ml-w2v-xgb ml-tfidf-rf ml-tfidf-xgb ml-all-embeddings \
+        ml-evaluate gan clean clean-all help

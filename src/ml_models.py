@@ -17,7 +17,6 @@ import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
@@ -34,63 +33,6 @@ from tqdm import tqdm
 import tensorflow as tf
 import platform
 import subprocess
-
-# System performance optimization for Apple Silicon
-def optimize_macos_performance():
-    """Apply performance optimizations for ML workloads on macOS."""
-    print("Applying MacOS performance optimizations...")
-    
-    # Configure TensorFlow for maximum performance
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if physical_devices:
-        try:
-            # Enable memory growth to avoid allocating all GPU memory at once
-            for device in physical_devices:
-                tf.config.experimental.set_memory_growth(device, True)
-            print("✓ GPU memory growth enabled")
-        except Exception as e:
-            print(f"Error configuring GPU: {e}")
-    
-    # Set maximum thread priority
-    os.system("sudo renice -20 $$") # Requires password, might not work in all environments
-    
-    # Optimize NumPy thread settings
-    NP_THREAD_COUNT = max(1, os.cpu_count() or 4)
-    os.environ["OMP_NUM_THREADS"] = str(NP_THREAD_COUNT)
-    os.environ["MKL_NUM_THREADS"] = str(NP_THREAD_COUNT)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(NP_THREAD_COUNT)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(NP_THREAD_COUNT)
-    
-    # Optimize TensorFlow for Apple Silicon
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Reduce TF logging
-    os.environ["TF_MKL_ALLOC_MAX_BYTES"] = "10000000000"  # 10GB
-    os.environ["TF_USE_LEGACY_TENSORFLOW_OPTIMIZATIONS"] = "0"
-    
-    # Enable aggressive compiler optimizations
-    os.environ["CFLAGS"] = "-O3 -march=native -mtune=native"
-    os.environ["CXXFLAGS"] = "-O3 -march=native -mtune=native"
-    
-    # Disable CPU throttling if running as root (uncomment if you have sudo without password)
-    # This is generally not recommended as it can lead to thermal issues
-    # subprocess.run("sudo pmset -a lessbright 0", shell=True)
-    # subprocess.run("sudo pmset -a highperformance 1", shell=True)
-    
-    # Disable spotlight indexing during ML runs to free up I/O
-    # subprocess.run("sudo mdutil -a -i off", shell=True)
-    
-    # Optimize disk I/O by increasing read-ahead cache
-    if platform.machine() == 'arm64':  # Apple Silicon
-        print("✓ Running on Apple Silicon - using optimized ML libraries")
-        # Apple Silicon specific optimizations
-        tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
-        print("✓ XLA JIT compilation enabled")
-    
-    print("✓ System optimized for high-performance ML workloads")
-    
-    return True
-
-# Call optimization function before any ML operations
-optimize_macos_performance()
 
 # Project paths
 ROOT = Path(__file__).resolve().parent.parent
@@ -145,16 +87,7 @@ def create_models(random_state=42):
             use_label_encoder=False,
             verbosity=0
         ),
-        'svm': SVC(
-            kernel='rbf',
-            C=10.0,
-            gamma='scale',
-            probability=True,
-            random_state=random_state,
-            cache_size=2000,  # Allocate more cache for faster training
-            class_weight='balanced'  # Handle imbalanced classes
-        ),
-        'knn': KNeighborsClassifier(
+                'knn': KNeighborsClassifier(
             n_neighbors=5,
             weights='distance',
             algorithm='auto',
@@ -201,11 +134,18 @@ def load_embedding_data(embedding_type='fasttext'):
         print(f"Make sure to run the embedding generation script first.")
         sys.exit(1)
     
+    # Convert to numpy array if necessary
+    if not isinstance(X_train, np.ndarray):
+        X_train = np.array(X_train)
+    if not isinstance(X_test, np.ndarray):
+        X_test = np.array(X_test)
+    
     # Parse JSON label strings
     y_train = parse_labels(y_train_raw)
     y_test = parse_labels(y_test_raw)
     
     print(f"Loaded {len(X_train)} training samples, {len(X_test)} test samples")
+    print(f"Data shape - X_train: {X_train.shape}, X_test: {X_test.shape}")
     
     return X_train, y_train, X_test, y_test
 
@@ -214,6 +154,9 @@ def parse_labels(label_strings):
     parsed = []
     for label in label_strings:
         try:
+            if isinstance(label, bytes):
+                label = label.decode('utf-8')
+            
             data = json.loads(label)
             if isinstance(data, list):
                 if not data:  # Empty array means "normal"
@@ -222,11 +165,12 @@ def parse_labels(label_strings):
                     parsed.append(data[0])  # Use first label if multiple
             else:
                 parsed.append("unknown")
-        except:
+        except Exception as e:
+            print(f"Error parsing label: {label}. Using 'unknown'. Error: {e}")
             parsed.append("unknown")
     return parsed
 
-def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, label_encoder, results_dir):
+def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, label_encoder, results_dir, encoded=False):
     """Train and evaluate a single model."""
     model_path = MODELS_DIR / f'{model_name}.joblib'
     model_start_time = time.time()
@@ -242,9 +186,9 @@ def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, la
     # Generate predictions
     y_pred = model.predict(X_test)
     
-    # Convert numerical predictions back to strings for SVM and other models if needed
-    if isinstance(y_pred[0], (np.integer, int)):
-        y_pred = label_encoder.inverse_transform(y_pred)
+    # If using encoded labels, decode predictions for evaluation
+    if encoded:
+        y_pred = label_encoder.inverse_transform(y_pred.astype(int))
     
     # Calculate metrics
     accuracy = accuracy_score(y_test, y_pred)
@@ -271,28 +215,32 @@ def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, la
     # Create boolean mask for rows that have both test and pred in top labels
     combined_mask = mask_test & mask_pred
     
-    # Apply mask to create filtered versions of y_test and y_pred
-    y_test_filtered = np.array(y_test)[combined_mask]
-    y_pred_filtered = np.array(y_pred)[combined_mask]
-    
-    # Generate confusion matrix
-    plt.figure(figsize=(12, 10))
-    cm = confusion_matrix(y_test_filtered, y_pred_filtered, labels=top_labels)
-    
-    # Normalize for better visualization
-    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    cm_norm = np.nan_to_num(cm_norm)  # Replace NaN with 0
-    
-    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues',
-               xticklabels=top_labels, 
-               yticklabels=top_labels)
-    plt.title(f'{model_name.upper()} - Confusion Matrix (Top 15 Classes)')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig(results_dir / f'{model_name}_cm.png', dpi=300)
-    plt.close()
+    # Check if there are any matching rows
+    if np.any(combined_mask):
+        # Apply mask to create filtered versions of y_test and y_pred
+        y_test_filtered = np.array(y_test)[combined_mask]
+        y_pred_filtered = np.array(y_pred)[combined_mask]
+        
+        # Generate confusion matrix
+        plt.figure(figsize=(12, 10))
+        cm = confusion_matrix(y_test_filtered, y_pred_filtered, labels=top_labels)
+        
+        # Normalize for better visualization
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm_norm = np.nan_to_num(cm_norm)  # Replace NaN with 0
+        
+        sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues',
+                   xticklabels=top_labels, 
+                   yticklabels=top_labels)
+        plt.title(f'{model_name.upper()} - Confusion Matrix (Top 15 Classes)')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(results_dir / f'{model_name}_cm.png', dpi=300)
+        plt.close()
+    else:
+        print(f"Warning: No matching rows found for confusion matrix. Skipping visualization.")
     
     # Calculate per-class metrics for detailed analysis
     class_metrics = {}
@@ -329,9 +277,9 @@ def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, la
     }
 
 def main():
-    """Main function for training and evaluating ML models."""
+    """Main function for training and evaluating ML models."""    
     parser = argparse.ArgumentParser(description='Optimized ML analysis for log data')
-    parser.add_argument('--model', choices=['rf', 'xgb', 'svm', 'knn', 'lr', 'all'], 
+    parser.add_argument('--model', choices=['rf', 'xgb', 'knn', 'lr', 'all'], 
                         default='all', help='Model to train (default: all)')
     parser.add_argument('--embedding-type', choices=['fasttext', 'word2vec', 'tfidf'], 
                         default='fasttext', help='Embedding type (default: fasttext)')
@@ -346,6 +294,18 @@ def main():
     
     # Load embedding data
     X_train, y_train, X_test, y_test = load_embedding_data(args.embedding_type)
+    
+    # Ensure data is in proper format
+    if isinstance(X_train, list):
+        X_train = np.array(X_train)
+    if isinstance(X_test, list):
+        X_test = np.array(X_test)
+    
+    # Check and fix dimensions for TF-IDF and other sparse matrices
+    if hasattr(X_train, 'toarray') and len(X_train.shape) == 2:
+        X_train = X_train.toarray()
+    if hasattr(X_test, 'toarray') and len(X_test.shape) == 2:
+        X_test = X_test.toarray()
     
     # Create label encoder
     le = LabelEncoder()
@@ -398,7 +358,7 @@ def main():
             # For XGBoost and other models that need numeric labels
             if model_name in ['xgb']:
                 result = train_evaluate_model(
-                    model_name, model, X_train, y_train_enc, X_test, y_test, le, run_dir
+                    model_name, model, X_train, y_train_enc, X_test, y_test, le, run_dir, encoded=True
                 )
             else:
                 result = train_evaluate_model(
