@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import seaborn as sns
 import json
+import multiprocessing
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -84,7 +85,7 @@ def train_fasttext_model(corpus, vector_size=VECTOR_SIZE, window=5, min_count=1,
         vector_size=vector_size,
         window=window,
         min_count=min_count,
-        workers=4,
+        workers=multiprocessing.cpu_count() - 1,  # Use all cores except one
         seed=RANDOM_SEED
     )
     
