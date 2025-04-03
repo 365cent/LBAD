@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import seaborn as sns
 import json
+import multiprocessing
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -84,15 +85,13 @@ def train_word2vec_model(corpus, vector_size=VECTOR_SIZE, window=5, min_count=1,
         vector_size=vector_size,
         window=window,
         min_count=min_count,
-        workers=4,
+        workers=max(1, multiprocessing.cpu_count() - 1),  # Use all cores except one
         seed=RANDOM_SEED,
-        sg=1,  # Skip-gram (CBOW is the default)
+        sg=1  # Use skip-gram algorithm (1) instead of CBOW (0)
     )
     
-    # Build vocabulary
+    # Build vocabulary and train
     model.build_vocab(corpus_iterable=corpus)
-    
-    # Train the model
     model.train(
         corpus_iterable=corpus,
         total_examples=len(corpus),
@@ -102,16 +101,13 @@ def train_word2vec_model(corpus, vector_size=VECTOR_SIZE, window=5, min_count=1,
     return model
 
 def generate_embeddings(model, corpus):
-    """Generate document embeddings by averaging word vectors, handling OOV words."""
+    """Generate document embeddings by averaging word vectors."""
     print("Generating document embeddings...")
     embeddings = []
     
     for doc in tqdm(corpus):
-        # Get word vectors for each word in document (handle OOV words)
-        word_vectors = []
-        for word in doc:
-            if word in model.wv:
-                word_vectors.append(model.wv[word])
+        # Get word vectors for each word in document
+        word_vectors = [model.wv[word] for word in doc if word in model.wv]
         
         # Average the vectors (or use zeros if no words have embeddings)
         if word_vectors:
@@ -123,26 +119,24 @@ def generate_embeddings(model, corpus):
     
     return np.array(embeddings)
 
-def parse_labels(label_strings):
-    """Convert JSON label strings to classification labels."""
-    parsed = []
-    for label in label_strings:
-        try:
-            data = json.loads(label)
-            if isinstance(data, list):
-                parsed.append("normal" if not data else data[0])
-            else:
-                parsed.append("unknown")
-        except:
-            parsed.append("unknown")
-    return parsed
-
 def visualize_embeddings(embeddings, labels, output_file=None):
-    """Create t-SNE visualization of embeddings."""
+    """Create t-SNE visualization of embeddings with better label handling."""
     print("Creating t-SNE visualization...")
     
-    # Parse the labels
-    parsed_labels = parse_labels(labels)
+    # Parse the JSON strings to get actual labels
+    parsed_labels = []
+    for label_str in labels:
+        try:
+            label_data = json.loads(label_str)
+            if isinstance(label_data, list):
+                if not label_data:  # Empty array means "normal"
+                    parsed_labels.append("normal")
+                else:
+                    parsed_labels.append(label_data[0])  # Use first label if multiple
+            else:
+                parsed_labels.append("unknown")
+        except:
+            parsed_labels.append("unknown")
     
     # Apply t-SNE
     tsne = TSNE(n_components=2, random_state=RANDOM_SEED, perplexity=30)
@@ -162,26 +156,9 @@ def visualize_embeddings(embeddings, labels, output_file=None):
     label_counts = df['label'].value_counts()
     print(f"Label distribution: {dict(label_counts)}")
     
-    # Create custom color palette with "normal" as green
-    unique_labels = df['label'].unique()
-    
-    # Create a color palette for non-normal classes
-    other_labels = [label for label in unique_labels if label != "normal"]
-    other_colors = sns.color_palette("husl", len(other_labels))
-    
-    # Create a dictionary mapping each label to its color
-    color_dict = {}
-    color_idx = 0
-    
-    for label in unique_labels:
-        if label == "normal":
-            color_dict[label] = "green"  # Set normal to green
-        else:
-            color_dict[label] = other_colors[color_idx]
-            color_idx += 1
-    
-    # Use the custom palette in the scatterplot
-    sns.scatterplot(x='x', y='y', hue='label', data=df, palette=color_dict)
+    # Use a better color palette with distinct colors for different labels
+    colors = sns.color_palette("husl", len(df['label'].unique()))
+    sns.scatterplot(x='x', y='y', hue='label', data=df, palette=colors)
     
     plt.title('t-SNE Visualization of Word2Vec Log Embeddings')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -205,7 +182,7 @@ def main():
     test_df = df.drop(train_df.index)
     
     # Train Word2Vec model
-    model_path = MODEL_DIR / "word2vec_model.model"
+    model_path = MODEL_DIR / "word2vec_model.bin"
     
     if model_path.exists():
         print(f"Loading existing model from {model_path}")
@@ -224,22 +201,22 @@ def main():
     test_labels = test_df['label'].tolist()
     
     # Save embeddings
-    with open(OUTPUT_DIR / "train_embeddings.pkl", 'wb') as f:
+    with open(OUTPUT_DIR / "word2vec_train_embeddings.pkl", 'wb') as f:
         pickle.dump(train_embeddings, f)
     
-    with open(OUTPUT_DIR / "test_embeddings.pkl", 'wb') as f:
+    with open(OUTPUT_DIR / "word2vec_test_embeddings.pkl", 'wb') as f:
         pickle.dump(test_embeddings, f)
         
     # Save labels
-    with open(OUTPUT_DIR / "train_labels.pkl", 'wb') as f:
+    with open(OUTPUT_DIR / "word2vec_train_labels.pkl", 'wb') as f:
         pickle.dump(train_labels, f)
     
-    with open(OUTPUT_DIR / "test_labels.pkl", 'wb') as f:
+    with open(OUTPUT_DIR / "word2vec_test_labels.pkl", 'wb') as f:
         pickle.dump(test_labels, f)
     
     print(f"Saved embeddings and labels to {OUTPUT_DIR}")
-    print(f"  - Embeddings: train_embeddings.pkl, test_embeddings.pkl")
-    print(f"  - Labels: train_labels.pkl, test_labels.pkl")
+    print(f"  - Embeddings: word2vec_train_embeddings.pkl, word2vec_test_embeddings.pkl")
+    print(f"  - Labels: word2vec_train_labels.pkl, word2vec_test_labels.pkl")
     
     # Visualize (sample up to 5000 points to avoid overcrowding)
     sample_size = min(5000, len(train_embeddings))
