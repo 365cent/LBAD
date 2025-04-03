@@ -26,11 +26,9 @@ MODEL_DIR = BASE_DIR / "models"
 RESULTS_DIR = BASE_DIR / "results"
 LOGS_DIR = BASE_DIR / "logs"
 LABELS_DIR = BASE_DIR / "labels"
-AUGMENTED_DIR = BASE_DIR / "augmented"
-EVAL_DIR = BASE_DIR / "evaluation"
 
 # Ensure directories exist
-for directory in [PROCESSED_DIR, EMBEDDING_DIR, MODEL_DIR, RESULTS_DIR, AUGMENTED_DIR, EVAL_DIR]:
+for directory in [PROCESSED_DIR, EMBEDDING_DIR, MODEL_DIR, RESULTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 def check_processed_files():
@@ -94,17 +92,18 @@ def parse_arguments():
     parser.add_argument('--test', action='store_true',
                         help='Run testing utilities')
     
-    parser.add_argument('--gan', action='store_true',
-                        help='Run GAN-based data augmentation')
+    # Temporarily removed GAN-related arguments
+    # parser.add_argument('--gan', action='store_true',
+    #                     help='Run GAN-based data augmentation')
     
-    parser.add_argument('--evaluate', action='store_true',
-                        help='Run GAN evaluation')
+    # parser.add_argument('--evaluate', action='store_true',
+    #                     help='Run GAN evaluation')
     
-    parser.add_argument('--eval-model', choices=['rf', 'xgb', 'all'],
-                        default='all', help='Models to evaluate (default: all)')
+    # parser.add_argument('--eval-model', choices=['rf', 'xgb', 'all'],
+    #                     default='all', help='Models to evaluate (default: all)')
     
-    parser.add_argument('--eval-data', choices=['original', 'augmented', 'both'],
-                        default='both', help='Data to evaluate (default: both)')
+    # parser.add_argument('--eval-data', choices=['original', 'augmented', 'both'],
+    #                     default='both', help='Data to evaluate (default: both)')
     
     parser.add_argument('--all', action='store_true',
                         help='Run all steps')
@@ -126,13 +125,14 @@ def main():
     
     # If --all is specified or no arguments provided, run all steps
     if args.all or not any([args.preprocess, args.fasttext, args.word2vec, args.tfidf, 
-                          args.all_embeddings, args.test, args.gan, args.evaluate, args.ml]):
+                          args.all_embeddings, args.test, args.ml]):
         args.preprocess = True
         args.all_embeddings = True
         args.ml = True
         args.test = False
-        args.gan = False
-        args.evaluate = False
+        # Removed GAN-related flags:
+        # args.gan = False
+        # args.evaluate = False
     
     # Set all embeddings if requested
     if args.all_embeddings:
@@ -223,36 +223,37 @@ def main():
                         print(f"Exiting due to ML with {embedding_type} failure")
                         return
     
+    # Temporarily removed GAN-related sections
     # GAN Augmentation
     # ===============
     
     # Step 5: GAN Augmentation with available embeddings
-    if args.gan:
-        for embedding_type in ['fasttext', 'word2vec', 'tfidf']:
-            if embedding_type in successful:
-                gan_args = ['--embedding-type', embedding_type]
-                if run_script('gan_augmentation.py', f'{embedding_type.upper()}-based GAN Augmentation', gan_args):
-                    successful.append(f'gan-{embedding_type}')
-                elif not args.skip_errors:
-                    print(f"Exiting due to {embedding_type} GAN failure")
-                    return
+    # if args.gan:
+    #     for embedding_type in ['fasttext', 'word2vec', 'tfidf']:
+    #         if embedding_type in successful:
+    #             gan_args = ['--embedding-type', embedding_type]
+    #             if run_script('gan_augmentation.py', f'{embedding_type.upper()}-based GAN Augmentation', gan_args):
+    #                 successful.append(f'gan-{embedding_type}')
+    #             elif not args.skip_errors:
+    #                 print(f"Exiting due to {embedding_type} GAN failure")
+    #                 return
     
     # Evaluation
     # ==========
     
     # Step 6: Evaluate GAN augmentation
-    if args.evaluate and any('gan-' in step for step in successful):
-        eval_args = []
-        if args.eval_model != 'all':
-            eval_args.extend(['--models', args.eval_model])
-        if args.eval_data != 'both':
-            eval_args.extend(['--data', args.eval_data])
-            
-        if run_script('gan_evaluation.py', 'GAN Augmentation Evaluation', eval_args):
-            successful.append('evaluation')
-        elif not args.skip_errors:
-            print("Exiting due to evaluation failure")
-            return
+    # if args.evaluate and any('gan-' in step for step in successful):
+    #     eval_args = []
+    #     if args.eval_model != 'all':
+    #         eval_args.extend(['--models', args.eval_model])
+    #     if args.eval_data != 'both':
+    #         eval_args.extend(['--data', args.eval_data])
+    #         
+    #     if run_script('gan_evaluation.py', 'GAN Augmentation Evaluation', eval_args):
+    #         successful.append('evaluation')
+    #     elif not args.skip_errors:
+    #         print("Exiting due to evaluation failure")
+    #         return
     
     # Summary
     print("\nWorkflow completed!")
@@ -279,15 +280,16 @@ def main():
         print(f"Model files available in: {MODEL_DIR}")
         print(f"Results available in: {RESULTS_DIR}")
     
-    # Print GAN information
-    gan_steps = [step for step in successful if step.startswith('gan-')]
-    if gan_steps:
-        print(f"\nCompleted GAN augmentations: {', '.join(gan_steps)}")
-        print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
-    
-    # Print evaluation information
-    if 'evaluation' in successful:
-        print(f"\nEvaluation results available in: {EVAL_DIR}")
+    # Removed GAN information output
+    # # Print GAN information
+    # gan_steps = [step for step in successful if step.startswith('gan-')]
+    # if gan_steps:
+    #     print(f"\nCompleted GAN augmentations: {', '.join(gan_steps)}")
+    #     print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
+    # 
+    # # Print evaluation information
+    # if 'evaluation' in successful:
+    #     print(f"\nEvaluation results available in: {EVAL_DIR}")
     
     print(f"\nAll results available in project directory: {BASE_DIR}")
     print("=" * 60)
