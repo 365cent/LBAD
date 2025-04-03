@@ -12,6 +12,7 @@ import os
 import argparse
 import subprocess
 import time
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -31,6 +32,14 @@ EVAL_DIR = BASE_DIR / "evaluation"
 # Ensure directories exist
 for directory in [PROCESSED_DIR, EMBEDDING_DIR, MODEL_DIR, RESULTS_DIR, AUGMENTED_DIR, EVAL_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+def check_processed_files():
+    """Check if processed TFRecord files exist."""
+    if not PROCESSED_DIR.exists():
+        return False
+    
+    tfrecord_files = list(PROCESSED_DIR.glob("**/*.tfrecord"))
+    return len(tfrecord_files) > 0
 
 def run_script(script_name, description, args=None):
     """Run a Python script and handle errors."""
@@ -62,11 +71,25 @@ def parse_arguments():
     parser.add_argument('--preprocess', action='store_true',
                         help='Run log preprocessing')
     
+    # Embedding options
     parser.add_argument('--fasttext', action='store_true',
                         help='Generate FastText embeddings')
     
     parser.add_argument('--word2vec', action='store_true',
                         help='Generate Word2Vec embeddings')
+    
+    parser.add_argument('--tfidf', action='store_true',
+                        help='Generate TF-IDF embeddings')
+    
+    parser.add_argument('--all-embeddings', action='store_true',
+                        help='Generate all embedding types')
+    
+    # ML models
+    parser.add_argument('--ml', action='store_true',
+                        help='Run machine learning models')
+    
+    parser.add_argument('--model', choices=['rf', 'xgb', 'svm', 'knn', 'lr', 'all'],
+                        default='all', help='ML model to use (default: all)')
     
     parser.add_argument('--test', action='store_true',
                         help='Run testing utilities')
@@ -89,6 +112,12 @@ def parse_arguments():
     parser.add_argument('--skip-errors', action='store_true',
                         help='Continue execution even if a step fails')
     
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='Maximum number of samples to use (for ML with direct TFRecord)')
+                        
+    parser.add_argument('--direct', action='store_true',
+                        help='Run ML directly on TFRecord data without embeddings')
+    
     return parser.parse_args()
 
 def main():
@@ -96,24 +125,41 @@ def main():
     args = parse_arguments()
     
     # If --all is specified or no arguments provided, run all steps
-    if args.all or not any([args.preprocess, args.fasttext, args.word2vec, args.test, args.gan, args.evaluate]):
+    if args.all or not any([args.preprocess, args.fasttext, args.word2vec, args.tfidf, 
+                          args.all_embeddings, args.test, args.gan, args.evaluate, args.ml]):
         args.preprocess = True
+        args.all_embeddings = True
+        args.ml = True
         args.test = False
+        args.gan = False
+        args.evaluate = False
+    
+    # Set all embeddings if requested
+    if args.all_embeddings:
         args.fasttext = True
         args.word2vec = True
-        args.gan = True
-        args.evaluate = True
+        args.tfidf = True
     
     # Track successful steps
     successful = []
     
-    # Step 1: Log Preprocessing
-    if args.preprocess:
+    # Check if we need preprocessing
+    need_preprocessing = False
+    if not check_processed_files():
+        print("No processed files found. Preprocessing is required.")
+        need_preprocessing = True
+    
+    # Step 1: Log Preprocessing (if needed or explicitly requested)
+    if need_preprocessing or args.preprocess:
         if run_script('preprocessing.py', 'Log Preprocessing'):
             successful.append('preprocess')
         elif not args.skip_errors:
             print("Exiting due to preprocessing failure")
             return
+    elif not check_processed_files():
+        print("Error: No processed files found and preprocessing was not run.")
+        print("Please run with --preprocess flag.")
+        return
     
     # Step 2: Testing Utilities
     if args.test:
@@ -123,49 +169,79 @@ def main():
             print("Exiting due to testing failure")
             return
     
-    # FastText Workflow
-    # =================
+    # Embedding Generation
+    # ===================
     
     # Step 3a: FastText Embedding
-    if args.fasttext and ('preprocess' in successful or not args.preprocess):
+    if args.fasttext and ('preprocess' in successful or not need_preprocessing):
         if run_script('fasttext_embedding.py', 'FastText Embedding'):
             successful.append('fasttext')
         elif not args.skip_errors:
             print("Exiting due to FastText embedding failure")
             return
     
-    # Step 4a: GAN Augmentation with FastText embeddings
-    if args.gan and args.fasttext and ('fasttext' in successful or not args.fasttext):
-        if run_script('gan_augmentation.py', 'FastText-based GAN Augmentation'):
-            successful.append('gan-fasttext')
-        elif not args.skip_errors:
-            print("Exiting due to FastText GAN failure")
-            return
-    
-    # Word2Vec Workflow
-    # =================
-    
     # Step 3b: Word2Vec Embedding
-    if args.word2vec and ('preprocess' in successful or not args.preprocess):
+    if args.word2vec and ('preprocess' in successful or not need_preprocessing):
         if run_script('word2vec_embedding.py', 'Word2Vec Embedding'):
             successful.append('word2vec')
         elif not args.skip_errors:
             print("Exiting due to Word2Vec embedding failure")
             return
     
-    # Step 4b: GAN Augmentation with Word2Vec embeddings
-    if args.gan and args.word2vec and ('word2vec' in successful or not args.word2vec):
-        if run_script('gan_augmentation.py', 'Word2Vec-based GAN Augmentation'):
-            successful.append('gan-word2vec')
+    # Step 3c: TF-IDF Embedding
+    if args.tfidf and ('preprocess' in successful or not need_preprocessing):
+        if run_script('tfidf_embedding.py', 'TF-IDF Embedding'):
+            successful.append('tfidf')
         elif not args.skip_errors:
-            print("Exiting due to Word2Vec GAN failure")
+            print("Exiting due to TF-IDF embedding failure")
             return
+    
+    # Machine Learning Models
+    # ======================
+    
+    # Step 4: Run ML Models
+    if args.ml:
+        ml_args = []
+        
+        if args.model != 'all':
+            ml_args.extend(['--model', args.model])
+        
+        if args.direct:
+            ml_args.extend(['--data-source', 'tfrecord'])
+            if args.max_samples:
+                ml_args.extend(['--max-samples', str(args.max_samples)])
+        else:
+            # Run ML on each available embedding type
+            for embedding_type in ['fasttext', 'word2vec', 'tfidf']:
+                if embedding_type in successful:
+                    print(f"\nRunning ML models with {embedding_type} embeddings...")
+                    current_args = ml_args + ['--embedding-type', embedding_type]
+                    
+                    if run_script('ml_models.py', f'ML with {embedding_type.upper()} Embeddings', current_args):
+                        successful.append(f'ml-{embedding_type}')
+                    elif not args.skip_errors:
+                        print(f"Exiting due to ML with {embedding_type} failure")
+                        return
+    
+    # GAN Augmentation
+    # ===============
+    
+    # Step 5: GAN Augmentation with available embeddings
+    if args.gan:
+        for embedding_type in ['fasttext', 'word2vec', 'tfidf']:
+            if embedding_type in successful:
+                gan_args = ['--embedding-type', embedding_type]
+                if run_script('gan_augmentation.py', f'{embedding_type.upper()}-based GAN Augmentation', gan_args):
+                    successful.append(f'gan-{embedding_type}')
+                elif not args.skip_errors:
+                    print(f"Exiting due to {embedding_type} GAN failure")
+                    return
     
     # Evaluation
     # ==========
     
-    # Step 5: Evaluate GAN augmentation
-    if args.evaluate and (any('gan-' in step for step in successful) or not args.gan):
+    # Step 6: Evaluate GAN augmentation
+    if args.evaluate and any('gan-' in step for step in successful):
         eval_args = []
         if args.eval_model != 'all':
             eval_args.extend(['--models', args.eval_model])
@@ -180,19 +256,41 @@ def main():
     
     # Summary
     print("\nWorkflow completed!")
+    print("=" * 60)
     if successful:
         print(f"Successful steps: {', '.join(successful)}")
     else:
         print("No steps were executed successfully.")
     
-    # Print final results location
+    # Print embedding availability
+    available_embeddings = []
+    for embedding in ['fasttext', 'word2vec', 'tfidf']:
+        if embedding in successful:
+            available_embeddings.append(embedding)
+    
+    if available_embeddings:
+        print(f"\nAvailable embeddings: {', '.join(available_embeddings)}")
+        print(f"Embedding files available in: {EMBEDDING_DIR}")
+    
+    # Print model information
+    ml_steps = [step for step in successful if step.startswith('ml-')]
+    if ml_steps:
+        print(f"\nCompleted ML models: {', '.join(ml_steps)}")
+        print(f"Model files available in: {MODEL_DIR}")
+        print(f"Results available in: {RESULTS_DIR}")
+    
+    # Print GAN information
+    gan_steps = [step for step in successful if step.startswith('gan-')]
+    if gan_steps:
+        print(f"\nCompleted GAN augmentations: {', '.join(gan_steps)}")
+        print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
+    
+    # Print evaluation information
     if 'evaluation' in successful:
         print(f"\nEvaluation results available in: {EVAL_DIR}")
     
-    if any('gan-' in step for step in successful):
-        print(f"GAN augmentation results available in: {AUGMENTED_DIR}")
-    
-    print(f"All results available in project directory: {BASE_DIR}")
+    print(f"\nAll results available in project directory: {BASE_DIR}")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
