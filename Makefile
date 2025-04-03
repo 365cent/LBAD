@@ -1,97 +1,126 @@
-# Makefile for Python Project
+# Makefile for Log Analysis Project
 
 # Variables
-PYTHON := python
-PIP := pip
-PREPROCESSING := ./src/preprocessing.py
-TESTING := ./src/testing.py
-FASTTEXT := ./src/fasttext_embedding.py
-WORD2VEC := ./src/word2vec_embedding.py
-ML := ./src/ml_models.py
+PYTHON := python3
+PIP := pip3
 MAIN := ./src/main.py
-GAN := ./src/gan_augmentation.py
 REQUIREMENTS := requirements.txt
 
 # Help command
 help:
 	@echo "Available targets:"
-	@echo "  all         - Run preprocessing, testing, embedding, and machine learning models"
-	@echo "  install     - Install dependencies in the current Python environment"
-	@echo "  preprocess  - Run the preprocessing script"
-	@echo "  test        - Run the testing script"
-	@echo "  embed       - Run the fastText embedding script"
-	@echo "  word2vec    - Run the Word2Vec embedding script"
-	@echo "  ml          - Run machine learning models"
-	@echo "  ml-rf       - Run the machine learning model with random forest"
-	@echo "  ml-xgb      - Run the machine learning model with XGBoost"
-	@echo "  ml-svm      - Run the machine learning model with SVM"
-	@echo "  ml-evaluate - Evaluate the machine learning model (without training)"
-	@echo "  gan         - Run GAN-based data augmentation"
-	@echo "  clean       - Clean up generated files"
-	@echo "  help        - Display this help message"
+	@echo "  all           - Run complete pipeline (preprocessing, all embeddings, ML models)"
+	@echo "  install       - Install dependencies in the current Python environment"
+	@echo "  preprocess    - Run log preprocessing"
+	@echo "  test          - Run preprocessing testing utilities"
+	@echo "  embeddings    - Generate all embedding types (FastText, Word2Vec, TF-IDF)"
+	@echo "  fasttext      - Generate FastText embeddings"
+	@echo "  word2vec      - Generate Word2Vec embeddings"
+	@echo "  tfidf         - Generate TF-IDF embeddings"
+	@echo "  ml            - Run all ML models on all available embeddings"
+	@echo "  ml-fasttext   - Run ML models with FastText embeddings"
+	@echo "  ml-word2vec   - Run ML models with Word2Vec embeddings"
+	@echo "  ml-tfidf      - Run ML models with TF-IDF embeddings"
+	@echo "  ml-direct     - Run ML directly on TFRecord data (no embeddings)"
+	@echo "  ml-rf         - Run Random Forest model on default embeddings"
+	@echo "  ml-xgb        - Run XGBoost model on default embeddings"
+	@echo "  ml-svm        - Run SVM model on default embeddings"
+	@echo "  ml-knn        - Run KNN model on default embeddings"
+	@echo "  ml-lr         - Run Logistic Regression model on default embeddings"
+	@echo "  evaluate      - Evaluate GAN augmentation effectiveness"
+	@echo "  evaluate-*    - Evaluate using specific model/data combinations"
+	@echo "  sample-run    - Run a sample pipeline on limited data"
+	@echo "  run-full-with-skip - Run full pipeline skipping errors"
+	@echo "  clean         - Clean up temporary files and caches"
+	@echo "  clean-all     - Clean all generated files (use with caution)"
+	@echo "  help          - Display this help message"
 
-# Run all scripts in order
+# Run full pipeline
 all:
-	$(PYTHON) $(MAIN)
+	$(PYTHON) $(MAIN) --all
 
-# Install dependencies in the current Python environment
+# Install dependencies
 install:
 	$(PIP) install -r $(REQUIREMENTS)
 
-# Run the preprocessing script
+# Data preprocessing
 preprocess:
-	$(PYTHON) $(PREPROCESSING)
+	$(PYTHON) $(MAIN) --preprocess
 
-# Run the testing script
+# Testing utilities
 test:
-	$(PYTHON) $(TESTING)
+	$(PYTHON) $(MAIN) --test
 
-# Run the fastText embedding script
-embed:
-	$(PYTHON) $(FASTTEXT)
+# All embeddings
+embeddings: fasttext word2vec tfidf
 
-# Run the Word2Vec embedding script
+fasttext:
+	$(PYTHON) $(MAIN) --fasttext
+
 word2vec:
-	$(PYTHON) $(WORD2VEC)
+	$(PYTHON) $(MAIN) --word2vec
 
-# Run machine learning models
+tfidf:
+	$(PYTHON) $(MAIN) --tfidf
+
+# Machine Learning models
 ml:
-	$(PYTHON) $(ML)
+	$(PYTHON) $(MAIN) --ml --all-embeddings
 
-# Run the machine learning model with random forest
+ml-fasttext:
+	$(PYTHON) $(MAIN) --ml --fasttext
+
+ml-word2vec:
+	$(PYTHON) $(MAIN) --ml --word2vec
+
+ml-tfidf:
+	$(PYTHON) $(MAIN) --ml --tfidf
+
+ml-direct:
+	$(PYTHON) $(MAIN) --ml --direct
+
 ml-rf:
-	$(PYTHON) $(ML) --model rf
+	$(PYTHON) $(MAIN) --ml --model rf
 
-# Run the machine learning model with XGBoost
 ml-xgb:
-	$(PYTHON) $(ML) --model xgb
+	$(PYTHON) $(MAIN) --ml --model xgb
 
-# Run the machine learning model with SVM
 ml-svm:
-	$(PYTHON) $(ML) --model svm
+	$(PYTHON) $(MAIN) --ml --model svm
 
-# Evaluate the machine learning model (without training)
-ml-evaluate:
-	$(PYTHON) $(ML) --evaluate-only
+ml-knn:
+	$(PYTHON) $(MAIN) --ml --model knn
 
-# Run GAN-based data augmentation
-gan:
-	$(PYTHON) $(GAN)
+ml-lr:
+	$(PYTHON) $(MAIN) --ml --model lr
 
-# Clean up generated files
+# GAN Evaluation
+evaluate:
+	$(PYTHON) $(MAIN) --evaluate
+
+evaluate-rf-original:
+	$(PYTHON) $(MAIN) --evaluate --eval-model rf --eval-data original
+
+evaluate-xgb-augmented:
+	$(PYTHON) $(MAIN) --evaluate --eval-model xgb --eval-data augmented
+
+# Run with limited samples
+sample-run:
+	$(PYTHON) $(MAIN) --ml --direct --max-samples 10000
+
+# Run full pipeline and skip errors
+run-full-with-skip:
+	$(PYTHON) $(MAIN) --all --skip-errors
+
+# Cleanup
 clean:
 	rm -rf __pycache__/
 	rm -rf *.pyc
 	find . -name "__pycache__" -type d -exec rm -rf {} +
 	find . -name "*.pyc" -delete
 
-# Clean all generated files including embeddings, models, and results, then run clean, use with caution
 clean-all:
-	rm -rf processed
-	rm -rf embeddings
-	rm -rf models
-	rm -rf results
-	rm -rf augmented
+	rm -rf processed embeddings models results augmented evaluation
 	$(MAKE) clean
 
-.PHONY: all install preprocess test embed word2vec ml ml-rf ml-xgb ml-svm ml-evaluate gan clean help clean-all
+.PHONY: all install preprocess test embeddings fasttext word2vec tfidf ml ml-fasttext ml-word2vec ml-tfidf ml-direct ml-rf ml-xgb ml-svm ml-knn ml-lr evaluate evaluate-rf-original evaluate-xgb-augmented sample-run run-full-with-skip clean clean-all help
