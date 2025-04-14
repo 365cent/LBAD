@@ -309,46 +309,52 @@ def main():
     if args.ml:
         ml_args = []
         
-        if args.model != 'all':
-            ml_args.extend(['--model', args.model])
+        # Always use 'all' models regardless of command line arguments
+        ml_args.extend(['--model', 'all'])
         
         if not available_embeddings:
-            print("\nNo embeddings available. Skipping ML step.")
+            print("\nWARNING: No embeddings available. ML steps cannot be executed.")
+            print("Please run with --fasttext, --word2vec, or --tfidf first to generate embeddings.")
         else:
             print(f"\nAvailable embeddings for ML: {', '.join(available_embeddings)}")
         
-        # If specific embedding types were requested, only use those for ML
-        requested_embeddings = []
-        if args.fasttext:
-            requested_embeddings.append('fasttext')
-        if args.word2vec:
-            requested_embeddings.append('word2vec')
-        if args.tfidf:
-            requested_embeddings.append('tfidf')
-        
-        # If no specific embeddings were requested but ML was requested, use all available
-        if not requested_embeddings and args.ml:
-            requested_embeddings = available_embeddings
-        
-        # Filter available embeddings based on requested ones
-        selected_embeddings = [emb for emb in requested_embeddings if emb in available_embeddings]
-        
-        # Run ML on selected embeddings
-        for embedding_type in selected_embeddings:
-            # Check if ML has already been run with these embeddings
-            if check_model_files(embedding_type, args.model) and not args.force:
-                print(f"ML models with {embedding_type} embeddings already exist. Skipping.")
-                skipped.append(f'ml-{embedding_type}')
-                successful.append(f'ml-{embedding_type}')
-            else:
-                print(f"\nRunning ML models with {embedding_type} embeddings...")
-                current_args = ml_args + ['--embedding-type', embedding_type]
+            # If specific embedding types were requested, only use those for ML
+            requested_embeddings = []
+            if args.fasttext:
+                requested_embeddings.append('fasttext')
+            if args.word2vec:
+                requested_embeddings.append('word2vec')
+            if args.tfidf:
+                requested_embeddings.append('tfidf')
+            
+            # If no specific embeddings were requested but ML was requested, use all available
+            if not requested_embeddings:
+                requested_embeddings = available_embeddings
                 
-                if run_script('ml_models.py', f'ML with {embedding_type.upper()} Embeddings', current_args):
+            # Filter available embeddings based on requested ones
+            selected_embeddings = [emb for emb in requested_embeddings if emb in available_embeddings]
+            
+            if not selected_embeddings:
+                print("\nWARNING: None of the requested embeddings are available.")
+                print("Using all available embeddings instead.")
+                selected_embeddings = available_embeddings
+            
+            # Run ML on selected embeddings
+            for embedding_type in selected_embeddings:
+                # Check if ML has already been run with these embeddings
+                if check_model_files(embedding_type, args.model) and not args.force:
+                    print(f"ML models with {embedding_type} embeddings already exist. Skipping.")
+                    skipped.append(f'ml-{embedding_type}')
                     successful.append(f'ml-{embedding_type}')
-                elif not args.skip_errors:
-                    print(f"Exiting due to ML with {embedding_type} failure")
-                    return
+                else:
+                    print(f"\nRunning ML models with {embedding_type} embeddings...")
+                    current_args = ml_args + ['--embedding-type', embedding_type]
+                    
+                    if run_script('ml_models.py', f'ML with {embedding_type.upper()} Embeddings', current_args):
+                        successful.append(f'ml-{embedding_type}')
+                    elif not args.skip_errors:
+                        print(f"Exiting due to ML with {embedding_type} failure")
+                        return
     
     # Summary
     print("\nWorkflow completed!")
