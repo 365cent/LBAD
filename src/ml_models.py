@@ -22,7 +22,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import cross_val_score
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -191,7 +191,7 @@ def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, la
         y_pred = label_encoder.inverse_transform(y_pred.astype(int))
     
     # Calculate metrics
-    accuracy = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average='weighted')
     report = classification_report(y_test, y_pred, zero_division=0)
     
     # Save metrics
@@ -272,7 +272,7 @@ def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, la
     
     return {
         'model_name': model_name,
-        'accuracy': accuracy,
+        'f1_score': f1,
         'training_time': training_time
     }
 
@@ -371,11 +371,11 @@ def main():
     if results:
         print("\nModel Performance Summary:")
         print("-" * 70)
-        print(f"{'Model':<15} {'Accuracy':<10} {'Training Time (s)':<20}")
+        print(f"{'Model':<15} {'F1 Score':<10} {'Training Time (s)':<20}")
         print("-" * 70)
         
-        for result in sorted(results, key=lambda x: x['accuracy'], reverse=True):
-            print(f"{result['model_name'].upper():<15} {result['accuracy']:.4f}     {result['training_time']:.2f}s")
+        for result in sorted(results, key=lambda x: x['f1_score'], reverse=True):
+            print(f"{result['model_name'].upper():<15} {result['f1_score']:.4f}     {result['training_time']:.2f}s")
     
     # Save summary to file
     with open(run_dir / 'summary.txt', 'w') as f:
@@ -389,11 +389,11 @@ def main():
         if results:
             f.write("Model Performance Summary:\n")
             f.write("-" * 50 + "\n")
-            f.write(f"{'Model':<15} {'Accuracy':<10} {'Training Time (s)':<20}\n")
+            f.write(f"{'Model':<15} {'F1 Score':<10} {'Training Time (s)':<20}\n")
             f.write("-" * 50 + "\n")
             
-            for result in sorted(results, key=lambda x: x['accuracy'], reverse=True):
-                f.write(f"{result['model_name'].upper():<15} {result['accuracy']:.4f}     {result['training_time']:.2f}s\n")
+            for result in sorted(results, key=lambda x: x['f1_score'], reverse=True):
+                f.write(f"{result['model_name'].upper():<15} {result['f1_score']:.4f}     {result['training_time']:.2f}s\n")
         
         total_time = time.time() - start_time
         f.write(f"\nTotal execution time: {total_time:.2f}s\n")
