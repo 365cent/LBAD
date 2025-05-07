@@ -1,14 +1,49 @@
 # Log-Based Attack Detection (LBAD) Framework
 
-A robust framework for detecting and classifying attacks in system logs using advanced embedding techniques and machine learning models. Optimized for performance on Apple Silicon.
+A robust framework for detecting and classifying attacks in system logs using advanced embedding techniques, machine learning models, and VAE-GAN augmentation. Optimized for performance on Apple Silicon.
 
 ## Overview
 
 LBAD tackles challenges in log-based attack detection by:
 - Representing unstructured log data with FastText, Word2Vec, and TF-IDF embeddings.
 - Leveraging traditional machine learning models (Random Forest, XGBoost, SVM, KNN, Logistic Regression) for accurate classification.
+- Implementing VAE-GAN (Variational Autoencoder - Generative Adversarial Network) hybrid for high-quality synthetic data generation.
+- Addressing class imbalance through advanced data augmentation techniques.
 - Optimizing performance on Apple Silicon (M1/M2/M3) processors.
-- Support for GAN-based data augmentation is planned for future releases.
+
+## Pipeline Architecture
+
+```mermaid
+flowchart TD
+    subgraph Log_Preprocessing
+        A[Scan and filter text log files] --> B[Match logs with label files]
+        B --> C[Generate TensorFlow Examples]
+        C --> D[Serialize and store TFRecord files]
+    end
+
+    subgraph FastText_Embedding_Generation
+        D --> E[Load preprocessed TFRecord data]
+        E --> F[Tokenize log entries]
+        F --> G[Train or load FastText model]
+        G --> H[Generate embeddings]
+        H --> I[Store embeddings and labels]
+    end
+
+    subgraph VAE_GAN_Data_Augmentation
+        I --> J[Identify minority classes]
+        J --> K[Build and compile VAE-GAN model]
+        K --> L[Train VAE-GAN on minority embeddings]
+        L --> M[Generate synthetic embeddings]
+        M --> N[Save augmented dataset]
+    end
+
+    subgraph Evaluation_with_XGBoost
+        N --> O[Load original and augmented embeddings]
+        O --> P[Train XGBoost classifiers]
+        P --> Q[Evaluate classifier performance]
+        Q --> R[Visualize metrics and comparisons]
+    end
+```
 
 ## Features
 
@@ -23,8 +58,12 @@ LBAD tackles challenges in log-based attack detection by:
   - **SVM**: Support Vector Machine with non-linear kernels.
   - **KNN**: K-Nearest Neighbors with distance weighting.
   - **Logistic Regression**: Fast linear model with regularization.
+- **VAE-GAN Augmentation**: Hybrid approach for generating high-quality synthetic data:
+  - **Beta-VAE**: Tunable KL divergence weighting for better representation learning
+  - **KL Annealing**: Gradual increase in KL weight for stable training
+  - **Multi-batch diversity generation**: Creates embeddings with varying diversity levels
+  - **Focused minority class augmentation**: Targeted synthetic data generation
 - **Comprehensive Evaluation**: Precision, recall, F1-score, confusion matrices, and per-class metrics.
-- **Coming Soon**: GAN-based data augmentation for minority classes.
 
 ## Getting Started
 
@@ -85,6 +124,14 @@ make all
   make ml-lr         # Logistic Regression classifier
   ```
 
+- **VAE-GAN Augmentation and Evaluation**:
+  ```bash
+  make gan           # Run VAE-GAN augmentation
+  make eval          # Evaluate augmentation results
+  make gan-pipeline  # Run both augmentation and evaluation
+  make gan-small     # Run with fewer epochs and samples (quick test)
+  ```
+
 - **Direct TFRecord Processing**:
   ```bash
   make ml-direct     # Process TFRecord data directly (no embeddings)
@@ -100,6 +147,7 @@ make all
 Remove generated files:
 ```bash
 make clean       # Remove cache files
+make clean-aug   # Remove augmented data only
 make clean-all   # Remove all generated data
 ```
 
@@ -107,23 +155,45 @@ make clean-all   # Remove all generated data
 
 ```
 .
-├── logs/                       # Raw log dataset
-├── labels/                     # Ground truth annotations
-├── src/                        # Source code
-│   ├── preprocessing.py        # Log preprocessing
-│   ├── preprocess_testing.py   # Testing for preprocessing
-│   ├── fasttext_embedding.py   # FastText embedding generation
-│   ├── word2vec_embedding.py   # Word2Vec embedding generation
-│   ├── tfidf_embedding.py      # TF-IDF embedding generation
-│   ├── embedding_testing.py    # Testing for embeddings
-│   ├── ml_models.py            # Traditional ML models
-│   ├── gan_augmentation.py.dist # GAN templates (future implementation)
-│   ├── gan_evaluation.py.dist  # GAN evaluation templates
-│   ├── gan_ml.py.dist          # GAN ML templates
-│   └── main.py                 # Workflow orchestration
-├── Makefile                    # Build automation
-└── requirements.txt            # Dependencies
+├── logs/                     # Raw log dataset
+├── labels/                   # Ground truth annotations
+├── embeddings/               # Generated embeddings
+├── augmented/                # Synthetic data from VAE-GAN
+├── results/                  # Evaluation metrics and visualizations
+├── models/                   # Saved model weights
+├── src/                      # Source code
+│   ├── preprocessing.py      # Log preprocessing
+│   ├── fasttext_embedding.py # FastText embedding generation
+│   ├── word2vec_embedding.py # Word2Vec embedding generation
+│   ├── tfidf_embedding.py    # TF-IDF embedding generation
+│   ├── gan_augmentation.py   # VAE-GAN implementation
+│   ├── gan_evaluation.py     # Evaluation with XGBoost
+│   ├── ml_models.py          # Traditional ML models
+│   └── main.py               # Workflow orchestration
+├── Makefile                  # Build automation
+└── requirements.txt          # Dependencies
 ```
+
+## VAE-GAN Augmentation Approach
+
+Our VAE-GAN hybrid approach combines the benefits of Variational Autoencoders and Generative Adversarial Networks to generate high-quality synthetic embeddings:
+
+### Model Architecture
+- **Enhanced Encoder**: Multi-layer network (512→768→512 units) for robust feature extraction
+- **Latent Space**: 128-dimensional latent space for expressive representation
+- **Decoder**: Mirror of encoder with tanh activation for embedding generation
+- **Discriminator**: Deep network that differentiates real from synthetic embeddings
+
+### Training Dynamics
+- **Beta-VAE**: Reduced beta parameter (0.5) to balance reconstruction vs. regularization
+- **KL Annealing**: Gradual increase of KL weight during training for stability
+- **Learning Rate Scheduling**: Exponential decay to prevent training divergence
+- **Gradient Clipping**: Limits gradient norms to prevent exploding gradients
+
+### Diversity Enhancement
+- **Multi-batch Generation**: Creates synthetic samples with varying diversity levels
+- **Periodic Diversity Injection**: Mixes diverse samples into training batches
+- **Targeted Augmentation**: Focuses on minority attack classes to address imbalance
 
 ## Evaluation Metrics
 
@@ -132,13 +202,6 @@ make clean-all   # Remove all generated data
 - **F1-Score**: Balances precision and recall.
 - **Per-class metrics**: Detailed performance for each attack type.
 - **Confusion matrices**: Visual representations of classification performance.
-
-## Advanced Techniques
-
-- **TF-IDF with SVD**: Dimension reduction while preserving signal.
-- **Multi-embedding comparison**: Test different vector representations.
-- **Auto-detection of processed files**: Automatically runs preprocessing when needed.
-- **Direct TFRecord processing**: Option to vectorize logs without embeddings.
 
 ## License
 
@@ -160,7 +223,6 @@ If you use this framework in your research, please cite:
 ## Acknowledgments
 
 - **FastText, Word2Vec, and TF-IDF**: For embedding implementations.
+- **TensorFlow, Keras**: For deep learning frameworks.
 - **Scikit-learn, XGBoost**: For ML implementations.
-- **TensorFlow**: For data processing frameworks.
-- **AIT Log Data Set**: For benchmark datasets.
 - **Open-Source Community**: For tools and libraries.
