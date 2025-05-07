@@ -118,8 +118,8 @@ def generate_embeddings(model, corpus):
     
     return np.array(embeddings)
 
-def visualize_embeddings(embeddings, labels, output_file=None):
-    """Create t-SNE visualization of embeddings with better label handling."""
+def visualize_embeddings(embeddings, labels, sources=None, output_file=None):
+    """Create t-SNE visualization of embeddings with better label handling and data source distinction."""
     print("Creating t-SNE visualization...")
     
     # Parse the JSON strings to get actual labels
@@ -151,14 +151,16 @@ def visualize_embeddings(embeddings, labels, output_file=None):
         'label': parsed_labels
     })
     
+    # Add source information if provided
+    if sources is not None:
+        df['source'] = sources
+    
     # Get unique labels and count occurrences
     label_counts = df['label'].value_counts()
     print(f"Label distribution: {dict(label_counts)}")
     
-    # Create custom color palette with "normal" as green
+    # Create a color palette for labels
     unique_labels = df['label'].unique()
-    
-    # Create a color palette for non-normal classes
     other_labels = [label for label in unique_labels if label != "normal"]
     other_colors = sns.color_palette("husl", len(other_labels))
     
@@ -173,10 +175,23 @@ def visualize_embeddings(embeddings, labels, output_file=None):
             color_dict[label] = other_colors[color_idx]
             color_idx += 1
     
-    # Use the custom palette in the scatterplot
-    sns.scatterplot(x='x', y='y', hue='label', data=df, palette=color_dict)
+    # Create the plot
+    if sources is not None:
+        # Plot with both hue (label) and style (source)
+        sns.scatterplot(
+            x='x', 
+            y='y', 
+            hue='label', 
+            style='source',
+            data=df, 
+            palette=color_dict,
+            alpha=0.7
+        )
+        plt.title('t-SNE Visualization of FastText Log Embeddings (Train and Test)')
+    else:
+        sns.scatterplot(x='x', y='y', hue='label', data=df, palette=color_dict)
+        plt.title('t-SNE Visualization of FastText Log Embeddings')
     
-    plt.title('t-SNE Visualization of FastText Log Embeddings')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     
@@ -234,13 +249,20 @@ def main():
     print(f"  - Embeddings: train_embeddings.pkl, test_embeddings.pkl")
     print(f"  - Labels: train_labels.pkl, test_labels.pkl")
     
-    # Visualize (sample up to 5000 points to avoid overcrowding)
-    sample_size = min(5000, len(train_embeddings))
-    sample_idx = np.random.choice(len(train_embeddings), sample_size, replace=False)
+    # Visualize both train and test data
+    # Combine train and test embeddings for visualization
+    combined_embeddings = np.vstack([train_embeddings, test_embeddings])
+    combined_labels = train_labels + test_labels
+    sources = ['train'] * len(train_embeddings) + ['test'] * len(test_embeddings)
+    
+    # Sample points to avoid overcrowding
+    sample_size = min(5000, len(combined_embeddings))
+    sample_idx = np.random.choice(len(combined_embeddings), sample_size, replace=False)
     
     visualize_embeddings(
-        train_embeddings[sample_idx], 
-        train_df['label'].iloc[sample_idx].tolist(),
+        combined_embeddings[sample_idx], 
+        [combined_labels[i] for i in sample_idx],
+        [sources[i] for i in sample_idx],
         output_file=OUTPUT_DIR / "embedding_visualization.png"
     )
     
