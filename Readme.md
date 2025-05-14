@@ -25,7 +25,7 @@ flowchart TD
     subgraph Embedding_Generation
         direction TB
         D_TF -- Run fasttext_embedding.py --> E_FT_Combined[Store Combined Embeddings & Labels e.g., embeddings/embeddings_all_combined.pkl];
-        D_TF -- Run fasttext_embedding.py --log-type <type> --> E_FT_PerType[Store Per-Type Embeddings & Labels e.g., embeddings/web/embeddings.pkl];
+        D_TF -- Run fasttext_embedding.py --log-type &lt;type&gt; --> E_FT_PerType[Store Per-Type Embeddings & Labels e.g., embeddings/web/embeddings.pkl];
         D_TF -- Potentially other embedding scripts --> E_OtherEmbed[Other Embedding Types e.g., Word2Vec, TF-IDF];
     end
 
@@ -34,7 +34,7 @@ flowchart TD
         E_FT_Combined -- Run xgboost_ml.py --context all_combined --> F_XGB_Combined[Train OvR XGBoost on Combined Data];
         F_XGB_Combined --> G_XGB_Combined_Eval[Evaluate & Store Metrics for Combined];
         
-        E_FT_PerType -- Run xgboost_ml.py --context <type> --> F_XGB_PerType[Train OvR XGBoost on Per-Type Data e.g., web];
+        E_FT_PerType -- Run xgboost_ml.py --context &lt;type&gt; --> F_XGB_PerType[Train OvR XGBoost on Per-Type Data e.g., web];
         F_XGB_PerType --> G_XGB_PerType_Eval[Evaluate & Store Metrics for Per-Type];
     end
 
