@@ -16,33 +16,74 @@ LBAD tackles challenges in log-based attack detection by:
 ```mermaid
 flowchart TD
     subgraph Log_Preprocessing
-        A[Scan and filter text log files] --> B[Match logs with label files]
-        B --> C[Generate TensorFlow Examples]
-        C --> D[Serialize and store TFRecord files]
+        A[Scan and filter text log files] --> B{Match logs with label files?};
+        B -- Yes --> C[Generate TensorFlow Examples];
+        C --> D_TF[Serialize and store TFRecord files by log type e.g., processed/web/*.tfrecord];
+        B -- No --> D_TF;
     end
 
-    subgraph FastText_Embedding_Generation
-        D --> E[Load preprocessed TFRecord data]
-        E --> F[Tokenize log entries]
-        F --> G[Train or load FastText model]
-        G --> H[Generate embeddings]
-        H --> I[Store embeddings and labels]
+    subgraph Embedding_Generation
+        direction TB
+        D_TF -- Run fasttext_embedding.py --> E_FT_Combined[Store Combined Embeddings & Labels e.g., embeddings/embeddings_all_combined.pkl];
+        D_TF -- Run fasttext_embedding.py --log-type <type> --> E_FT_PerType[Store Per-Type Embeddings & Labels e.g., embeddings/web/embeddings.pkl];
+        D_TF -- Potentially other embedding scripts --> E_OtherEmbed[Other Embedding Types e.g., Word2Vec, TF-IDF];
     end
 
-    subgraph VAE_GAN_Data_Augmentation
-        I --> J[Identify minority classes]
-        J --> K[Build and compile VAE-GAN model]
-        K --> L[Train VAE-GAN on minority embeddings]
-        L --> M[Generate synthetic embeddings]
-        M --> N[Save augmented dataset]
+    subgraph Baseline_MultiLabel_XGBoost_Evaluation
+        direction TB
+        E_FT_Combined -- Run xgboost_ml.py --context all_combined --> F_XGB_Combined[Train OvR XGBoost on Combined Data];
+        F_XGB_Combined --> G_XGB_Combined_Eval[Evaluate & Store Metrics for Combined];
+        
+        E_FT_PerType -- Run xgboost_ml.py --context <type> --> F_XGB_PerType[Train OvR XGBoost on Per-Type Data e.g., web];
+        F_XGB_PerType --> G_XGB_PerType_Eval[Evaluate & Store Metrics for Per-Type];
     end
 
-    subgraph Evaluation_with_XGBoost
-        N --> O[Load original and augmented embeddings]
-        O --> P[Train XGBoost classifiers]
-        P --> Q[Evaluate classifier performance]
-        Q --> R[Visualize metrics and comparisons]
+    subgraph Traditional_MultiClass_ML_Evaluation
+        direction TB
+        note_trad["ml_models.py: Handles various embeddings (FastText, W2V, TF-IDF) for multi-class tasks (e.g., first label)"]
+        E_FT_Combined ----> H_Trad_FT[Load FastText for ml_models.py];
+        E_OtherEmbed ----> H_Trad_Other[Load Other Embeddings for ml_models.py];
+        H_Trad_FT --> I_Trad_ML[Train RF, XGB, KNN, LR etc.];
+        H_Trad_Other --> I_Trad_ML;
+        I_Trad_ML --> J_Trad_Eval[Evaluate & Store Metrics];
     end
+
+    subgraph Optional_VAE_GAN_Data_Augmentation
+        direction TB
+        note_gan["GAN operates on selected embeddings (e.g., minority classes from FastText combined set)"]
+        E_FT_Combined --> K_GAN[Identify minority classes from embeddings];
+        K_GAN --> L_GAN[Build & Train VAE-GAN model];
+        L_GAN --> M_GAN[Generate synthetic embeddings];
+        M_GAN --> N_GAN[Save augmented dataset];
+        N_GAN --> O_GAN_Eval[Load Original & Augmented Data for Traditional ML Evaluation e.g. using ml_models.py];
+        O_GAN_Eval --> P_GAN_Results[Evaluate & Store Post-Augmentation Metrics];
+    end
+
+    style A fill:#lightgreen,stroke:#333,stroke-width:2px
+    style B fill:#lightgreen,stroke:#333,stroke-width:2px
+    style C fill:#lightgreen,stroke:#333,stroke-width:2px
+    style D_TF fill:#lightgreen,stroke:#333,stroke-width:2px
+
+    style E_FT_Combined fill:#lightblue,stroke:#333,stroke-width:2px
+    style E_FT_PerType fill:#lightblue,stroke:#333,stroke-width:2px
+    style E_OtherEmbed fill:#lightblue,stroke:#333,stroke-width:2px
+
+    style F_XGB_Combined fill:#FFD700,stroke:#333,stroke-width:2px
+    style G_XGB_Combined_Eval fill:#FFD700,stroke:#333,stroke-width:2px
+    style F_XGB_PerType fill:#FFD700,stroke:#333,stroke-width:2px
+    style G_XGB_PerType_Eval fill:#FFD700,stroke:#333,stroke-width:2px
+    
+    style H_Trad_FT fill:#FFBF00,stroke:#333,stroke-width:2px
+    style H_Trad_Other fill:#FFBF00,stroke:#333,stroke-width:2px
+    style I_Trad_ML fill:#FFBF00,stroke:#333,stroke-width:2px
+    style J_Trad_Eval fill:#FFBF00,stroke:#333,stroke-width:2px
+
+    style K_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
+    style L_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
+    style M_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
+    style N_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
+    style O_GAN_Eval fill:#FFC0CB,stroke:#333,stroke-width:2px
+    style P_GAN_Results fill:#FFC0CB,stroke:#333,stroke-width:2px
 ```
 
 ## Features

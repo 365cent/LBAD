@@ -47,3 +47,6 @@ h5py>=3.1.0
 
 # Types support
 typing-extensions>=3.10.0
+
+# For t-SNE
+openTSNE>=0.5.0
