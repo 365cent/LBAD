@@ -16,45 +16,45 @@ LBAD tackles challenges in log-based attack detection by:
 ```mermaid
 flowchart TD
     subgraph Log_Preprocessing
-        A["Scan and filter text log files"] --> B["Match logs with label files"];
-        B --> C["Generate TensorFlow Examples"];
-        C --> D["Serialize and store TFRecord files by log type"];
+        A["Scan and filter text log files"] --> B["Match logs with label files"]
+        B --> C["Generate TensorFlow Examples"]
+        C --> D["Serialize and store TFRecord files by log type"]
     end
 
     subgraph FastText_Embedding_Generation
-        D --> E["Load preprocessed TFRecord data (combined or per-type)"];
-        E --> F["Tokenize log entries"];
-        F --> G["Train or load FastText model(s)"];
-        G --> H["Generate embeddings"];
-        H --> I["Store Embeddings & Multi-Label Binary Labels (e.g., combined_all.pkl, web/labels.pkl)"];
+        D --> E["Load preprocessed TFRecord data (combined or per-type)"]
+        E --> F["Tokenize log entries"]
+        F --> G["Train or load FastText model(s)"]
+        G --> H["Generate embeddings"]
+        H --> I["Store Embeddings & Multi-Label Binary Labels"]
     end
 
     subgraph Baseline_XGBoost_MultiLabel_Evaluation
-        I -- Run xgboost_ml.py --context &lt;ctx&gt; --> I_Base1["Load Embeddings & Labels for context"];
-        I_Base1 --> J_Base["Train One-vs-Rest XGBoost Classifiers per attack type"];
-        J_Base --> K_Base["Predict multi-label attack vectors"];
-        K_Base --> L_Base["Evaluate & Store Baseline OvR Metrics"];
+        I --> I_Base1["Load Embeddings & Labels for context"]
+        I_Base1 --> J_Base["Train One-vs-Rest XGBoost Classifiers per attack type"]
+        J_Base --> K_Base["Predict multi-label attack vectors"]
+        K_Base --> L_Base["Evaluate & Store Baseline OvR Metrics"]
     end
 
     subgraph Optional_VAE_GAN_Data_Augmentation
-        I -- Select data (e.g., minority classes from combined set) --> M_GAN["Identify minority classes for GAN"];
-        M_GAN --> N_GAN["Build and compile VAE-GAN model"];
-        N_GAN --> O_GAN["Train VAE-GAN on selected embeddings"];
-        O_GAN --> P_GAN["Generate synthetic embeddings"];
-        P_GAN --> Q_GAN["Save augmented dataset"];
+        I --> M_GAN["Identify minority classes for GAN"]
+        M_GAN --> N_GAN["Build and compile VAE-GAN model"]
+        N_GAN --> O_GAN["Train VAE-GAN on selected embeddings"]
+        O_GAN --> P_GAN["Generate synthetic embeddings"]
+        P_GAN --> Q_GAN["Save augmented dataset"]
     end
 
     subgraph Evaluation_of_Augmented_Data_with_ML
-        Q_GAN --> R_Eval["Load Original & Augmented Embeddings"];
-        R_Eval -- Using e.g., ml_models.py or custom script --> S_Eval["Train ML Classifiers (e.g., XGBoost, RF) on different datasets"];
-        S_Eval --> T_Eval["Evaluate classifier performance (Original vs. Augmented)"];
-        T_Eval --> U_Eval["Visualize metrics and comparisons"];
+        Q_GAN --> R_Eval["Load Original & Augmented Embeddings"]
+        R_Eval --> S_Eval["Train ML Classifiers (e.g., XGBoost, RF) on different datasets"]
+        S_Eval --> T_Eval["Evaluate classifier performance (Original vs. Augmented)"]
+        T_Eval --> U_Eval["Visualize metrics and comparisons"]
     end
 
-    %% Styling (can be added or kept minimal)
-    style A fill:#lightgreen,stroke:#333,stroke-width:2px
-    style D fill:#lightgreen,stroke:#333,stroke-width:2px
-    style I fill:#lightblue,stroke:#333,stroke-width:2px
+    %% Styling
+    style A fill:#90EE90,stroke:#333,stroke-width:2px
+    style D fill:#90EE90,stroke:#333,stroke-width:2px
+    style I fill:#ADD8E6,stroke:#333,stroke-width:2px
     style L_Base fill:#FFD700,stroke:#333,stroke-width:2px
     style Q_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
     style U_Eval fill:#FFBF00,stroke:#333,stroke-width:2px
