@@ -22,11 +22,11 @@ flowchart TD
     end
 
     subgraph FastText_Embedding_Generation
-        D --> E[Load preprocessed TFRecord data (combined or per-type)];
+        D --> E["Load preprocessed TFRecord data (combined or per-type)"];
         E --> F[Tokenize log entries];
         F --> G[Train or load FastText model(s)];
         G --> H[Generate embeddings];
-        H --> I[Store Embeddings & Multi-Label Binary Labels (e.g., combined_all.pkl, web/labels.pkl)];
+        H --> I["Store Embeddings & Multi-Label Binary Labels (e.g., combined_all.pkl, web/labels.pkl)"];
     end
 
     subgraph Baseline_XGBoost_MultiLabel_Evaluation
@@ -37,7 +37,7 @@ flowchart TD
     end
 
     subgraph Optional_VAE_GAN_Data_Augmentation
-        I -- Select data (e.g., minority classes from combined set) --> M_GAN[Identify minority classes for GAN];
+        I -- Select data (e.g., minority classes from combined set) --> M_GAN["Identify minority classes for GAN"];
         M_GAN --> N_GAN[Build and compile VAE-GAN model];
         N_GAN --> O_GAN[Train VAE-GAN on selected embeddings];
         O_GAN --> P_GAN[Generate synthetic embeddings];
@@ -46,8 +46,8 @@ flowchart TD
 
     subgraph Evaluation_of_Augmented_Data_with_ML
         Q_GAN --> R_Eval[Load Original & Augmented Embeddings];
-        R_Eval -- Using e.g., ml_models.py or custom script --> S_Eval[Train ML Classifiers (e.g., XGBoost, RF) on different datasets];
-        S_Eval --> T_Eval[Evaluate classifier performance (Original vs. Augmented)];
+        R_Eval -- Using e.g., ml_models.py or custom script --> S_Eval["Train ML Classifiers (e.g., XGBoost, RF) on different datasets"];
+        S_Eval --> T_Eval["Evaluate classifier performance (Original vs. Augmented)"];
         T_Eval --> U_Eval[Visualize metrics and comparisons];
     end
 
