@@ -58,32 +58,6 @@ flowchart TD
         N_GAN --> O_GAN_Eval[Load Original & Augmented Data for Traditional ML Evaluation e.g. using ml_models.py];
         O_GAN_Eval --> P_GAN_Results[Evaluate & Store Post-Augmentation Metrics];
     end
-
-    style A fill:#lightgreen,stroke:#333,stroke-width:2px
-    style B fill:#lightgreen,stroke:#333,stroke-width:2px
-    style C fill:#lightgreen,stroke:#333,stroke-width:2px
-    style D_TF fill:#lightgreen,stroke:#333,stroke-width:2px
-
-    style E_FT_Combined fill:#lightblue,stroke:#333,stroke-width:2px
-    style E_FT_PerType fill:#lightblue,stroke:#333,stroke-width:2px
-    style E_OtherEmbed fill:#lightblue,stroke:#333,stroke-width:2px
-
-    style F_XGB_Combined fill:#FFD700,stroke:#333,stroke-width:2px
-    style G_XGB_Combined_Eval fill:#FFD700,stroke:#333,stroke-width:2px
-    style F_XGB_PerType fill:#FFD700,stroke:#333,stroke-width:2px
-    style G_XGB_PerType_Eval fill:#FFD700,stroke:#333,stroke-width:2px
-    
-    style H_Trad_FT fill:#FFBF00,stroke:#333,stroke-width:2px
-    style H_Trad_Other fill:#FFBF00,stroke:#333,stroke-width:2px
-    style I_Trad_ML fill:#FFBF00,stroke:#333,stroke-width:2px
-    style J_Trad_Eval fill:#FFBF00,stroke:#333,stroke-width:2px
-
-    style K_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style L_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style M_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style N_GAN fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style O_GAN_Eval fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style P_GAN_Results fill:#FFC0CB,stroke:#333,stroke-width:2px
 ```
 
 ## Features
