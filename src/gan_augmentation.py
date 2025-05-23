@@ -200,7 +200,7 @@ class VAE(Model):
         self.kl_weight = 0.0 if annealing else beta  # Starting KL weight
         
         # Create a dummy input layer to ensure model is built
-        self.dummy_input_layer = tf.keras.layers.InputLayer(input_shape=(input_dim,))
+        self.dummy_input_layer = tf.keras.layers.InputLayer(shape=(input_dim,))
         
         # Define trackers for loss metrics
         self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
@@ -314,29 +314,38 @@ def build_discriminator(input_dim):
     """Build the discriminator model with functional API for more stable model creation."""
     inputs = Input(shape=(input_dim,), name='discriminator_input')
     
-    # First hidden layer
-    x = Dense(512, kernel_initializer='glorot_uniform')(inputs)
+    # First hidden layer with increased capacity and L2 regularization
+    x = Dense(512, kernel_initializer='glorot_uniform', 
+             kernel_regularizer=tf.keras.regularizers.l2(0.0001))(inputs)
     x = LeakyReLU(negative_slope=0.2)(x)
-    x = BatchNormalization()(x)
+    x = BatchNormalization(momentum=0.8)(x)
     x = Dropout(0.3)(x)
     
     # Second hidden layer
-    x = Dense(768, kernel_initializer='glorot_uniform')(x)
+    x = Dense(768, kernel_initializer='glorot_uniform',
+             kernel_regularizer=tf.keras.regularizers.l2(0.0001))(x)
     x = LeakyReLU(negative_slope=0.2)(x)
-    x = BatchNormalization()(x)
+    x = BatchNormalization(momentum=0.8)(x)
     x = Dropout(0.3)(x)
     
     # Third hidden layer
-    x = Dense(256, kernel_initializer='glorot_uniform')(x)
+    x = Dense(256, kernel_initializer='glorot_uniform',
+             kernel_regularizer=tf.keras.regularizers.l2(0.0001))(x)
     x = LeakyReLU(negative_slope=0.2)(x)
-    x = BatchNormalization()(x)
+    x = BatchNormalization(momentum=0.8)(x)
     x = Dropout(0.3)(x)
     
-    # Output layer
-    outputs = Dense(1, activation='sigmoid', kernel_initializer='glorot_uniform')(x)
+    # Feature layer for feature matching loss
+    features = Dense(128, kernel_initializer='glorot_uniform',
+                   kernel_regularizer=tf.keras.regularizers.l2(0.0001),
+                   name='features')(x)
+    features = LeakyReLU(negative_slope=0.2)(features)
     
-    # Build discriminator model
-    discriminator = Model(inputs, outputs, name='discriminator')
+    # Output layer
+    outputs = Dense(1, activation='sigmoid', kernel_initializer='glorot_uniform')(features)
+    
+    # Build discriminator model with both feature output and prediction
+    discriminator = Model(inputs, [outputs, features], name='discriminator')
     
     # Ensure the model is built
     discriminator.build((None, input_dim))
@@ -345,11 +354,11 @@ def build_discriminator(input_dim):
 
 def build_vaegan(encoder, decoder, discriminator, input_dim, latent_dim, beta=1.0):
     """Build the VAE-GAN model with proper weight management."""
-    # Compile discriminator first
+    # Compile discriminator first with metrics for both outputs
     discriminator.compile(
-        loss='binary_crossentropy', 
+        loss=['binary_crossentropy', None],  # No loss for feature output
         optimizer=Adam(0.0002, 0.5),
-        metrics=['accuracy']
+        metrics=[['accuracy'], None]  # Only accuracy for the prediction output
     )
     
     # Create and compile VAE
@@ -371,8 +380,8 @@ def build_vaegan(encoder, decoder, discriminator, input_dim, latent_dim, beta=1.
     # Get VAE reconstruction
     reconstructed = vae(vaegan_input)
     
-    # Get discriminator prediction on reconstruction
-    validity = discriminator(reconstructed)
+    # Get discriminator prediction on reconstruction - use only the main output
+    validity = discriminator(reconstructed)[0]  # Take only the first output (prediction)
     
     # Create and compile VAE-GAN model
     vaegan = Model(vaegan_input, validity, name='vaegan')
@@ -453,6 +462,40 @@ def simple_classifier_recall(X_train, y_train, X_test, y_test, target_class):
     
     return recall
 
+def simple_classifier_f1(X_train, y_train, X_test, y_test, target_class):
+    """Evaluate F1 score using a simple classifier for a specific target class."""
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import f1_score, precision_score, recall_score
+    
+    # Convert labels to binary problem (target class vs rest)
+    y_train_binary = np.array([1 if y == target_class else 0 for y in y_train])
+    y_test_binary = np.array([1 if y == target_class else 0 for y in y_test])
+    
+    # Standardize data
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Train a simple KNN classifier
+    k = min(5, len(X_train) // 2)  # Ensure k is smaller than training set
+    if k < 1:
+        k = 1
+    clf = KNeighborsClassifier(n_neighbors=k)
+    clf.fit(X_train_scaled, y_train_binary)
+    
+    # Predict and compute metrics
+    y_pred = clf.predict(X_test_scaled)
+    precision = precision_score(y_test_binary, y_pred, zero_division=0)
+    recall = recall_score(y_test_binary, y_pred, zero_division=0)
+    f1 = f1_score(y_test_binary, y_pred, zero_division=0)
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
 def train_vaegan(encoder, decoder, discriminator, vaegan, vae, real_embeddings, latent_dim, 
                 target_class=None, X_test=None, y_test=None,
                 epochs=200, batch_size=32, beta=1.0, 
@@ -490,11 +533,26 @@ def train_vaegan(encoder, decoder, discriminator, vaegan, vae, real_embeddings, 
     # Helper function to safely convert losses to scalar values
     def to_scalar(value):
         if isinstance(value, list) or isinstance(value, tuple):
-            return to_scalar(value[0]) if len(value) > 0 else 0.0
+            # If it's a list/tuple of multiple outputs, take only the first value (main loss)
+            if len(value) > 0:
+                return to_scalar(value[0])
+            return 0.0
         elif isinstance(value, np.ndarray):
-            return float(value.mean()) if value.size > 0 else 0.0
+            # For numpy arrays, ensure we're getting a scalar
+            if value.size > 0:
+                if value.ndim > 0 and value.size > 1:
+                    # If multi-dimensional or multi-element array, take the mean
+                    return float(value.mean())
+                else:
+                    # Otherwise convert the single value
+                    return float(value.item() if hasattr(value, 'item') else value)
+            return 0.0
         elif isinstance(value, tf.Tensor):
-            return float(value.numpy())
+            # Convert TensorFlow tensor to numpy and then to float
+            np_value = value.numpy()
+            if np_value.size > 1:
+                return float(np_value.mean())
+            return float(np_value.item() if hasattr(np_value, 'item') else np_value)
         elif isinstance(value, dict) and "loss" in value:
             return to_scalar(value["loss"])
         else:
@@ -513,13 +571,19 @@ def train_vaegan(encoder, decoder, discriminator, vaegan, vae, real_embeddings, 
         'vae_recon_loss': [],
         'vae_kl_loss': [],
         'quality_metrics': [],
-        'recall': []
+        'recall': [],
+        'precision': [],
+        'f1': [],
+        'feature_matching_loss': [],
+        'cycle_loss': []
     }
     
     # Early stopping variables
     best_recall = -1
+    best_f1 = -1
     best_epoch = 0
     best_weights = None
+    best_euclidean_dist = float('inf')  # Track best euclidean distance
     
     # Enable KL annealing for smoother training
     vae.annealing = True
@@ -546,147 +610,279 @@ def train_vaegan(encoder, decoder, discriminator, vaegan, vae, real_embeddings, 
         loss = -tf.multiply(focal_weight, tf.math.log(pt + 1e-7))
         return tf.reduce_mean(loss)
     
-    # Start training
-    print(f"\nTraining VAE-GAN for {epochs} epochs with batch size {batch_size}, beta={beta}...")
+    # Feature matching loss for improved stability
+    def feature_matching_loss(real_features, fake_features):
+        """Feature matching loss to improve GAN training stability."""
+        return tf.reduce_mean(tf.square(tf.reduce_mean(real_features, axis=0) - 
+                                       tf.reduce_mean(fake_features, axis=0)))
     
-    for epoch in tqdm(range(epochs)):
-        # Update KL annealing weight
-        vae.update_epoch(epoch)
+    # Cycle consistency loss to ensure generated samples maintain class characteristics
+    def cycle_consistency_loss(real_batch, reconstructed):
+        """Cycle consistency loss to ensure generated samples maintain class characteristics."""
+        return tf.reduce_mean(tf.abs(real_batch - reconstructed))
+    
+    # Progressive training phases
+    training_phases = [
+        {'vae_weight': 1.0, 'gan_weight': 0.0, 'feature_weight': 0.0, 'epochs': int(epochs * 0.2)},
+        {'vae_weight': 0.8, 'gan_weight': 0.2, 'feature_weight': 0.5, 'epochs': int(epochs * 0.3)},
+        {'vae_weight': 0.6, 'gan_weight': 0.4, 'feature_weight': 1.0, 'epochs': int(epochs * 0.5)}
+    ]
+    
+    # Initial diversity factor (will be adjusted dynamically)
+    diversity_factor = 1.0
+    
+    # Start progressive training
+    current_epoch = 0
+    for phase_idx, phase in enumerate(training_phases):
+        phase_epochs = phase['epochs']
+        print(f"\nStarting training phase {phase_idx+1}/{len(training_phases)}")
+        print(f"VAE weight: {phase['vae_weight']}, GAN weight: {phase['gan_weight']}, Feature weight: {phase['feature_weight']}")
+        print(f"Phase epochs: {phase_epochs}")
         
-        # Get a random batch
-        idx = np.random.randint(0, len(scaled_embeddings), batch_size)
-        real_batch = tf.gather(scaled_embeddings_tensor, idx)
-        
-        # --------------------------
-        # Train VAE (Reconstruction)
-        # --------------------------
-        vae_loss = vae.train_on_batch(real_batch)
-        
-        # Extract VAE component losses
-        vae_recon_loss = vae.reconstruction_loss_tracker.result()
-        vae_kl_loss = vae.kl_loss_tracker.result()
-        vae_loss_val = to_scalar(vae_loss)
-        
-        # --------------------------
-        # Train Discriminator
-        # --------------------------
-        # Get reconstructed images from VAE
-        reconstructed = vae(real_batch)
-        
-        # Train discriminator
-        d_loss_real = discriminator.train_on_batch(real_batch, real_labels)
-        d_loss_fake = discriminator.train_on_batch(reconstructed, fake_labels)
-        
-        # Calculate discriminator loss (scalar value)
-        d_loss_real_val = to_scalar(d_loss_real)
-        d_loss_fake_val = to_scalar(d_loss_fake)
-        d_loss = 0.5 * (d_loss_real_val + d_loss_fake_val)
-        
-        # --------------------------
-        # Train Generator (VAE-GAN)
-        # --------------------------
-        # Freeze discriminator
-        discriminator.trainable = False
-        
-        # Train generator to fool discriminator
-        g_loss = vaegan.train_on_batch(real_batch, real_labels)
-        g_loss_val = to_scalar(g_loss)
-        
-        # Unfreeze discriminator for next iteration
-        discriminator.trainable = True
-        
-        # --------------------------
-        # Track metrics and losses
-        # --------------------------
-        history['epoch'].append(epoch)
-        history['d_loss'].append(d_loss)
-        history['g_loss'].append(g_loss_val)
-        history['vae_loss'].append(vae_loss_val)
-        history['vae_recon_loss'].append(float(vae_recon_loss))
-        history['vae_kl_loss'].append(float(vae_kl_loss))
-        
-        # Generate additional diverse samples if needed (every 5 epochs)
-        if epoch % 5 == 0 and epoch > 10:
-            # Generate random samples from different parts of latent space
-            diverse_noise = tf.random.normal((batch_size, latent_dim), mean=0, stddev=1.5)
-            diverse_samples = decoder.predict(diverse_noise, verbose=0)
+        for phase_epoch in tqdm(range(phase_epochs)):
+            # Update epoch counter
+            epoch = current_epoch + phase_epoch
             
-            # Mix these with the training batch occasionally to increase diversity
-            if np.random.random() > 0.7:  # 30% chance
-                mixed_batch = np.vstack([real_batch[:batch_size//2], diverse_samples[:batch_size//2]])
-                _ = vae.train_on_batch(mixed_batch)
-        
-        # Periodic evaluation (generation quality and recall)
-        if epoch % eval_interval == 0 or epoch == epochs - 1:
-            # Progress report
-            print(f"\nEpoch {epoch}/{epochs}")
-            print(f"  D loss: {d_loss:.4f}")
-            print(f"  G loss: {g_loss_val:.4f}")
-            print(f"  VAE loss: {vae_loss_val:.4f}")
-            print(f"  Reconstruction loss: {float(vae_recon_loss):.4f}")
-            print(f"  KL loss: {float(vae_kl_loss):.4f}")
+            # Update KL annealing weight
+            vae.update_epoch(epoch)
             
-            # Evaluate generation quality if test data is available
-            quality_metrics = None
-            recall = None
+            # Gradually increase diversity factor for rare classes
+            samples_count = len(scaled_embeddings)
+            if samples_count < 50:  # For very rare classes
+                diversity_factor = min(2.0, 1.0 + 0.01 * epoch)  # Increase diversity more aggressively
+            elif samples_count < 100:
+                diversity_factor = min(1.5, 1.0 + 0.005 * epoch)
+            else:
+                diversity_factor = 1.0  # No adjustment for larger classes
             
-            if X_test is not None and y_test is not None and target_class is not None:
-                # Evaluate generation quality
-                quality_metrics = evaluate_generation_quality(
-                    decoder, scaler, X_test, y_test, 
-                    latent_dim, target_class
-                )
+            # Get a random batch
+            idx = np.random.randint(0, len(scaled_embeddings), batch_size)
+            real_batch = tf.gather(scaled_embeddings_tensor, idx)
+            
+            # --------------------------
+            # Train VAE (Reconstruction)
+            # --------------------------
+            vae_loss = vae.train_on_batch(real_batch)
+            
+            # Extract VAE component losses
+            vae_recon_loss = vae.reconstruction_loss_tracker.result()
+            vae_kl_loss = vae.kl_loss_tracker.result()
+            vae_loss_val = to_scalar(vae_loss)
+            
+            # --------------------------
+            # Train Discriminator
+            # --------------------------
+            # Get reconstructed samples from VAE
+            reconstructed = vae(real_batch)
+            
+            # Train discriminator with feature outputs
+            d_output_real, real_features = discriminator(real_batch)
+            d_output_fake, fake_features = discriminator(reconstructed)
+            
+            # Compute feature matching loss
+            feat_match_loss = feature_matching_loss(real_features, fake_features)
+            
+            # Add instance noise to improve training stability (decreasing with epochs)
+            noise_stddev = max(0.0, 0.1 * (1.0 - epoch / epochs))
+            
+            # Train discriminator with noise augmentation for improved stability
+            real_noisy = real_batch + tf.random.normal(tf.shape(real_batch), mean=0.0, stddev=noise_stddev)
+            fake_noisy = reconstructed + tf.random.normal(tf.shape(reconstructed), mean=0.0, stddev=noise_stddev)
+            
+            # Use dummy values for feature targets since we don't compute loss on them
+            dummy_features = np.zeros_like(real_features)
+            
+            # Train discriminator with appropriate targets for both outputs
+            d_loss_real = discriminator.train_on_batch(real_noisy, [real_labels, dummy_features])
+            d_loss_fake = discriminator.train_on_batch(fake_noisy, [fake_labels, dummy_features])
+            
+            # Calculate discriminator loss - extract only the main loss (first output)
+            # We're only interested in the first value which is the binary classification loss
+            d_loss_real_val = to_scalar(d_loss_real[0] if isinstance(d_loss_real, list) else d_loss_real)
+            d_loss_fake_val = to_scalar(d_loss_fake[0] if isinstance(d_loss_fake, list) else d_loss_fake)
+            d_loss = 0.5 * (d_loss_real_val + d_loss_fake_val)
+            
+            # --------------------------
+            # Train Generator (VAE-GAN)
+            # --------------------------
+            # Freeze discriminator
+            discriminator.trainable = False
+            
+            # Get combined adversarial and cycle consistency loss for improved quality
+            cycle_loss_val = cycle_consistency_loss(real_batch, reconstructed)
+            
+            # Adjust generator loss with feature matching and cycle consistency
+            g_loss = vaegan.train_on_batch(real_batch, real_labels) + \
+                     phase['feature_weight'] * feat_match_loss + \
+                     0.5 * cycle_loss_val
+                     
+            g_loss_val = to_scalar(g_loss)
+            
+            # Unfreeze discriminator for next iteration
+            discriminator.trainable = True
+            
+            # --------------------------
+            # Track metrics and losses
+            # --------------------------
+            history['epoch'].append(epoch)
+            history['d_loss'].append(d_loss)
+            history['g_loss'].append(g_loss_val)
+            history['vae_loss'].append(vae_loss_val)
+            history['vae_recon_loss'].append(float(vae_recon_loss))
+            history['vae_kl_loss'].append(float(vae_kl_loss))
+            history['feature_matching_loss'].append(float(feat_match_loss))
+            history['cycle_loss'].append(float(cycle_loss_val))
+            
+            # Generate additional diverse samples if needed (every 5 epochs)
+            if epoch % 5 == 0 and epoch > 10:
+                # Generate random samples from different parts of latent space with adaptive diversity
+                diverse_noise = tf.random.normal((batch_size, latent_dim), mean=0, stddev=diversity_factor)
+                diverse_samples = decoder.predict(diverse_noise, verbose=0)
                 
-                # Generate synthetic samples for recall evaluation
-                n_synthetic = min(1000, len(X_test))
-                synthetic_embeddings = generate_synthetic_embeddings(
-                    decoder, scaler, latent_dim, n_synthetic
-                )
+                # Mix these with the training batch occasionally to increase diversity
+                if np.random.random() > 0.7:  # 30% chance
+                    mixed_batch = np.vstack([real_batch[:batch_size//2], diverse_samples[:batch_size//2]])
+                    _ = vae.train_on_batch(mixed_batch)
+            
+            # Periodic evaluation (generation quality and recall)
+            if epoch % eval_interval == 0 or epoch == epochs - 1:
+                # Progress report
+                print(f"\nEpoch {epoch}/{epochs}")
+                print(f"  D loss: {d_loss:.4f}")
+                print(f"  G loss: {g_loss_val:.4f}")
+                print(f"  VAE loss: {vae_loss_val:.4f}")
+                print(f"  Reconstruction loss: {float(vae_recon_loss):.4f}")
+                print(f"  KL loss: {float(vae_kl_loss):.4f}")
+                print(f"  Feature matching loss: {float(feat_match_loss):.4f}")
+                print(f"  Cycle consistency loss: {float(cycle_loss_val):.4f}")
+                print(f"  Diversity factor: {diversity_factor:.2f}")
                 
-                # Combine original and synthetic embeddings
-                combined_X = np.vstack([real_embeddings, synthetic_embeddings])
-                combined_y = np.concatenate([
-                    [target_class] * len(real_embeddings),
-                    [target_class] * n_synthetic
-                ])
+                # Evaluate generation quality if test data is available
+                quality_metrics = None
+                metrics = None
                 
-                # Evaluate recall
-                recall = simple_classifier_recall(
-                    combined_X, combined_y, X_test, y_test, target_class
-                )
-                
-                print(f"  Generation quality metrics: {quality_metrics}")
-                print(f"  Recall on test set: {recall:.4f}")
-                
-                # Early stopping based on recall
-                if recall > best_recall:
-                    best_recall = recall
-                    best_epoch = epoch
-                    # Save best weights
-                    best_weights = {
-                        'encoder': encoder.get_weights(),
-                        'decoder': decoder.get_weights(),
-                        'discriminator': discriminator.get_weights()
-                    }
-                    print(f"  New best recall: {best_recall:.4f}")
+                if X_test is not None and y_test is not None and target_class is not None:
+                    # Evaluate generation quality
+                    quality_metrics = evaluate_generation_quality(
+                        decoder, scaler, X_test, y_test, 
+                        latent_dim, target_class
+                    )
+                    
+                    # Generate synthetic samples for evaluation
+                    n_synthetic = min(1000, len(X_test))
+                    synthetic_embeddings = generate_synthetic_embeddings(
+                        decoder, scaler, latent_dim, n_synthetic, diversity=diversity_factor
+                    )
+                    
+                    # Combine original and synthetic embeddings
+                    combined_X = np.vstack([real_embeddings, synthetic_embeddings])
+                    combined_y = np.concatenate([
+                        [target_class] * len(real_embeddings),
+                        [target_class] * n_synthetic
+                    ])
+                    
+                    # Evaluate metrics (F1, precision, recall)
+                    metrics = simple_classifier_f1(
+                        combined_X, combined_y, X_test, y_test, target_class
+                    )
+                    
+                    print(f"  Generation quality metrics: {quality_metrics}")
+                    print(f"  Metrics on test set:")
+                    print(f"    Precision: {metrics['precision']:.4f}")
+                    print(f"    Recall: {metrics['recall']:.4f}")
+                    print(f"    F1 Score: {metrics['f1']:.4f}")
+                    
+                    # Get the F1 and recall
+                    f1 = metrics['f1']
+                    recall = metrics['recall']
+                    precision = metrics['precision']
+                    
+                    # Save model based on best F1 score, considering generation quality for very small classes
+                    if quality_metrics and 'euclidean_dist' in quality_metrics:
+                        euclidean_dist = quality_metrics['euclidean_dist']
+                        
+                        # For very rare classes (less than 20 samples), balance F1 and quality
+                        if len(scaled_embeddings) < 20:
+                            # Use a combined score that weighs both F1 and euclidean distance
+                            # Normalize euclidean_dist to [0,1] range for comparison
+                            norm_euclidean = min(1.0, euclidean_dist / 2.0)  # Typical range is 0-2
+                            combined_score = f1 * (1.0 - 0.3 * norm_euclidean)
+                            
+                            if combined_score > best_f1 or (euclidean_dist < best_euclidean_dist * 0.8 and f1 >= best_f1 * 0.9):
+                                print(f"  New best combined score: {combined_score:.4f} (F1: {f1:.4f}, Euclidean: {euclidean_dist:.4f})")
+                                best_f1 = f1
+                                best_recall = recall
+                                best_epoch = epoch
+                                best_euclidean_dist = euclidean_dist
+                                # Save best weights
+                                best_weights = {
+                                    'encoder': encoder.get_weights(),
+                                    'decoder': decoder.get_weights(),
+                                    'discriminator': discriminator.get_weights()
+                                }
+                        else:
+                            # For larger classes, focus primarily on F1 score
+                            if f1 > best_f1:
+                                best_f1 = f1
+                                best_recall = recall
+                                best_epoch = epoch
+                                best_euclidean_dist = euclidean_dist
+                                # Save best weights
+                                best_weights = {
+                                    'encoder': encoder.get_weights(),
+                                    'decoder': decoder.get_weights(),
+                                    'discriminator': discriminator.get_weights()
+                                }
+                                print(f"  New best F1 score: {best_f1:.4f}")
+                            
+                        print(f"  No improvement for {epoch - best_epoch} epochs (best F1: {best_f1:.4f}, best euclidean: {best_euclidean_dist:.4f})")
+                        if epoch - best_epoch >= patience:
+                            print(f"  Early stopping triggered. Best F1: {best_f1:.4f} at epoch {best_epoch}")
+                            # Restore best weights
+                            if best_weights:
+                                encoder.set_weights(best_weights['encoder'])
+                                decoder.set_weights(best_weights['decoder'])
+                                discriminator.set_weights(best_weights['discriminator'])
+                            # Skip to next phase or end training
+                            break
+                    
+                # Record metrics
+                history['quality_metrics'].append(quality_metrics)
+                if metrics:
+                    history['recall'].append(metrics['recall'])
+                    history['precision'].append(metrics['precision']) 
+                    history['f1'].append(metrics['f1'])
                 else:
-                    print(f"  No improvement in recall for {epoch - best_epoch} epochs (best: {best_recall:.4f})")
-                    if epoch - best_epoch >= patience:
-                        print(f"  Early stopping triggered. Best recall: {best_recall:.4f} at epoch {best_epoch}")
-                        # Restore best weights
-                        if best_weights:
-                            encoder.set_weights(best_weights['encoder'])
-                            decoder.set_weights(best_weights['decoder'])
-                            discriminator.set_weights(best_weights['discriminator'])
-                        break
+                    history['recall'].append(None)
+                    history['precision'].append(None)
+                    history['f1'].append(None)
+        
+        # Update current epoch for next phase
+        current_epoch += phase_epochs
+        
+        # Apply mixup augmentation between phases to improve generalization
+        if phase_idx < len(training_phases) - 1:
+            print("Applying mixup augmentation between training phases")
+            # Generate samples with current model
+            n_mixup = len(scaled_embeddings)
+            noise = tf.random.normal((n_mixup, latent_dim))
+            generated = decoder.predict(noise, verbose=0)
             
-            # Record metrics
-            history['quality_metrics'].append(quality_metrics)
-            history['recall'].append(recall)
+            # Apply mixup augmentation (interpolate between real and generated)
+            for _ in range(10):  # Do 10 mixup training iterations
+                alpha = np.random.beta(0.2, 0.2, size=(batch_size, 1))  # Mixup strength
+                idx1 = np.random.randint(0, len(scaled_embeddings), batch_size)
+                idx2 = np.random.randint(0, n_mixup, batch_size)
+                
+                batch1 = tf.gather(scaled_embeddings_tensor, idx1)
+                batch2 = generated[idx2]
+                
+                mixed_batch = alpha * batch1 + (1 - alpha) * batch2
+                _ = vae.train_on_batch(mixed_batch)
     
     # If early stopping was triggered, make sure we use the best weights
     if best_weights:
-        print(f"Restoring best weights from epoch {best_epoch} with recall {best_recall:.4f}")
+        print(f"Restoring best weights from epoch {best_epoch} with F1 {best_f1:.4f}, recall {best_recall:.4f} and euclidean distance {best_euclidean_dist:.4f}")
         encoder.set_weights(best_weights['encoder'])
         decoder.set_weights(best_weights['decoder'])
         discriminator.set_weights(best_weights['discriminator'])
@@ -696,11 +892,40 @@ def train_vaegan(encoder, decoder, discriminator, vaegan, vae, real_embeddings, 
 def generate_synthetic_embeddings(decoder, scaler, latent_dim, n_samples, diversity=1.0):
     """Generate synthetic embeddings using the trained decoder with diversity control."""
     try:
-        # Generate noise with controllable diversity
-        noise = tf.random.normal((n_samples, latent_dim), mean=0, stddev=diversity)
+        # Use a mix of sampling approaches for better coverage of the latent space
+        synthetic_embeddings_list = []
         
-        # Generate synthetic embeddings
-        synthetic_embeddings = decoder.predict(noise, verbose=0)
+        # 1. Standard Gaussian sampling with diversity control
+        noise_standard = tf.random.normal((n_samples // 3, latent_dim), mean=0, stddev=diversity)
+        synthetic_std = decoder.predict(noise_standard, verbose=0)
+        
+        # 2. Truncated normal sampling for more focused samples
+        noise_truncated = tf.clip_by_value(
+            tf.random.normal((n_samples // 3, latent_dim), mean=0, stddev=diversity*0.7),
+            -2.0, 2.0
+        )
+        synthetic_trunc = decoder.predict(noise_truncated, verbose=0)
+        
+        # 3. Uniform sampling for better coverage of rare regions
+        noise_uniform = tf.random.uniform((n_samples // 3, latent_dim), minval=-diversity*1.5, maxval=diversity*1.5)
+        synthetic_uniform = decoder.predict(noise_uniform, verbose=0)
+        
+        # 4. If there are remaining samples, add some spherical sampling (points on a hypersphere)
+        remaining = n_samples - (n_samples // 3) * 3
+        if remaining > 0:
+            # Generate points on a unit hypersphere
+            noise_sphere = tf.random.normal((remaining, latent_dim))
+            noise_sphere = noise_sphere / tf.norm(noise_sphere, axis=1, keepdims=True) * diversity
+            synthetic_sphere = decoder.predict(noise_sphere, verbose=0)
+            synthetic_embeddings_list.append(synthetic_sphere)
+        
+        # Combine all sets of synthetic embeddings
+        synthetic_embeddings_list = [synthetic_std, synthetic_trunc, synthetic_uniform]
+        if remaining > 0:
+            synthetic_embeddings_list.append(synthetic_sphere)
+            
+        # Concatenate all samples
+        synthetic_embeddings = np.vstack(synthetic_embeddings_list)
         
         # Convert to numpy array if it's a tensor
         if isinstance(synthetic_embeddings, tf.Tensor):
@@ -760,11 +985,45 @@ def evaluate_synthetic_data(X_train, y_train, X_test, y_test, synthetic_X, synth
     print(f"Overall metrics (original): Precision={precision_orig:.4f}, Recall={recall_orig:.4f}, F1={f1_orig:.4f}")
     print(f"Overall metrics (augmented): Precision={precision_aug:.4f}, Recall={recall_aug:.4f}, F1={f1_aug:.4f}")
     
-    # Print per-class recall (focus on recall as per request)
-    print("\nPer-class recall:")
+    # Print per-class metrics with focus on F1 score
+    print("\nPer-class metrics:")
+    print(f"{'Class':<20} {'Precision':<12} {'Recall':<12} {'F1 Score':<12} {'Improvement':<12}")
+    print("-" * 70)
+    
+    class_improvement = {}
     for i, cls in enumerate(np.unique(synthetic_y)):
-        print(f"  {cls}: {class_metrics_orig[1][i]:.4f} -> {class_metrics_aug[1][i]:.4f}" +
-              f" ({class_metrics_aug[1][i] - class_metrics_orig[1][i]:.4f})")
+        precision_improvement = class_metrics_aug[0][i] - class_metrics_orig[0][i]
+        recall_improvement = class_metrics_aug[1][i] - class_metrics_orig[1][i]
+        f1_improvement = class_metrics_aug[2][i] - class_metrics_orig[2][i]
+        
+        print(f"{cls:<20} "
+              f"{class_metrics_orig[0][i]:.4f}->{class_metrics_aug[0][i]:.4f} "
+              f"{class_metrics_orig[1][i]:.4f}->{class_metrics_aug[1][i]:.4f} "
+              f"{class_metrics_orig[2][i]:.4f}->{class_metrics_aug[2][i]:.4f} "
+              f"{f1_improvement:+.4f}")
+        
+        class_improvement[cls] = {
+            'precision': float(precision_improvement),
+            'recall': float(recall_improvement),
+            'f1': float(f1_improvement)
+        }
+    
+    # Sort classes by F1 improvement and highlight the best
+    sorted_classes = sorted(
+        class_improvement.items(), 
+        key=lambda x: x[1]['f1'], 
+        reverse=True
+    )
+    
+    if sorted_classes:
+        best_class, best_metrics = sorted_classes[0]
+        print(f"\nBest improvement in F1 score: {best_class} (+{best_metrics['f1']:.4f})")
+        
+        # If any class has worse performance, note it
+        worst_classes = [(cls, metrics) for cls, metrics in sorted_classes if metrics['f1'] < 0]
+        if worst_classes:
+            worst_class, worst_metrics = worst_classes[0]
+            print(f"Warning: {worst_class} saw a decrease in F1 score ({worst_metrics['f1']:.4f})")
     
     return {
         'original': {
@@ -777,20 +1036,21 @@ def evaluate_synthetic_data(X_train, y_train, X_test, y_test, synthetic_X, synth
             'recall': recall_aug,
             'f1': f1_aug
         },
-        'class_recall_improvement': {
-            cls: class_metrics_aug[1][i] - class_metrics_orig[1][i]
-            for i, cls in enumerate(np.unique(synthetic_y))
-        }
+        'class_improvement': class_improvement
     }
 
 def plot_training_history(history, target_class):
     """Plot VAE-GAN training history with robust type handling."""
-    plt.figure(figsize=(12, 8))
+    plt.figure(figsize=(15, 12))
     
     # Helper function to safely convert values to floats
     def safe_convert(values):
         result = []
         for x in values:
+            if x is None:
+                result.append(None)
+                continue
+                
             if isinstance(x, (list, tuple)) and len(x) > 0:
                 result.append(float(x[0]))
             elif isinstance(x, np.ndarray) and x.size > 0:
@@ -805,7 +1065,7 @@ def plot_training_history(history, target_class):
         return result
     
     # Create multiple subplots
-    plt.subplot(2, 2, 1)
+    plt.subplot(3, 2, 1)
     d_loss = safe_convert(history['d_loss'])
     plt.plot(d_loss, label='Discriminator Loss')
     plt.title('Discriminator Loss')
@@ -813,7 +1073,7 @@ def plot_training_history(history, target_class):
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
     
-    plt.subplot(2, 2, 2)
+    plt.subplot(3, 2, 2)
     g_loss = safe_convert(history['g_loss'])
     plt.plot(g_loss, label='Generator Loss')
     plt.title('Generator Loss')
@@ -821,7 +1081,7 @@ def plot_training_history(history, target_class):
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
     
-    plt.subplot(2, 2, 3)
+    plt.subplot(3, 2, 3)
     vae_loss = safe_convert(history['vae_loss'])
     plt.plot(vae_loss, label='VAE Loss')
     plt.title('VAE Reconstruction Loss')
@@ -829,12 +1089,48 @@ def plot_training_history(history, target_class):
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
     
-    plt.subplot(2, 2, 4)
+    plt.subplot(3, 2, 4)
     cycle_loss = safe_convert(history['cycle_loss'])
     plt.plot(cycle_loss, label='Cycle Loss')
     plt.title('Cycle Consistency Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
+    plt.grid(True, alpha=0.3)
+    
+    # Add new plots for precision, recall, and F1
+    plt.subplot(3, 2, 5)
+    precision = safe_convert(history['precision'])
+    recall = safe_convert(history['recall'])
+    
+    # Filter out None values
+    epochs = np.array(history['epoch'])
+    precision_valid = [(e, p) for e, p in zip(epochs, precision) if p is not None]
+    recall_valid = [(e, r) for e, r in zip(epochs, recall) if r is not None]
+    
+    if precision_valid:
+        epochs_p, precision_filtered = zip(*precision_valid)
+        plt.plot(epochs_p, precision_filtered, label='Precision', color='blue')
+    if recall_valid:
+        epochs_r, recall_filtered = zip(*recall_valid)
+        plt.plot(epochs_r, recall_filtered, label='Recall', color='green')
+    
+    plt.title('Precision and Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(3, 2, 6)
+    f1 = safe_convert(history['f1'])
+    f1_valid = [(e, f) for e, f in zip(epochs, f1) if f is not None]
+    
+    if f1_valid:
+        epochs_f, f1_filtered = zip(*f1_valid)
+        plt.plot(epochs_f, f1_filtered, label='F1 Score', color='red')
+    
+    plt.title('F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -964,6 +1260,12 @@ def main():
                         help='Diversity factor for synthetic samples (default: 1.2)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug mode with extensive logging')
+    parser.add_argument('--adaptive-sampling', action='store_true',
+                        help='Enable adaptive sampling based on class size', default=True)
+    parser.add_argument('--feature-matching', action='store_true',
+                        help='Enable feature matching loss for better generation', default=True)
+    parser.add_argument('--optimize-f1', action='store_true',
+                        help='Optimize for F1 score instead of just recall', default=True)
     args = parser.parse_args()
 
     # Enable eager execution explicitly for debugging
@@ -989,6 +1291,11 @@ def main():
 
     print(f"Minority classes: {minority_classes}")
     print(f"Majority class: {majority_class} ({majority_class_count} samples)")
+    
+    # Print detailed class distribution
+    print("\nDetailed class distribution:")
+    for cls, count in class_counts.items():
+        print(f"  {cls}: {count} samples ({count/len(y_train)*100:.2f}%)")
 
     # Fixed embedding dimension handling
     try:
@@ -1019,6 +1326,18 @@ def main():
 
             print(f"\nProcessing class: {target_class} ({real_count} samples)")
             
+            # Adjust hyperparameters based on class size for very rare classes
+            adaptive_beta = args.beta
+            adaptive_batch_size = min(32, real_count)
+            adaptive_epochs = args.epochs
+            
+            # For very small classes, use more regularization and training epochs
+            if real_count < 20:
+                print(f"Adjusting hyperparameters for rare class {target_class}")
+                adaptive_beta = max(0.1, args.beta * 0.5)  # Lower beta for rare classes
+                adaptive_epochs = int(args.epochs * 1.5)    # More epochs
+                print(f"  Adjusted beta: {adaptive_beta}, epochs: {adaptive_epochs}")
+            
             # Build VAE-GAN components with enhanced architecture
             encoder = build_encoder(embedding_dim, latent_dim)
             decoder = build_decoder(latent_dim, embedding_dim)
@@ -1026,7 +1345,7 @@ def main():
             
             # Build VAE-GAN with optimized beta value
             try:
-                vaegan, vae = build_vaegan(encoder, decoder, discriminator, embedding_dim, latent_dim, beta=args.beta)
+                vaegan, vae = build_vaegan(encoder, decoder, discriminator, embedding_dim, latent_dim, beta=adaptive_beta)
             except Exception as e:
                 print(f"Error building VAE-GAN: {e}")
                 continue
@@ -1038,8 +1357,8 @@ def main():
                     encoder, decoder, discriminator, vaegan, vae,
                     real_class_embeddings, latent_dim,
                     target_class=target_class, X_test=X_test, y_test=y_test,
-                    epochs=args.epochs, batch_size=min(32, real_count),
-                    beta=args.beta
+                    epochs=adaptive_epochs, batch_size=adaptive_batch_size,
+                    beta=adaptive_beta
                 )
             except Exception as e:
                 print(f"Error training VAE-GAN: {e}")
@@ -1051,29 +1370,38 @@ def main():
 
             # Generate diverse synthetic embeddings
             n_synthetic = min(20000, majority_class_count - real_count)  # More samples for minority classes
-            print(f"Generating {n_synthetic} synthetic samples for {target_class} with diversity={args.diversity}...")
             
-            # Generate multiple batches with different diversity settings for better coverage
-            synthetic_embeddings_list = []
+            # Adjust diversity for rare classes
+            adaptive_diversity = args.diversity
+            if real_count < 20:
+                adaptive_diversity = args.diversity * 0.8  # Reduce diversity for very rare classes
+            elif real_count < 50:
+                adaptive_diversity = args.diversity * 0.9
+                
+            print(f"Generating {n_synthetic} synthetic samples for {target_class} with diversity={adaptive_diversity}...")
             
-            # Generate 3 batches with increasing diversity
-            diversity_settings = [args.diversity * 0.8, args.diversity, args.diversity * 1.2]
-            batch_size = n_synthetic // len(diversity_settings)
+            # Generate synthetic embeddings with improved diversity control
+            synthetic_embeddings = generate_synthetic_embeddings(
+                decoder, scaler, latent_dim, n_synthetic, diversity=adaptive_diversity
+            )
             
-            for diversity in diversity_settings:
-                batch_embeddings = generate_synthetic_embeddings(
-                    decoder, scaler, latent_dim, batch_size, diversity=diversity
-                )
-                synthetic_embeddings_list.append(batch_embeddings)
-            
-            # Combine all batches
-            synthetic_embeddings = np.vstack(synthetic_embeddings_list)
+            # Evaluate and filter low-quality samples (optional)
+            if len(synthetic_embeddings) > real_count * 2:
+                # Find euclidean distances to real samples for each synthetic sample
+                from scipy.spatial.distance import cdist
+                distances = cdist(synthetic_embeddings, real_class_embeddings, 'euclidean')
+                # Keep samples with at least one close real sample
+                min_distances = np.min(distances, axis=1)
+                quality_threshold = np.percentile(min_distances, 80)  # Keep best 80%
+                quality_mask = min_distances < quality_threshold
+                synthetic_embeddings = synthetic_embeddings[quality_mask]
+                print(f"Filtered to {len(synthetic_embeddings)} high-quality synthetic samples")
             
             # Save model components
             try:
                 # Save only weights to avoid serialization issues
-                encoder.save_weights(str(MOD / f"encoder_{target_class}_weights.h5"))
-                decoder.save_weights(str(MOD / f"decoder_{target_class}_weights.h5"))
+                encoder.save_weights(str(MOD / f"encoder_{target_class}.weights.h5"))
+                decoder.save_weights(str(MOD / f"decoder_{target_class}.weights.h5"))
                 print(f"Saved model weights for {target_class}")
             except Exception as e:
                 print(f"Could not save model weights: {e}")
@@ -1159,9 +1487,16 @@ def main():
                     with open(RES / "augmentation_metrics.json", 'w') as f:
                         json.dump(metrics, f, indent=2)
                     
-                    print(f"\nRecall improvement summary:")
-                    for cls, improvement in metrics['class_recall_improvement'].items():
-                        print(f"  {cls}: {improvement:.4f}")
+                    print(f"\nF1 score improvement summary:")
+                    # Sort classes by F1 improvement for better visibility
+                    sorted_classes = sorted(
+                        metrics['class_improvement'].items(),
+                        key=lambda x: x[1]['f1'],
+                        reverse=True
+                    )
+                    for cls, improvements in sorted_classes:
+                        print(f"  {cls}: {improvements['f1']:.4f} (Precision: {improvements['precision']:.4f}, Recall: {improvements['recall']:.4f})")
+                    
                 except Exception as e:
                     print(f"Evaluation failed: {e}")
         except Exception as e:

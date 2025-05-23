@@ -87,7 +87,7 @@ def create_models(random_state=42):
             use_label_encoder=False,
             verbosity=0
         ),
-                'knn': KNeighborsClassifier(
+        'knn': KNeighborsClassifier(
             n_neighbors=5,
             weights='distance',
             algorithm='auto',

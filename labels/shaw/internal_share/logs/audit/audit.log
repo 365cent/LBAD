@@ -1,0 +1,2 @@
+{"line": 701, "labels": ["dnsteal", "exfiltration-service", "attacker"], "rules": {"dnsteal": ["exfil.service"], "exfiltration-service": ["exfil.service"], "attacker": ["exfil.service"]}}
+{"line": 702, "labels": ["dnsteal", "exfiltration-service", "attacker"], "rules": {"dnsteal": ["exfil.service"], "exfiltration-service": ["exfil.service"], "attacker": ["exfil.service"]}}
