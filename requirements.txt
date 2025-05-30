@@ -50,3 +50,6 @@ typing-extensions>=3.10.0
 
 # For t-SNE
 openTSNE>=0.5.0
+
+# Progress spinners
+halo>=0.0.31

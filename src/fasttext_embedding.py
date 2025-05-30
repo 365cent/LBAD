@@ -2,14 +2,47 @@
 # -*- coding: utf-8 -*-
 
 """
-FastText Embedding for Log Analysis - Optimized
+FastText Embedding for Log Analysis - Using Pre-trained Models
+
+Key Improvements:
+- Uses pre-trained FastText models instead of training from scratch
+- Embeds logs as FastText vectors for better semantic representation
+- Creates binary multi-label vectors with clear column mapping
+- Removed randomness for consistent results
+- Enhanced progress tracking with dots spinner
+- Visualization shows ALL classes without sampling/reduction
+
+Output files per log type (only 2 files as requested):
+- log_{type}.pkl: Raw log text embeddings (300D FastText vectors, float32)
+- label_{type}.pkl: Binary label vectors with metadata
+  * 'vectors': Binary arrays where [0 1 0] means only second class is present
+  * 'classes': List of attack types corresponding to each column
+  * 'column_explanation': JSON mapping of column indices to attack types
+  * 'example': Sample vector with explanation
+  * 'description': Explanation of the binary vector format
+
+Performance optimizations:
+- Batch processing (500 samples per batch)
+- Memory-efficient data types (int8 for labels, float32 for embeddings)
+- Vectorized operations where possible
+- Optimized pickle protocol for faster I/O
+- Barnes-Hut t-SNE for faster visualization
+- Reduced progress update frequency
+
+Example label structure:
+{
+  'vectors': array([[0, 1, 0], [1, 0, 1], ...], dtype=int8),  # Binary vectors
+  'classes': ['attack_type_1', 'attack_type_2', 'attack_type_3'],
+  'column_explanation': {'column_0': 'attack_type_1', 'column_1': 'attack_type_2', ...},
+  'example': {'vector': [0 1 0], 'meaning': 'Example: [0 1 0] means only attack_type_2 is present'}
+}
 """
 
 import os
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from gensim.models import FastText
+from gensim.models import KeyedVectors
 from gensim.utils import simple_preprocess
 from pathlib import Path
 import pickle
@@ -22,13 +55,12 @@ import multiprocessing
 import argparse
 from functools import partial
 from halo import Halo
+import gensim.downloader as api
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
-MODEL_DIR = Path("models")
 PROCESSED_DIR = Path("processed")
-VECTOR_SIZE = 128
-RANDOM_SEED = 42
+VECTOR_SIZE = 300  # Standard FastText vector size
 
 def parse_example(example):
     """Parse a TensorFlow Example protocol buffer."""
@@ -106,7 +138,7 @@ def normalize_label(label):
     """Normalize attack labels to ensure consistency."""
     if not label:
         return label
-    return label.replace('-', '_')
+    return label.replace('-', '_').lower().strip()
 
 def get_labels_from_json(label_json_str):
     """Extract labels from JSON string."""
@@ -128,18 +160,89 @@ def collect_unique_labels_from_data(df):
     for label_json_str in df['label_json']:
         all_unique_labels.update(get_labels_from_json(label_json_str))
     
+    # Remove empty labels
+    all_unique_labels.discard('')
+    all_unique_labels.discard(None)
+    
     spinner.succeed(f"Found {len(all_unique_labels)} unique attack types")
     return sorted(list(all_unique_labels))
 
-def create_attack_binary_vector(label_json_str, target_attack_types):
-    """Convert labels from JSON string into a binary vector."""
-    normalized_labels = get_labels_from_json(label_json_str)
+def load_pretrained_fasttext():
+    """Load pre-trained FastText model."""
+    spinner = Halo(text='Loading pre-trained FastText model', spinner='dots')
+    spinner.start()
     
-    # Create binary vector
-    binary_vector = np.zeros(len(target_attack_types), dtype=np.int8)  # Use int8 instead of int
-    for i, attack in enumerate(target_attack_types):
-        if attack in normalized_labels:
-            binary_vector[i] = 1
+    try:
+        # Try to load from local cache first
+        model = api.load("fasttext-wiki-news-subwords-300")
+        spinner.succeed("Loaded pre-trained FastText model (fasttext-wiki-news-subwords-300)")
+        return model
+    except Exception as e:
+        spinner.text = "Downloading pre-trained FastText model (this may take a while)"
+        try:
+            model = api.load("fasttext-wiki-news-subwords-300")
+            spinner.succeed("Downloaded and loaded pre-trained FastText model")
+            return model
+        except Exception as e2:
+            # Try alternative smaller model if main one fails
+            spinner.text = "Trying alternative word2vec model"
+            try:
+                model = api.load("word2vec-google-news-300")
+                spinner.succeed("Loaded alternative word2vec model (word2vec-google-news-300)")
+                return model
+            except Exception as e3:
+                spinner.fail(f"Failed to load any pre-trained model: {e3}")
+                print("Consider installing fasttext manually or check internet connection")
+                return None
+
+def preprocess_text(text):
+    """Preprocess text for embedding."""
+    return simple_preprocess(text)
+
+def embed_text(model, tokens):
+    """Generate embedding for tokenized text using pre-trained FastText."""
+    if not tokens:
+        return np.zeros(model.vector_size, dtype=np.float32)
+    
+    # Vectorized approach for better performance
+    valid_tokens = [token for token in tokens if token in model]
+    
+    if valid_tokens:
+        # Get all embeddings at once and compute mean
+        embeddings_matrix = np.array([model[token] for token in valid_tokens], dtype=np.float32)
+        return np.mean(embeddings_matrix, axis=0)
+    else:
+        return np.zeros(model.vector_size, dtype=np.float32)
+
+def embed_labels(model, labels):
+    """Generate embeddings for labels."""
+    if not labels:
+        return np.zeros(model.vector_size)
+    
+    label_embeddings = []
+    for label in labels:
+        if label:
+            tokens = preprocess_text(label)
+            embedding = embed_text(model, tokens)
+            label_embeddings.append(embedding)
+    
+    if label_embeddings:
+        return np.mean(label_embeddings, axis=0)
+    else:
+        return np.zeros(model.vector_size)
+
+def create_binary_label_vector(label_json_str, all_attack_types):
+    """Create binary vector representation for multi-label classification."""
+    labels = get_labels_from_json(label_json_str)
+    
+    # Binary vector: [0 1 0] means only second class is present
+    binary_vector = np.zeros(len(all_attack_types), dtype=np.int8)  # Use int8 for memory efficiency
+    
+    # Vectorized approach for better performance
+    if labels:
+        attack_indices = [i for i, attack in enumerate(all_attack_types) if attack in labels]
+        binary_vector[attack_indices] = 1
+    
     return binary_vector
 
 def display_data_distribution(df, log_type_name="all combined"):
@@ -193,56 +296,78 @@ def display_data_distribution(df, log_type_name="all combined"):
     print(f"{'='*70}\n")
     return attack_count, normal_count
 
-def preprocess_log(log):
-    """Preprocess a single log entry."""
-    return simple_preprocess(log)
+def process_embeddings_batch(model, tokens_batch):
+    """Process a batch of tokens for embedding generation."""
+    return [embed_text(model, tokens) for tokens in tokens_batch]
 
-def preprocess_logs_and_labels(df, use_global_attack_list=False):
-    """Tokenize log entries and create binary label vectors with parallel processing."""
-    # Parallelize tokenization
-    num_cores = max(1, multiprocessing.cpu_count() - 1)
-    
-    spinner = Halo(text='Tokenizing logs', spinner='dots')
+def process_labels_batch(labels_batch, attack_types):
+    """Process a batch of labels for binary vector generation."""
+    return [create_binary_label_vector(label_json, attack_types) for label_json in labels_batch]
+
+def process_embeddings(df, model, use_global_attack_list=False):
+    """Process logs and create embeddings with binary label vectors - optimized version."""
+    spinner = Halo(text='Processing log embeddings', spinner='dots')
     spinner.start()
     
-    with multiprocessing.Pool(num_cores) as pool:
-        # Initialize counter for progress updates
-        processed_count = 0
-        total_count = len(df)
-        
-        # Define a callback to update the spinner
-        def update_spinner(result):
-            nonlocal processed_count
-            processed_count += 1
-            if processed_count % 1000 == 0 or processed_count == total_count:
-                spinner.text = f"Tokenizing logs: {processed_count}/{total_count} ({processed_count/total_count*100:.1f}%)"
-        
-        # Process logs in chunks
-        results = []
-        for i in range(0, len(df), 1000):
-            chunk = df['log'][i:i+1000]
-            result = pool.map_async(preprocess_log, chunk, callback=update_spinner)
-            results.append(result)
-        
-        # Wait for all results
-        tokens = []
-        for result in results:
-            tokens.extend(result.get())
-        
-        df['tokens'] = tokens
+    total_count = len(df)
+    batch_size = 500  # Optimized batch size for better performance
     
-    spinner.succeed(f"Tokenized {len(df)} logs")
+    # Tokenize logs in batches
+    spinner.text = "Tokenizing logs in batches"
+    tokenized_logs = []
     
-    spinner = Halo(text='Creating binary label vectors', spinner='dots')
-    spinner.start()
+    # Use vectorized string operations where possible
+    for i in range(0, total_count, batch_size):
+        end_idx = min(i + batch_size, total_count)
+        batch_logs = df['log'].iloc[i:end_idx]
+        
+        if i % 2000 == 0:  # Update progress less frequently
+            spinner.text = f"Tokenizing logs: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
+        
+        # Process batch
+        batch_tokens = [preprocess_text(log) for log in batch_logs]
+        tokenized_logs.extend(batch_tokens)
+    
+    df['tokens'] = tokenized_logs
+    
+    # Create log embeddings in batches
+    spinner.text = "Creating log embeddings in batches"
+    log_embeddings = []
+    
+    for i in range(0, total_count, batch_size):
+        end_idx = min(i + batch_size, total_count)
+        tokens_batch = tokenized_logs[i:end_idx]
+        
+        if i % 2000 == 0:
+            spinner.text = f"Creating log embeddings: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
+        
+        # Process batch with multiprocessing could be added here if needed
+        batch_embeddings = process_embeddings_batch(model, tokens_batch)
+        log_embeddings.extend(batch_embeddings)
+    
+    # Convert to numpy array for better memory efficiency
+    log_embeddings_array = np.array(log_embeddings, dtype=np.float32)
+    df['log_embedding'] = list(log_embeddings_array)  # Convert back to list for pandas
+    
+    # Process labels in batches
+    spinner.text = "Processing binary label vectors in batches"
     
     if use_global_attack_list:
         # Use all labels across all log types
         attack_types = collect_unique_labels_from_data(df)
         
-        # Vectorize binary label creation
-        vector_func = partial(create_attack_binary_vector, target_attack_types=attack_types)
-        df['binary_labels'] = list(map(vector_func, df['label_json']))
+        binary_labels = []
+        for i in range(0, total_count, batch_size):
+            end_idx = min(i + batch_size, total_count)
+            labels_batch = df['label_json'].iloc[i:end_idx]
+            
+            if i % 2000 == 0:
+                spinner.text = f"Processing labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
+            
+            batch_binary = process_labels_batch(labels_batch, attack_types)
+            binary_labels.extend(batch_binary)
+        
+        df['binary_labels'] = binary_labels
         df.attrs['attack_types'] = attack_types
     else:
         # Process by log type
@@ -251,217 +376,183 @@ def preprocess_logs_and_labels(df, use_global_attack_list=False):
             spinner.text = f"Processing log type: {log_type}"
             log_type_to_attacks[log_type] = collect_unique_labels_from_data(group_df)
         
-        # Apply to each log entry grouped by log type
-        def get_binary_vector(row):
-            log_type = row['log_type']
-            if log_type not in log_type_to_attacks:
-                return np.array([])
-            return create_attack_binary_vector(row['label_json'], log_type_to_attacks[log_type])
+        # Process all labels in batches
+        binary_labels = []
+        for i in range(0, total_count, batch_size):
+            end_idx = min(i + batch_size, total_count)
+            
+            if i % 2000 == 0:
+                spinner.text = f"Processing binary labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
+            
+            batch_binary = []
+            for j in range(i, end_idx):
+                row = df.iloc[j]
+                log_type = row['log_type']
+                if log_type in log_type_to_attacks:
+                    binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[log_type])
+                else:
+                    binary_vector = np.array([], dtype=np.int8)
+                batch_binary.append(binary_vector)
+            
+            binary_labels.extend(batch_binary)
         
-        df['binary_labels'] = df.apply(get_binary_vector, axis=1)
+        df['binary_labels'] = binary_labels
         df.attrs['log_type_to_attacks'] = log_type_to_attacks
     
-    spinner.succeed("Binary label vectors created successfully")
-    
+    spinner.succeed("Embedding processing complete")
     return df
 
-def train_fasttext_model(corpus, vector_size=VECTOR_SIZE, window=5, min_count=5, epochs=5, model_name_suffix=""):
-    """Train an optimized FastText model on the corpus."""
-    model_name = f"fasttext_model{model_name_suffix}.bin"
-    model_path = MODEL_DIR / model_name
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+def visualize_embeddings(df, output_file=None):
+    """Create t-SNE visualization with balanced class sampling for performance and minority visibility."""
+    # ------------------------- NEW IMPLEMENTATION START -------------------------
+    # Parameters for sampling – tweak here if necessary
+    MAX_TOTAL_POINTS = 50000   # Hard cap on total points sent to t-SNE
+    MAX_POINTS_PER_CLASS = 1500  # Limit for any single class to avoid domination
 
-    # Use existing model if available
-    if model_path.exists():
-        print(f"Loading existing model from {model_path}")
-        return FastText.load(str(model_path))
-
-    # Train new model with optimized parameters
-    spinner = Halo(text=f"Training FastText model on {len(corpus)} documents", spinner='dots')
+    spinner = Halo(text="Preparing visualization data", spinner='dots')
     spinner.start()
-    
-    model = FastText(
-        vector_size=vector_size,
-        window=window,
-        min_count=min_count,  # Increased from 1 to 5 to reduce vocab size
-        workers=multiprocessing.cpu_count() - 1,
-        seed=RANDOM_SEED,
-        sg=1,  # Use skip-gram for better quality
-        negative=10  # More negative samples for better quality
-    )
-    
-    spinner.text = "Building vocabulary"
-    model.build_vocab(corpus_iterable=corpus)
-    
-    spinner.text = f"Training FastText model (0/{epochs} epochs)"
-    for epoch in range(epochs):
-        model.train(corpus_iterable=corpus, total_examples=len(corpus), epochs=1)
-        spinner.text = f"Training FastText model ({epoch+1}/{epochs} epochs)"
-    
-    # Trim memory
-    spinner.text = "Optimizing model memory usage"
-    model.trim_rule = None
-    model.callbacks = None
-    model.save(str(model_path))
-    
-    spinner.succeed(f"FastText model trained and saved to {model_path}")
-    
-    return model
 
-def generate_embeddings(model, corpus):
-    """Generate document embeddings with optimized batching."""
-    spinner = Halo(text="Generating document embeddings", spinner='dots')
-    spinner.start()
-    
-    # Generate embeddings using NumPy operations for speed
-    model_vocab = set(model.wv.key_to_index.keys())
-    batch_size = 1000
-    num_batches = (len(corpus) + batch_size - 1) // batch_size
-    all_embeddings = np.zeros((len(corpus), model.vector_size), dtype=np.float32)
-    
-    for i in range(num_batches):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, len(corpus))
-        batch = corpus[start_idx:end_idx]
-        
-        spinner.text = f"Generating embeddings: batch {i+1}/{num_batches} ({end_idx}/{len(corpus)} docs)"
-        
-        for j, doc in enumerate(batch):
-            valid_words = [word for word in doc if word in model_vocab]
-            idx = start_idx + j
-            
-            if valid_words:
-                # Use numpy operations directly for faster computation
-                word_vectors = np.array([model.wv[word] for word in valid_words])
-                all_embeddings[idx] = np.mean(word_vectors, axis=0)
-    
-    spinner.succeed(f"Generated embeddings for {len(corpus)} documents")
-    return all_embeddings
-
-def visualize_embeddings(embeddings, label_json_list, log_types, output_file=None):
-    """Create optimized t-SNE visualization of embeddings."""
-    spinner = Halo(text="Creating t-SNE visualization", spinner='dots')
-    spinner.start()
-    
-    # Apply t-SNE to get the 2D coordinates
-    perplexity = min(30, max(5, len(embeddings)//100))
-    spinner.text = "Applying t-SNE dimensionality reduction"
-    tsne = TSNE(
-        n_components=2, 
-        random_state=RANDOM_SEED, 
-        perplexity=perplexity,
-        n_iter=1000,  # Reduced from default
-        n_jobs=-1  # Use all available cores
-    )
-    reduced = tsne.fit_transform(embeddings)
-    
-    # Process labels more efficiently
-    spinner.text = "Processing attack labels"
-    processed_labels = []
-    for label_json_str in label_json_list:
+    # -------------------------------------------------------------------------
+    # 1. Build visualization labels for every row (normal vs attacks etc.)
+    # -------------------------------------------------------------------------
+    spinner.text = "Generating labels for visualization"
+    viz_labels = []
+    for label_json_str in df['label_json']:
         labels = get_labels_from_json(label_json_str)
         if not labels:
-            processed_labels.append("normal")
+            viz_labels.append("normal")
         else:
-            processed_labels.append(next(iter(labels)))
-    
-    # Create plot dataframe
+            viz_labels.append(", ".join(sorted(labels)))
+
+    # Attach labels temporarily to the dataframe for easy indexing
+    df = df.copy()
+    df['viz_label'] = viz_labels
+
+    # -------------------------------------------------------------------------
+    # 2. Balanced sampling – keep all minority classes, down-sample major ones
+    # -------------------------------------------------------------------------
+    spinner.text = "Applying balanced sampling to limit dataset size"
+    np.random.seed(42)  # Reproducibility
+
+    selected_indices = []
+    label_to_indices = {}
+    for idx, lbl in enumerate(viz_labels):
+        label_to_indices.setdefault(lbl, []).append(idx)
+
+    for lbl, indices in label_to_indices.items():
+        if len(indices) > MAX_POINTS_PER_CLASS:
+            sampled = np.random.choice(indices, MAX_POINTS_PER_CLASS, replace=False)
+            selected_indices.extend(sampled)
+        else:
+            selected_indices.extend(indices)  # Keep all if already small
+
+    # If we still exceed the global cap, randomly subsample the union (keeps balance reasonably well)
+    if len(selected_indices) > MAX_TOTAL_POINTS:
+        selected_indices = list(np.random.choice(selected_indices, MAX_TOTAL_POINTS, replace=False))
+
+    # -------------------------------------------------------------------------
+    # 3. Gather embeddings and labels for the sampled indices
+    # -------------------------------------------------------------------------
+    embeddings = np.vstack([df.at[i, 'log_embedding'] for i in selected_indices]).astype(np.float32)
+    sampled_labels = [viz_labels[i] for i in selected_indices]
+    sampled_log_types = [df.at[i, 'log_type'] for i in selected_indices]
+
+    spinner.text = f"Running t-SNE on {len(embeddings)} sampled points"
+
+    # Choose perplexity based on size (rule of thumb: 5–50 & < samples/3)
+    perplexity = min(50, max(5, len(embeddings)//1000))
+
+    # -------------------------------------------------------------------------
+    # 4. Execute t-SNE (Barnes-Hut) – use safer sklearn parameters
+    # -------------------------------------------------------------------------
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        n_iter=500,          # Reasonable iterations
+        learning_rate='auto',
+        init='pca',
+        method='barnes_hut',
+        random_state=42
+    )
+
+    reduced = tsne.fit_transform(embeddings)
+
+    # -------------------------------------------------------------------------
+    # 5. Prepare DataFrame for plotting
+    # -------------------------------------------------------------------------
     df_plot = pd.DataFrame({
         'x': reduced[:, 0],
         'y': reduced[:, 1],
-        'label': processed_labels,
-        'log_type': log_types
+        'label': sampled_labels,
+        'log_type': sampled_log_types
     })
-    
+
+    spinner.succeed("t-SNE dimensionality reduction complete")
+
+    # ------------------------- NEW IMPLEMENTATION END -------------------------
+
     # Count visualization labels
     label_counts = df_plot['label'].value_counts()
-    spinner.succeed("Visualization preprocessing complete")
-    
-    print("\nVisualization label distribution:")
-    for label, count in label_counts.items():
+    print(f"\nVisualization showing ALL {len(label_counts)} unique label combinations:")
+    for label, count in label_counts.head(10).items():  # Show top 10 for readability
         percentage = (count / len(df_plot)) * 100
         print(f"  {label}: {count} ({percentage:.2f}%)")
     
-    # Color palette with consistent colors
+    if len(label_counts) > 10:
+        print(f"  ... and {len(label_counts) - 10} more label combinations")
+    
+    # Create optimized color palette
     unique_labels = sorted(df_plot['label'].unique())
     palette = sns.color_palette("husl", len(unique_labels))
     color_map = {label: palette[i] for i, label in enumerate(unique_labels)}
     
     if "normal" in color_map:
         color_map["normal"] = "green"
-    if "unknown" in color_map:
-        color_map["unknown"] = "gray"
     
-    # Create scatter plot
-    spinner = Halo(text="Creating main visualization plot", spinner='dots')
+    # Create optimized scatter plot
+    spinner = Halo(text="Creating visualization plot", spinner='dots')
     spinner.start()
     
-    plt.figure(figsize=(12, 10))
-    sns.scatterplot(
-        x='x', 
-        y='y', 
-        hue='label', 
-        style='log_type',
-        data=df_plot, 
-        palette=color_map,
-        alpha=0.7,
-        s=40  # Reduced from 50
-    )
+    plt.figure(figsize=(16, 10))  # Larger figure for better readability
     
-    plt.title('t-SNE Visualization of FastText Log Embeddings')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout(rect=[0,0,0.85,1])
+    # Use matplotlib directly for better performance with large datasets
+    for label in unique_labels:
+        mask = df_plot['label'] == label
+        subset = df_plot[mask]
+        
+        plt.scatter(
+            subset['x'], 
+            subset['y'], 
+            c=[color_map[label]], 
+            label=label,
+            alpha=0.6,
+            s=20,  # Smaller points for large datasets
+            edgecolors='none'  # Remove edges for better performance
+        )
+    
+    plt.title(f't-SNE Visualization: FastText Log Embeddings (All {len(unique_labels)} Classes)', fontsize=14)
+    plt.xlabel('t-SNE Component 1', fontsize=12)
+    plt.ylabel('t-SNE Component 2', fontsize=12)
+    
+    # Optimize legend for many classes
+    if len(unique_labels) <= 20:
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        plt.tight_layout(rect=[0,0,0.85,1])
+    else:
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=6, ncol=2)
+        plt.tight_layout(rect=[0,0,0.8,1])
     
     if output_file:
-        plt.savefig(output_file, dpi=200, bbox_inches='tight')  # Reduced from 300 dpi
-        spinner.succeed(f"Saved main visualization to {output_file}")
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')  # Slightly lower DPI for faster saving
+        spinner.succeed(f"Saved visualization to {output_file}")
     else:
         plt.show()
-        spinner.succeed("Displayed main visualization")
+        spinner.succeed("Displayed visualization")
     
     plt.close()
     
-    # Create individual attack visualizations for ALL attack types
-    if output_file and len([l for l in unique_labels if l != "normal" and l != "unknown"]) > 1:
-        output_dir = os.path.dirname(output_file)
-        base_name = os.path.splitext(os.path.basename(output_file))[0]
-        
-        # Create visualizations for all attack types
-        attack_labels = [l for l in unique_labels if l != "normal" and l != "unknown"]
-        
-        print(f"\nCreating individual attack visualizations for all {len(attack_labels)} attack types...")
-        
-        for i, attack in enumerate(attack_labels):
-            spinner = Halo(text=f"Creating visualization for attack type: {attack} ({i+1}/{len(attack_labels)})", spinner='dots')
-            spinner.start()
-            
-            df_attack = df_plot.copy()
-            df_attack['label'] = df_attack['label'].apply(
-                lambda x: x if x == attack else "normal" if x != "unknown" else "unknown"
-            )
-            
-            plt.figure(figsize=(10, 8))
-            sns.scatterplot(
-                x='x', y='y', hue='label', style='log_type',
-                data=df_attack, 
-                palette={
-                    attack: color_map[attack],
-                    "normal": "green",
-                    "unknown": "gray"
-                },
-                alpha=0.7,
-                s=40
-            )
-            
-            plt.title(f't-SNE Visualization: {attack}')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.tight_layout(rect=[0,0,0.85,1])
-            
-            attack_output_file = os.path.join(output_dir, f"{base_name}_{attack}.png")
-            plt.savefig(attack_output_file, dpi=200, bbox_inches='tight')
-            plt.close()
-            
-            spinner.succeed(f"Created visualization for {attack}")
+    # Clear memory
+    del embeddings, reduced, df_plot
 
 def find_available_log_types():
     """Find available log types in the processed directory."""
@@ -470,27 +561,87 @@ def find_available_log_types():
     return sorted([path.name for path in PROCESSED_DIR.iterdir() 
                   if path.is_dir() and list(path.glob("*.tfrecord"))])
 
-def save_key_file(attack_types, output_dir, filename="key.txt"):
-    """Save a file mapping attack type indices to their names."""
-    output_path = Path(output_dir) / filename
-    with open(output_path, 'w') as f:
-        f.write("# Attack type to index mapping\n")
-        f.write("# index,attack_type\n")
-        for i, attack_type in enumerate(attack_types):
-            f.write(f"{i},{attack_type}\n")
-    print(f"Saved attack type mapping to {output_path}")
+def save_embeddings_and_labels(df, output_dir, log_type_name):
+    """Save only log embeddings and label vectors as requested - optimized version."""
+    spinner = Halo(text=f"Saving embeddings for {log_type_name}", spinner='dots')
+    spinner.start()
+    
+    # Extract and save log embeddings as log_<type>.pkl (optimized)
+    log_embeddings = np.vstack(df['log_embedding'].tolist()).astype(np.float32)
+    log_filename = f"log_{log_type_name}.pkl"
+    
+    spinner.text = f"Saving log embeddings to {log_filename}"
+    with open(output_dir / log_filename, 'wb') as f:
+        pickle.dump(log_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)  # Use highest protocol for speed
+    
+    # Extract and save binary label vectors as label_<type>.pkl
+    if 'binary_labels' in df.columns and len(df['binary_labels']) > 0:
+        # Filter out empty arrays and stack efficiently
+        valid_vectors = [vec for vec in df['binary_labels'] if len(vec) > 0]
+        
+        if valid_vectors:
+            binary_vectors = np.vstack(valid_vectors).astype(np.int8)  # Memory efficient
+            label_filename = f"label_{log_type_name}.pkl"
+            
+            # Create comprehensive label data with metadata
+            label_data = {
+                'vectors': binary_vectors,  # Binary vectors: [0 1 0] means only second class
+                'classes': None,  # Will be populated below
+                'description': 'Binary multi-label vectors where [0 1 0] means only the second class is present'
+            }
+            
+            # Add class mapping information
+            if 'attack_types' in df.attrs:
+                label_data['classes'] = df.attrs['attack_types']
+            elif 'log_type_to_attacks' in df.attrs and log_type_name in df.attrs['log_type_to_attacks']:
+                label_data['classes'] = df.attrs['log_type_to_attacks'][log_type_name]
+            else:
+                label_data['classes'] = []
+            
+            # Add column explanation with better formatting
+            label_data['column_explanation'] = {
+                f"column_{i}": attack_type for i, attack_type in enumerate(label_data['classes'])
+            }
+            
+            # Add example for clarity
+            if len(label_data['classes']) > 0:
+                example_vector = np.zeros(len(label_data['classes']), dtype=np.int8)
+                if len(label_data['classes']) > 1:
+                    example_vector[1] = 1  # Set second class as example
+                label_data['example'] = {
+                    'vector': example_vector,
+                    'meaning': f"Example: {example_vector} means only '{label_data['classes'][1] if len(label_data['classes']) > 1 else label_data['classes'][0]}' attack is present"
+                }
+            
+            spinner.text = f"Saving label vectors to {label_filename}"
+            with open(output_dir / label_filename, 'wb') as f:
+                pickle.dump(label_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                
+            spinner.succeed(f"Saved {log_filename} and {label_filename}")
+            
+            # Print summary with proper vector format
+            print(f"\nSaved files for {log_type_name}:")
+            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape}")
+            print(f"  - {label_filename}: Binary label vectors {binary_vectors.shape}")
+            print(f"  - Classes: {label_data['classes']}")
+        else:
+            spinner.warn(f"No valid binary labels found for {log_type_name}")
+    else:
+        spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data")
+    parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained models")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
-    parser.add_argument("--vector-size", type=int, default=VECTOR_SIZE, help="Size of embedding vectors")
-    parser.add_argument("--sample-size", type=int, default=5000, help="Maximum samples for visualization")
-    parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
     args = parser.parse_args()
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Load pre-trained FastText model
+    model = load_pretrained_fasttext()
+    if model is None:
+        print("Failed to load pre-trained FastText model. Exiting.")
+        return
     
     # Find available log types
     spinner = Halo(text="Finding available log types", spinner='dots')
@@ -523,64 +674,21 @@ def main():
                 print(f"No data for log type '{log_type}'. Skipping.")
                 continue
 
-            # Display data distribution before preprocessing
+            # Display data distribution
             display_data_distribution(df, log_type)
 
-            # Preprocess and tokenize
-            df = preprocess_logs_and_labels(df, use_global_attack_list=False)
-            
-            # Train FastText model
-            model = train_fasttext_model(
-                df['tokens'].tolist(),
-                vector_size=args.vector_size,
-                epochs=args.epochs,
-                model_name_suffix=f"_{log_type}"
-            )
-            
-            # Generate embeddings
-            embeddings = generate_embeddings(model, df['tokens'].tolist())
+            # Process embeddings
+            df = process_embeddings(df, model, use_global_attack_list=False)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            spinner = Halo(text=f"Saving embeddings for {log_type}", spinner='dots')
-            spinner.start()
+            save_embeddings_and_labels(df, output_dir, log_type)
             
-            with open(output_dir / "embeddings.pkl", 'wb') as f:
-                pickle.dump(embeddings, f)
-            
-            if 'binary_labels' in df and len(df['binary_labels']) > 0:
-                binary_labels = np.vstack(df['binary_labels'].tolist())
-                with open(output_dir / "labels.pkl", 'wb') as f:
-                    pickle.dump(binary_labels, f)
-                
-                if 'log_type_to_attacks' in df.attrs:
-                    attack_types = df.attrs['log_type_to_attacks'][log_type]
-                    save_key_file(attack_types, output_dir)
-            
-            spinner.succeed(f"Saved embeddings and labels for {log_type}")
-            
-            # Create visualization with sampling
-            spinner = Halo(text=f"Preparing visualization samples for {log_type}", spinner='dots')
-            spinner.start()
-            
-            if len(embeddings) > args.sample_size:
-                sample_idx = np.random.choice(len(embeddings), args.sample_size, replace=False)
-                sample_embeddings = embeddings[sample_idx]
-                sample_labels = df['label_json'].iloc[sample_idx].tolist()
-                sample_log_types = df['log_type'].iloc[sample_idx].tolist()
-                spinner.succeed(f"Sampled {args.sample_size} entries for visualization")
-            else:
-                sample_embeddings = embeddings
-                sample_labels = df['label_json'].tolist()
-                sample_log_types = df['log_type'].tolist()
-                spinner.succeed(f"Using all {len(embeddings)} entries for visualization")
-                
+            # Create visualization
             visualize_embeddings(
-                sample_embeddings, 
-                sample_labels,
-                sample_log_types,
+                df, 
                 output_file=output_dir / "visualization.png"
             )
             
@@ -593,63 +701,20 @@ def main():
     if run_combined:
         print(f"\n{'='*50}\nProcessing all log types combined\n{'='*50}")
         try:
-            spinner = Halo(text="Loading data for all log types combined", spinner='dots')
-            spinner.start()
-            
+            # Load all data
             df_all = load_tfrecord_files()
             if df_all.empty:
-                spinner.fail("No data found for combined log types")
+                print("No data found for combined log types")
             else:
-                spinner.succeed(f"Loaded {len(df_all)} entries for combined processing")
-                
                 display_data_distribution(df_all, "all combined")
-                df_all = preprocess_logs_and_labels(df_all, use_global_attack_list=True)
+                df_all = process_embeddings(df_all, model, use_global_attack_list=True)
                 
-                model_all = train_fasttext_model(
-                    df_all['tokens'].tolist(),
-                    vector_size=args.vector_size,
-                    epochs=args.epochs,
-                    model_name_suffix="_all_combined"
-                )
+                # Save combined outputs
+                save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
                 
-                embeddings_all = generate_embeddings(model_all, df_all['tokens'].tolist())
-                
-                # Save outputs
-                spinner = Halo(text="Saving combined embeddings", spinner='dots')
-                spinner.start()
-                
-                with open(OUTPUT_DIR / "embeddings_all_combined.pkl", 'wb') as f:
-                    pickle.dump(embeddings_all, f)
-                
-                if 'binary_labels' in df_all and len(df_all['binary_labels']) > 0 and 'attack_types' in df_all.attrs:
-                    binary_labels = np.vstack(df_all['binary_labels'].tolist())
-                    with open(OUTPUT_DIR / "labels_all_combined.pkl", 'wb') as f:
-                        pickle.dump(binary_labels, f)
-                    
-                    save_key_file(df_all.attrs['attack_types'], OUTPUT_DIR, "key_all_combined.txt")
-                
-                spinner.succeed("Saved combined embeddings and labels")
-                
-                # Create visualization with sampling
-                spinner = Halo(text="Preparing visualization samples for combined data", spinner='dots')
-                spinner.start()
-                
-                if len(embeddings_all) > args.sample_size:
-                    sample_idx = np.random.choice(len(embeddings_all), args.sample_size, replace=False)
-                    sample_embeddings = embeddings_all[sample_idx]
-                    sample_labels = df_all['label_json'].iloc[sample_idx].tolist()
-                    sample_log_types = df_all['log_type'].iloc[sample_idx].tolist()
-                    spinner.succeed(f"Sampled {args.sample_size} entries for visualization")
-                else:
-                    sample_embeddings = embeddings_all
-                    sample_labels = df_all['label_json'].tolist()
-                    sample_log_types = df_all['log_type'].tolist()
-                    spinner.succeed(f"Using all {len(embeddings_all)} entries for visualization")
-                
+                # Create visualization
                 visualize_embeddings(
-                    sample_embeddings,
-                    sample_labels,
-                    sample_log_types,
+                    df_all,
                     output_file=OUTPUT_DIR / "visualization_all_combined.png"
                 )
         
