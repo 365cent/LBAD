@@ -22,8 +22,8 @@ PREPROCESS_LOG_TYPES := web error auth dns firewall vpn audit kernel systemd
 # From src/fasttext_embedding.py LOG_TYPE_ATTACKS.keys()
 FASTTEXT_LOG_TYPES := dns network web error monitoring auth audit
 
-# Contexts for xgboost_ml.py (specific logical types + all_combined)
-XGBOOST_ML_CONTEXTS := all_combined $(FASTTEXT_LOG_TYPES)
+# Contexts for xgboost_ml.py and ml_models.py (specific logical types + all_combined)
+ML_CONTEXTS := all_combined $(FASTTEXT_LOG_TYPES)
 
 # Help
 help:
@@ -42,17 +42,15 @@ help:
 	@echo "                     Available types for fasttext: $(FASTTEXT_LOG_TYPES)"
 	@echo "  word2vec         Run Word2Vec embeddings"
 	@echo "  tfidf            Run TF-IDF embeddings"
-	@echo "  ml               Run all ML models (FastText)"
-	@echo "  ml-[rf|xgb|knn|lr]     Run specific ML model (FastText)"
-	@echo "  ml-word2vec      Run ML models (Word2Vec)"
-	@echo "  ml-tfidf         Run ML models (TF-IDF)"
-	@echo "  ml-w2v-[rf|xgb]  Run specific ML model (Word2Vec)"
-	@echo "  ml-tfidf-[rf|xgb] Run specific ML model (TF-IDF)"
+	@echo "  ml               Run all ML models (all_combined)"
+	@echo "  ml-[rf|xgb|knn|lr]     Run specific ML model (all_combined)"
+	@echo "  ml-<type>        Run all ML models for specific log type (e.g., make ml-web)"
+	@echo "  ml-<type>-[rf|xgb|knn|lr]  Run specific ML model for log type (e.g., make ml-web-rf)"
+	@echo "                     Available log types for ml: $(ML_CONTEXTS)"
 	@echo "  ml-evaluate      Evaluate without training"
-	@echo "  ml-all-embeddings Run ML with all embeddings"
 	@echo "  xgboost-ml         Run XGBoost Multi-Label (OvR) for all_combined context"
-	@echo "  xgboost-ml-<ctx>   Run XGBoost Multi-Label (OvR) for a specific context (e.g., make xgboost-ml-web)"
-	@echo "                     Available contexts for xgboost-ml: $(XGBOOST_ML_CONTEXTS)"
+	@echo "  xgboost-ml-<ctx>   Run XGBoost Multi-Label (OvR) for a specific context"
+	@echo "                     Available contexts for xgboost-ml: $(ML_CONTEXTS)"
 	@echo "  gan              Run VAE-GAN augmentation"
 	@echo "  eval             Evaluate VAE-GAN augmentation"
 	@echo "  gan-pipeline     Run augmentation and evaluation"
@@ -88,25 +86,25 @@ fasttext-%:
 word2vec:   ; $(PYTHON) $(WORD2VEC)
 tfidf:      ; $(PYTHON) $(TFIDF)
 
-ml:         ; $(PYTHON) $(ML) --embedding-type fasttext
-ml-rf:      ; $(PYTHON) $(ML) --model rf --embedding-type fasttext
-ml-xgb:     ; $(PYTHON) $(ML) --model xgb --embedding-type fasttext
-ml-knn:     ; $(PYTHON) $(ML) --model knn --embedding-type fasttext
-ml-lr:      ; $(PYTHON) $(ML) --model lr --embedding-type fasttext
+# ML models with all_combined (default)
+ml:         ; $(PYTHON) $(ML)
+ml-rf:      ; $(PYTHON) $(ML) --model rf
+ml-xgb:     ; $(PYTHON) $(ML) --model xgb
+ml-knn:     ; $(PYTHON) $(ML) --model knn
+ml-lr:      ; $(PYTHON) $(ML) --model lr
 
-ml-word2vec:    ; $(PYTHON) $(ML) --embedding-type word2vec
-ml-tfidf:       ; $(PYTHON) $(ML) --embedding-type tfidf
-ml-w2v-rf:      ; $(PYTHON) $(ML) --model rf --embedding-type word2vec
-ml-w2v-xgb:     ; $(PYTHON) $(ML) --model xgb --embedding-type word2vec
-ml-tfidf-rf:    ; $(PYTHON) $(ML) --model rf --embedding-type tfidf
-ml-tfidf-xgb:   ; $(PYTHON) $(ML) --model xgb --embedding-type tfidf
+# ML models for specific log type
+ml-%:
+	@echo "Running all ML models for log type: $*"
+	$(PYTHON) $(ML) --log-type $*
 
-ml-all-embeddings:
-	$(MAKE) ml
-	$(MAKE) ml-word2vec
-	$(MAKE) ml-tfidf
+# ML models with specific model and log type
+ml-%-rf:    ; $(PYTHON) $(ML) --model rf --log-type $*
+ml-%-xgb:   ; $(PYTHON) $(ML) --model xgb --log-type $*
+ml-%-knn:   ; $(PYTHON) $(ML) --model knn --log-type $*
+ml-%-lr:    ; $(PYTHON) $(ML) --model lr --log-type $*
 
-# New targets for XGBoost Multi-Label (OvR) baseline
+# XGBoost Multi-Label (OvR) baseline
 xgboost-ml:
 	@echo "Running XGBoost Multi-Label (OvR) for context: all_combined"
 	$(PYTHON) $(XGBOOST_ML) --context all_combined
@@ -119,7 +117,7 @@ ml-evaluate: ; $(PYTHON) $(ML) --no-train
 gan:         ; $(PYTHON) $(GAN)
 eval:        ; $(PYTHON) $(EVAL)
 
-# New targets for VAE-GAN pipeline
+# VAE-GAN pipeline
 gan-pipeline:
 	$(MAKE) gan
 	$(MAKE) eval
@@ -142,11 +140,7 @@ clean-all:
 	$(MAKE) clean
 
 .PHONY: all install preprocess test fasttext word2vec tfidf ml ml-rf ml-xgb ml-knn ml-lr \
-        ml-word2vec ml-tfidf ml-w2v-rf ml-w2v-xgb ml-tfidf-rf ml-tfidf-xgb ml-all-embeddings \
-        ml-evaluate xgboost-ml gan eval gan-pipeline gan-small eval-fast clean clean-aug clean-all help
-# Add xgboost-ml-% to .PHONY if it doesn't create a file named xgboost-ml-<ctx>
-# For pattern rules, if they always execute commands and don't create a target file,
-# they should be .PHONY. However, make often treats pattern rules as .PHONY by default
-# if no corresponding file is ever created by them.
-# Explicitly adding it for clarity or if issues arise:
-.PHONY: $(addprefix xgboost-ml-,$(XGBOOST_ML_CONTEXTS))
+        ml-evaluate xgboost-ml gan eval gan-pipeline gan-small eval-fast clean clean-aug clean-all help \
+        $(addprefix ml-,$(ML_CONTEXTS)) \
+        $(foreach ctx,$(ML_CONTEXTS),$(addprefix ml-$(ctx)-,rf xgb knn lr)) \
+        $(addprefix xgboost-ml-,$(ML_CONTEXTS))

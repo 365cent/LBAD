@@ -23,7 +23,7 @@ from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
@@ -118,57 +118,93 @@ def load_embedding_data(embedding_type='fasttext'):
     """Load embeddings and labels from pickle files."""
     print(f"Loading {embedding_type} embeddings...")
     
-    prefix = f"{embedding_type}_" if embedding_type != 'fasttext' else ""
+    # Map embedding type to directory name
+    if embedding_type == 'fasttext':
+        dir_name = 'all_combined'
+    else:
+        dir_name = embedding_type
     
     try:
-        with open(EMBEDDINGS_DIR / f'{prefix}train_embeddings.pkl', 'rb') as f:
-            X_train = pickle.load(f)
-        with open(EMBEDDINGS_DIR / f'{prefix}test_embeddings.pkl', 'rb') as f:
-            X_test = pickle.load(f)
-        with open(EMBEDDINGS_DIR / f'{prefix}train_labels.pkl', 'rb') as f:
-            y_train_raw = pickle.load(f)
-        with open(EMBEDDINGS_DIR / f'{prefix}test_labels.pkl', 'rb') as f:
-            y_test_raw = pickle.load(f)
+        # Load embeddings
+        embeddings_file = EMBEDDINGS_DIR / f'log_{dir_name}.pkl'
+        with open(embeddings_file, 'rb') as f:
+            embeddings = pickle.load(f)
+        
+        # Load labels (now contains dictionary with 'vectors' key)
+        labels_file = EMBEDDINGS_DIR / f'label_{dir_name}.pkl' 
+        with open(labels_file, 'rb') as f:
+            label_data = pickle.load(f)
+        
+        # Extract binary vectors and class names
+        if isinstance(label_data, dict) and 'vectors' in label_data:
+            binary_vectors = label_data['vectors']
+            attack_types = label_data.get('classes', [])
+        else:
+            # Fallback for old format
+            binary_vectors = label_data
+            attack_types = []
+            
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print(f"Make sure to run the embedding generation script first.")
         sys.exit(1)
     
-    # Convert to numpy array if necessary
-    if not isinstance(X_train, np.ndarray):
-        X_train = np.array(X_train)
-    if not isinstance(X_test, np.ndarray):
-        X_test = np.array(X_test)
+    # Convert to numpy arrays
+    if not isinstance(embeddings, np.ndarray):
+        embeddings = np.array(embeddings)
+    if not isinstance(binary_vectors, np.ndarray):
+        binary_vectors = np.array(binary_vectors)
     
-    # Parse JSON label strings
-    y_train = parse_labels(y_train_raw)
-    y_test = parse_labels(y_test_raw)
+    # Convert multi-label binary vectors to single labels
+    # For traditional ML, we use the first detected attack or 'normal'
+    labels = []
+    for binary_vec in binary_vectors:
+        if np.sum(binary_vec) == 0:
+            labels.append('normal')
+        else:
+            # Find first active attack type
+            first_attack_idx = np.argmax(binary_vec)
+            if attack_types and first_attack_idx < len(attack_types):
+                labels.append(attack_types[first_attack_idx])
+            else:
+                labels.append(f'attack_{first_attack_idx}')
+    
+    # Split into train/test (80/20 split) with stratification
+    try:
+        # Try stratified split first to ensure all classes are represented
+        X_train, X_test, y_train, y_test = train_test_split(
+            embeddings, labels, test_size=0.2, stratify=labels, random_state=42
+        )
+        print("Using stratified train/test split to ensure all classes are represented")
+    except ValueError as e:
+        # Fall back to regular split if stratification fails (e.g., class with only 1 sample)
+        print(f"Warning: Stratified split failed ({e}). Using random split instead.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            embeddings, labels, test_size=0.2, random_state=42
+        )
     
     print(f"Loaded {len(X_train)} training samples, {len(X_test)} test samples")
     print(f"Data shape - X_train: {X_train.shape}, X_test: {X_test.shape}")
     
+    # Check class distribution in both sets
+    train_classes = pd.Series(y_train).value_counts()
+    test_classes = pd.Series(y_test).value_counts()
+    
+    print("\nClass distribution in train set:")
+    for class_name, count in train_classes.items():
+        print(f"  {class_name}: {count} ({count/len(y_train)*100:.2f}%)")
+    
+    print("\nClass distribution in test set:")
+    for class_name, count in test_classes.items():
+        print(f"  {class_name}: {count} ({count/len(y_test)*100:.2f}%)")
+    
+    # Warn if any class is missing from test set
+    missing_classes = set(train_classes.index) - set(test_classes.index)
+    if missing_classes:
+        print(f"\nWarning: The following classes are not in test set: {missing_classes}")
+        print("Consider using a smaller test_size or collecting more data for these classes.")
+    
     return X_train, y_train, X_test, y_test
-
-def parse_labels(label_strings):
-    """Convert JSON label strings to classification labels."""
-    parsed = []
-    for label in label_strings:
-        try:
-            if isinstance(label, bytes):
-                label = label.decode('utf-8')
-            
-            data = json.loads(label)
-            if isinstance(data, list):
-                if not data:  # Empty array means "normal"
-                    parsed.append("normal")
-                else:
-                    parsed.append(data[0])  # Use first label if multiple
-            else:
-                parsed.append("unknown")
-        except Exception as e:
-            print(f"Error parsing label: {label}. Using 'unknown'. Error: {e}")
-            parsed.append("unknown")
-    return parsed
 
 def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, label_encoder, results_dir, encoded=False):
     """Train and evaluate a single model."""
@@ -281,8 +317,8 @@ def main():
     parser = argparse.ArgumentParser(description='Optimized ML analysis for log data')
     parser.add_argument('--model', choices=['rf', 'xgb', 'knn', 'lr', 'all'], 
                         default='all', help='Model to train (default: all)')
-    parser.add_argument('--embedding-type', choices=['fasttext', 'word2vec', 'tfidf'], 
-                        default='fasttext', help='Embedding type (default: fasttext)')
+    parser.add_argument('--log-type', 
+                        default='all_combined', help='Log type to process (default: all_combined)')
     parser.add_argument('--no-train', action='store_true',
                         help='Skip training and only evaluate existing models')
     args = parser.parse_args()
@@ -293,7 +329,7 @@ def main():
     run_dir.mkdir(exist_ok=True)
     
     # Load embedding data
-    X_train, y_train, X_test, y_test = load_embedding_data(args.embedding_type)
+    X_train, y_train, X_test, y_test = load_embedding_data(args.log_type)
     
     # Ensure data is in proper format
     if isinstance(X_train, list):
@@ -381,7 +417,7 @@ def main():
     with open(run_dir / 'summary.txt', 'w') as f:
         f.write(f"Log Analysis Run Summary - {timestamp}\n")
         f.write("-" * 50 + "\n")
-        f.write(f"Embedding type: {args.embedding_type}\n")
+        f.write(f"Log type: {args.log_type}\n")
         f.write(f"Training samples: {len(y_train)}\n")
         f.write(f"Test samples: {len(y_test)}\n")
         f.write(f"Total unique labels: {len(all_labels)}\n\n")
