@@ -19,7 +19,8 @@ import tensorflow as tf
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
-from transformers import BertForSequenceClassification, BertTokenizer, AdamW
+from transformers import BertForSequenceClassification, BertTokenizer
+from torch.optim import AdamW
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
