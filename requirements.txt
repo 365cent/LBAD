@@ -1,10 +1,10 @@
 # Core dependencies
-numpy>=1.19.5
-pandas>=1.1.5
+numpy>=1.21.0
+pandas>=1.3.0
 tensorflow>=2.9.0
-matplotlib>=3.4.3
+matplotlib>=3.5.0
 seaborn>=0.11.2
-scikit-learn>=0.24.2
+scikit-learn>=1.0.0
 tqdm>=4.62.3
 
 # NLP and embeddings
@@ -22,19 +22,25 @@ pickle-mixin>=1.0.2
 # Deep learning (for GAN implementation)
 Keras>=2.8.0
 
+torch>=1.8
+transformers>=4.40
+
 # Visualization enhancements
 plotly>=5.5.0
+bokeh>=2.4.0
 
 # Development tools
 pytest>=6.2.5
 black>=22.1.0
 pylint>=2.12.0
+jupyter>=1.0.0
+ipykernel>=6.0.0
 
 # For TSNE visualizations
-scikit-learn>=0.24.2
+openTSNE>=0.5.0
 
 # For log preprocessing
-jsonschema>=3.2.0
+jsonschema>=4.0.0
 
 # For advanced tensor operations
 scipy>=1.7.3
@@ -48,8 +54,111 @@ h5py>=3.1.0
 # Types support
 typing-extensions>=3.10.0
 
-# For t-SNE
-openTSNE>=0.5.0
-
 # Progress spinners
 halo>=0.0.31
+# Additional ML utilities
+datasets>=2.0.0
+tokenizers>=0.12.0
+
+# System and Path utilities
+pathlib2>=2.3.6
+
+# Memory profiling (optional)
+memory-profiler>=0.60.0
+psutil>=5.8.0
+
+# Regex and text processing
+regex>=2022.1.18
+
+# Configuration and argument parsing
+argparse>=1.4.0
+
+# Logging
+loguru>=0.6.0
+
+# For reproducibility
+random2>=1.0.1
+
+# Additional utilities for log parsing
+editdistance>=0.6.0
+jellyfish>=0.9.0
+
+# Performance monitoring
+py-cpuinfo>=8.0.0
+
+# File compression support
+gzip>=1.0.0
+
+# Multi-processing support
+multiprocessing-logging>=0.3.0
+
+# GPU memory management (if using CUDA)
+GPUtil>=1.4.0
+
+# Optional: For hyperparameter tuning
+optuna>=3.0.0
+wandb>=0.12.0
+
+# Optional: For model versioning and tracking
+mlflow>=1.20.0
+
+# Security and validation
+cryptography>=3.4.0
+
+# Date and time utilities
+python-dateutil>=2.8.0
+
+# Environment management
+python-dotenv>=0.19.0
+
+# Optional: For distributed training
+accelerate>=0.12.0
+
+# Optional: For ONNX model export
+onnx>=1.12.0
+onnxruntime>=1.12.0
+
+# Network utilities (for downloading models)
+requests>=2.25.0
+urllib3>=1.26.0
+
+# Optional: For advanced tokenization
+sentencepiece>=0.1.96
+sacremoses>=0.0.53
+
+# Optional: For model compression
+pruning>=0.1.0
+
+# File watching and monitoring
+watchdog>=2.1.0
+
+# Configuration file handling
+pyyaml>=6.0
+configparser>=5.0.0
+
+# Optional: For cloud storage integration
+boto3>=1.20.0
+google-cloud-storage>=2.1.0
+
+# Optional: For data validation
+cerberus>=1.3.0
+marshmallow>=3.14.0
+
+# Optional: For advanced metrics
+torchmetrics>=0.6.0
+
+# Optional: For model serving
+fastapi>=0.70.0
+uvicorn>=0.15.0
+
+# Optional: For containerization support
+docker>=5.0.0
+
+# System information
+platform>=1.0.8
+
+# Optional: For advanced debugging
+ipdb>=0.13.0
+pdbpp>=0.10.0
+
+# AdamW is now imported from torch.optim, not transformers
