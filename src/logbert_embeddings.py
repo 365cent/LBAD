@@ -1,47 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-FastText Embedding for Log Analysis - Using Pre-trained Models
+LogBERT Embeddings for Log Analysis - Using BERT CLS tokens
 
-Key Improvements:
-- Uses pre-trained FastText models instead of training from scratch
-- Embeds logs as FastText vectors for better semantic representation
+This script extracts BERT CLS token embeddings for log analysis, following the same
+input/output format as fasttext_embedding.py for compatibility with downstream tasks.
+
+Key Features:
+- Uses pre-trained BERT to extract CLS token embeddings (768D vectors)
 - Creates binary multi-label vectors with clear column mapping
-- Removed randomness for consistent results
+- Maintains compatibility with FastText output format
+- Optimized for M2 GPU (MPS device) when available
 - Enhanced progress tracking with dots spinner
 - Visualization shows ALL classes without sampling/reduction
 
 Output files per log type (3 files for clarity):
-- log_{type}.pkl: Raw log text embeddings (300D FastText vectors, float32)
-- label_{type}.pkl: Binary label vectors with metadata
+- log_{type}.pkl: Raw log text embeddings (768D BERT CLS vectors, float32)
+- label_{type}.pkl: Binary label vectors with metadata (same format as FastText)
   * 'vectors': Binary arrays where [0 1 0] means only second class is present
   * 'classes': List of attack types corresponding to each column
   * 'description': Explanation of the binary vector format
 - attack_types_{type}.txt: Human-readable attack type mapping and examples
 
 Performance optimizations:
-- Batch processing (500 samples per batch)
+- Batch processing (8 samples per batch for BERT)
 - Memory-efficient data types (int8 for labels, float32 for embeddings)
-- Vectorized operations where possible
+- GPU acceleration when available (MPS for M2, CUDA for NVIDIA)
 - Optimized pickle protocol for faster I/O
-- Barnes-Hut t-SNE for faster visualization
-- Reduced progress update frequency
-
-Example label structure:
-{
-  'vectors': array([[0, 1, 0], [1, 0, 1], ...], dtype=int8),  # Binary vectors
-  'classes': ['attack_type_1', 'attack_type_2', 'attack_type_3'],
-  'description': 'Binary multi-label vectors where [0 1 0] means only the second class is present'
-}
 """
 
 import os
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from gensim.models import KeyedVectors
-from gensim.utils import simple_preprocess
+import torch
+import torch.nn as nn
 from pathlib import Path
 import pickle
 from tqdm import tqdm
@@ -49,24 +42,75 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import seaborn as sns
 import json
-import multiprocessing
+import multiprocessing as mp
 import argparse
-from functools import partial
+from transformers import BertModel, BertTokenizer
+from torch.utils.data import DataLoader, Dataset
 from halo import Halo
-import gensim.downloader as api
+from typing import List, Dict, Tuple, Optional
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
 PROCESSED_DIR = Path("processed")
-VECTOR_SIZE = 300  # Standard FastText vector size
+VECTOR_SIZE = 768  # BERT hidden size
+MAX_SEQ_LENGTH = 128
+BATCH_SIZE = 8
+NUM_WORKERS = 2
 
-def parse_example(example):
-    """Parse a TensorFlow Example protocol buffer."""
+# Enable TensorFlow optimizations but limit threads
+tf.config.threading.set_inter_op_parallelism_threads(2)
+tf.config.threading.set_intra_op_parallelism_threads(2)
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def get_device() -> torch.device:
+    """Return best available computation device, optimized for M2 GPU."""
+    if torch.backends.mps.is_available():
+        print("Using MPS (Metal Performance Shaders) device - M2 GPU")
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        print("Using CUDA device")
+        return torch.device("cuda")
+    print("Using CPU device")
+    return torch.device("cpu")
+
+
+def clear_memory(device):
+    """Clear memory based on device type."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        pass  # MPS doesn't need explicit cleanup
+    import gc
+    gc.collect()
+
+
+def parse_tfrecord(example: tf.Tensor) -> Dict[str, tf.Tensor]:
+    """Parse a serialized TFRecord example."""
     feature_description = {
-        'l': tf.io.FixedLenFeature([], tf.string),  # log
-        'y': tf.io.FixedLenFeature([], tf.string),  # label
+        "l": tf.io.FixedLenFeature([], tf.string),
+        "y": tf.io.FixedLenFeature([], tf.string),
     }
     return tf.io.parse_single_example(example, feature_description)
+
+
+def process_single_tfrecord(path: Path) -> Tuple[List[str], List[str]]:
+    """Process a single TFRecord file and return logs and labels."""
+    logs = []
+    labels = []
+    
+    dataset = tf.data.TFRecordDataset(str(path), compression_type="GZIP")
+    dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    for parsed in dataset:
+        logs.append(parsed["l"].numpy().decode("utf-8"))
+        labels.append(parsed["y"].numpy().decode("utf-8"))
+    
+    return logs, labels
+
 
 def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
     """Load TFRecord files from directory into a DataFrame with optimized processing."""
@@ -101,22 +145,11 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
             spinner.text = f"Loading file {file_idx+1}/{len(tfrecord_files)}: {file_path.name}"
             log_type = file_path.parent.name
             
-            # Use TensorFlow's optimized API for batch processing
-            dataset = tf.data.TFRecordDataset(str(file_path), compression_type="GZIP", num_parallel_reads=4)
-            dataset = dataset.batch(1000)  # Process in batches
+            logs, labels = process_single_tfrecord(file_path)
             
-            for batch in dataset:
-                parsed_batch = tf.io.parse_example(batch, {
-                    'l': tf.io.FixedLenFeature([], tf.string),
-                    'y': tf.io.FixedLenFeature([], tf.string)
-                })
-                
-                logs = [log.decode('utf-8') for log in parsed_batch['l'].numpy()]
-                labels = [label.decode('utf-8') for label in parsed_batch['y'].numpy()]
-                
-                all_logs.extend(logs)
-                all_labels_json.extend(labels)
-                all_log_types.extend([log_type] * len(logs))
+            all_logs.extend(logs)
+            all_labels_json.extend(labels)
+            all_log_types.extend([log_type] * len(logs))
                 
         except Exception as e:
             spinner.text = f"Error processing file {file_path}: {e}"
@@ -132,11 +165,13 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
         'log_type': all_log_types
     })
 
+
 def normalize_label(label):
     """Normalize attack labels to ensure consistency."""
     if not label:
         return label
     return label.replace('-', '_').lower().strip()
+
 
 def get_labels_from_json(label_json_str):
     """Extract labels from JSON string."""
@@ -147,6 +182,7 @@ def get_labels_from_json(label_json_str):
         return {normalize_label(label) for label in labels if label}
     except json.JSONDecodeError:
         return set()
+
 
 def collect_unique_labels_from_data(df):
     """Extract all unique attack labels from the dataset efficiently."""
@@ -165,69 +201,6 @@ def collect_unique_labels_from_data(df):
     spinner.succeed(f"Found {len(all_unique_labels)} unique attack types")
     return sorted(list(all_unique_labels))
 
-def load_pretrained_fasttext():
-    """Load pre-trained FastText model."""
-    spinner = Halo(text='Loading pre-trained FastText model', spinner='dots')
-    spinner.start()
-    
-    try:
-        # Try to load from local cache first
-        model = api.load("fasttext-wiki-news-subwords-300")
-        spinner.succeed("Loaded pre-trained FastText model (fasttext-wiki-news-subwords-300)")
-        return model
-    except Exception as e:
-        spinner.text = "Downloading pre-trained FastText model (this may take a while)"
-        try:
-            model = api.load("fasttext-wiki-news-subwords-300")
-            spinner.succeed("Downloaded and loaded pre-trained FastText model")
-            return model
-        except Exception as e2:
-            # Try alternative smaller model if main one fails
-            spinner.text = "Trying alternative word2vec model"
-            try:
-                model = api.load("word2vec-google-news-300")
-                spinner.succeed("Loaded alternative word2vec model (word2vec-google-news-300)")
-                return model
-            except Exception as e3:
-                spinner.fail(f"Failed to load any pre-trained model: {e3}")
-                print("Consider installing fasttext manually or check internet connection")
-                return None
-
-def preprocess_text(text):
-    """Preprocess text for embedding."""
-    return simple_preprocess(text)
-
-def embed_text(model, tokens):
-    """Generate embedding for tokenized text using pre-trained FastText."""
-    if not tokens:
-        return np.zeros(model.vector_size, dtype=np.float32)
-    
-    # Vectorized approach for better performance
-    valid_tokens = [token for token in tokens if token in model]
-    
-    if valid_tokens:
-        # Get all embeddings at once and compute mean
-        embeddings_matrix = np.array([model[token] for token in valid_tokens], dtype=np.float32)
-        return np.mean(embeddings_matrix, axis=0)
-    else:
-        return np.zeros(model.vector_size, dtype=np.float32)
-
-def embed_labels(model, labels):
-    """Generate embeddings for labels."""
-    if not labels:
-        return np.zeros(model.vector_size)
-    
-    label_embeddings = []
-    for label in labels:
-        if label:
-            tokens = preprocess_text(label)
-            embedding = embed_text(model, tokens)
-            label_embeddings.append(embedding)
-    
-    if label_embeddings:
-        return np.mean(label_embeddings, axis=0)
-    else:
-        return np.zeros(model.vector_size)
 
 def create_binary_label_vector(label_json_str, all_attack_types):
     """Create binary vector representation for multi-label classification."""
@@ -242,6 +215,7 @@ def create_binary_label_vector(label_json_str, all_attack_types):
         binary_vector[attack_indices] = 1
     
     return binary_vector
+
 
 def display_data_distribution(df, log_type_name="all combined"):
     """Calculate and display data distribution statistics."""
@@ -294,76 +268,123 @@ def display_data_distribution(df, log_type_name="all combined"):
     print(f"{'='*70}\n")
     return attack_count, normal_count
 
-def process_embeddings_batch(model, tokens_batch):
-    """Process a batch of tokens for embedding generation."""
-    return [embed_text(model, tokens) for tokens in tokens_batch]
 
-def process_labels_batch(labels_batch, attack_types):
-    """Process a batch of labels for binary vector generation."""
-    return [create_binary_label_vector(label_json, attack_types) for label_json in labels_batch]
+def find_available_log_types():
+    """Find available log types in the processed directory."""
+    if not PROCESSED_DIR.exists():
+        return []
+    return sorted([path.name for path in PROCESSED_DIR.iterdir() 
+                  if path.is_dir() and list(path.glob("*.tfrecord"))])
 
-def process_embeddings(df, model, use_global_attack_list=False):
-    """Process logs and create embeddings with binary label vectors - optimized version."""
-    spinner = Halo(text='Processing log embeddings', spinner='dots')
+
+# ---------------------------------------------------------------------------
+# Dataset Class for BERT
+# ---------------------------------------------------------------------------
+
+class LogBERTEmbeddingDataset(Dataset):
+    """Dataset class for LogBERT embedding extraction."""
+    
+    def __init__(self, texts: List[str], tokenizer: BertTokenizer, max_length: int = MAX_SEQ_LENGTH):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'idx': idx
+        }
+
+
+def extract_bert_embeddings(df, device):
+    """Extract BERT CLS embeddings for all logs in the dataframe."""
+    spinner = Halo(text='Initializing BERT model', spinner='dots')
     spinner.start()
     
-    total_count = len(df)
-    batch_size = 500  # Optimized batch size for better performance
+    # Load pre-trained BERT model and tokenizer
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased').to(device)
+    model.eval()
     
-    # Tokenize logs in batches
-    spinner.text = "Tokenizing logs in batches"
-    tokenized_logs = []
+    spinner.succeed("BERT model loaded successfully")
     
-    # Use vectorized string operations where possible
-    for i in range(0, total_count, batch_size):
-        end_idx = min(i + batch_size, total_count)
-        batch_logs = df['log'].iloc[i:end_idx]
-        
-        if i % 2000 == 0:  # Update progress less frequently
-            spinner.text = f"Tokenizing logs: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-        
-        # Process batch
-        batch_tokens = [preprocess_text(log) for log in batch_logs]
-        tokenized_logs.extend(batch_tokens)
+    # Create dataset and dataloader
+    dataset = LogBERTEmbeddingDataset(df['log'].tolist(), tokenizer)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type in ["cuda", "mps"]
+    )
     
-    df['tokens'] = tokenized_logs
+    # Extract embeddings
+    all_embeddings = []
     
-    # Create log embeddings in batches
-    spinner.text = "Creating log embeddings in batches"
-    log_embeddings = []
+    spinner = Halo(text='Extracting BERT CLS embeddings', spinner='dots')
+    spinner.start()
     
-    for i in range(0, total_count, batch_size):
-        end_idx = min(i + batch_size, total_count)
-        tokens_batch = tokenized_logs[i:end_idx]
-        
-        if i % 2000 == 0:
-            spinner.text = f"Creating log embeddings: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-        
-        # Process batch with multiprocessing could be added here if needed
-        batch_embeddings = process_embeddings_batch(model, tokens_batch)
-        log_embeddings.extend(batch_embeddings)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx % 10 == 0:
+                spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
+            
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            
+            # Extract CLS token embeddings (first token)
+            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            all_embeddings.append(cls_embeddings)
+            
+            # Clear memory periodically
+            if batch_idx % 50 == 0:
+                clear_memory(device)
     
-    # Convert to numpy array for better memory efficiency
-    log_embeddings_array = np.array(log_embeddings, dtype=np.float32)
-    df['log_embedding'] = list(log_embeddings_array)  # Convert back to list for pandas
+    spinner.succeed("BERT embedding extraction complete")
     
-    # Process labels in batches
-    spinner.text = "Processing binary label vectors in batches"
+    # Concatenate all embeddings
+    all_embeddings = np.vstack(all_embeddings).astype(np.float32)
+    
+    # Clear model from memory
+    del model, tokenizer
+    clear_memory(device)
+    
+    return all_embeddings
+
+
+def process_embeddings(df, device, use_global_attack_list=False):
+    """Process logs and create BERT embeddings with binary label vectors."""
+    # Extract BERT embeddings
+    log_embeddings = extract_bert_embeddings(df, device)
+    df['log_embedding'] = list(log_embeddings)
+    
+    # Process labels
+    spinner = Halo(text="Processing binary label vectors", spinner='dots')
+    spinner.start()
     
     if use_global_attack_list:
         # Use all labels across all log types
         attack_types = collect_unique_labels_from_data(df)
         
         binary_labels = []
-        for i in range(0, total_count, batch_size):
-            end_idx = min(i + batch_size, total_count)
-            labels_batch = df['label_json'].iloc[i:end_idx]
-            
-            if i % 2000 == 0:
-                spinner.text = f"Processing labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-            
-            batch_binary = process_labels_batch(labels_batch, attack_types)
-            binary_labels.extend(batch_binary)
+        for label_json in df['label_json']:
+            binary_vector = create_binary_label_vector(label_json, attack_types)
+            binary_labels.append(binary_vector)
         
         df['binary_labels'] = binary_labels
         df.attrs['attack_types'] = attack_types
@@ -374,45 +395,32 @@ def process_embeddings(df, model, use_global_attack_list=False):
             spinner.text = f"Processing log type: {log_type}"
             log_type_to_attacks[log_type] = collect_unique_labels_from_data(group_df)
         
-        # Process all labels in batches
         binary_labels = []
-        for i in range(0, total_count, batch_size):
-            end_idx = min(i + batch_size, total_count)
-            
-            if i % 2000 == 0:
-                spinner.text = f"Processing binary labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-            
-            batch_binary = []
-            for j in range(i, end_idx):
-                row = df.iloc[j]
-                log_type = row['log_type']
-                if log_type in log_type_to_attacks:
-                    binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[log_type])
-                else:
-                    binary_vector = np.array([], dtype=np.int8)
-                batch_binary.append(binary_vector)
-            
-            binary_labels.extend(batch_binary)
+        for idx, row in df.iterrows():
+            log_type = row['log_type']
+            if log_type in log_type_to_attacks:
+                binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[log_type])
+            else:
+                binary_vector = np.array([], dtype=np.int8)
+            binary_labels.append(binary_vector)
         
         df['binary_labels'] = binary_labels
         df.attrs['log_type_to_attacks'] = log_type_to_attacks
     
-    spinner.succeed("Embedding processing complete")
+    spinner.succeed("Label processing complete")
     return df
+
 
 def visualize_embeddings(df, output_file=None):
     """Create t-SNE visualization with balanced class sampling for performance and minority visibility."""
-    # ------------------------- NEW IMPLEMENTATION START -------------------------
-    # Parameters for sampling – tweak here if necessary
-    MAX_TOTAL_POINTS = 50000   # Hard cap on total points sent to t-SNE
-    MAX_POINTS_PER_CLASS = 1500  # Limit for any single class to avoid domination
+    # Parameters for sampling
+    MAX_TOTAL_POINTS = 50000
+    MAX_POINTS_PER_CLASS = 1500
 
     spinner = Halo(text="Preparing visualization data", spinner='dots')
     spinner.start()
 
-    # -------------------------------------------------------------------------
-    # 1. Build visualization labels for every row (normal vs attacks etc.)
-    # -------------------------------------------------------------------------
+    # Build visualization labels
     spinner.text = "Generating labels for visualization"
     viz_labels = []
     for label_json_str in df['label_json']:
@@ -422,15 +430,13 @@ def visualize_embeddings(df, output_file=None):
         else:
             viz_labels.append(", ".join(sorted(labels)))
 
-    # Attach labels temporarily to the dataframe for easy indexing
+    # Attach labels temporarily to the dataframe
     df = df.copy()
     df['viz_label'] = viz_labels
 
-    # -------------------------------------------------------------------------
-    # 2. Balanced sampling – keep all minority classes, down-sample major ones
-    # -------------------------------------------------------------------------
+    # Balanced sampling
     spinner.text = "Applying balanced sampling to limit dataset size"
-    np.random.seed(42)  # Reproducibility
+    np.random.seed(42)
 
     selected_indices = []
     label_to_indices = {}
@@ -442,31 +448,26 @@ def visualize_embeddings(df, output_file=None):
             sampled = np.random.choice(indices, MAX_POINTS_PER_CLASS, replace=False)
             selected_indices.extend(sampled)
         else:
-            selected_indices.extend(indices)  # Keep all if already small
+            selected_indices.extend(indices)
 
-    # If we still exceed the global cap, randomly subsample the union (keeps balance reasonably well)
     if len(selected_indices) > MAX_TOTAL_POINTS:
         selected_indices = list(np.random.choice(selected_indices, MAX_TOTAL_POINTS, replace=False))
 
-    # -------------------------------------------------------------------------
-    # 3. Gather embeddings and labels for the sampled indices
-    # -------------------------------------------------------------------------
+    # Gather embeddings and labels for the sampled indices
     embeddings = np.vstack([df.at[i, 'log_embedding'] for i in selected_indices]).astype(np.float32)
     sampled_labels = [viz_labels[i] for i in selected_indices]
     sampled_log_types = [df.at[i, 'log_type'] for i in selected_indices]
 
     spinner.text = f"Running t-SNE on {len(embeddings)} sampled points"
 
-    # Choose perplexity based on size (rule of thumb: 5–50 & < samples/3)
+    # Choose perplexity based on size
     perplexity = min(50, max(5, len(embeddings)//1000))
 
-    # -------------------------------------------------------------------------
-    # 4. Execute t-SNE (Barnes-Hut) – use safer sklearn parameters
-    # -------------------------------------------------------------------------
+    # Execute t-SNE
     tsne = TSNE(
         n_components=2,
         perplexity=perplexity,
-        n_iter=500,          # Reasonable iterations
+        n_iter=500,
         learning_rate='auto',
         init='pca',
         method='barnes_hut',
@@ -475,9 +476,7 @@ def visualize_embeddings(df, output_file=None):
 
     reduced = tsne.fit_transform(embeddings)
 
-    # -------------------------------------------------------------------------
-    # 5. Prepare DataFrame for plotting
-    # -------------------------------------------------------------------------
+    # Prepare DataFrame for plotting
     df_plot = pd.DataFrame({
         'x': reduced[:, 0],
         'y': reduced[:, 1],
@@ -487,19 +486,17 @@ def visualize_embeddings(df, output_file=None):
 
     spinner.succeed("t-SNE dimensionality reduction complete")
 
-    # ------------------------- NEW IMPLEMENTATION END -------------------------
-
     # Count visualization labels
     label_counts = df_plot['label'].value_counts()
     print(f"\nVisualization showing ALL {len(label_counts)} unique label combinations:")
-    for label, count in label_counts.head(10).items():  # Show top 10 for readability
+    for label, count in label_counts.head(10).items():
         percentage = (count / len(df_plot)) * 100
         print(f"  {label}: {count} ({percentage:.2f}%)")
     
     if len(label_counts) > 10:
         print(f"  ... and {len(label_counts) - 10} more label combinations")
     
-    # Create optimized color palette
+    # Create color palette
     unique_labels = sorted(df_plot['label'].unique())
     palette = sns.color_palette("husl", len(unique_labels))
     color_map = {label: palette[i] for i, label in enumerate(unique_labels)}
@@ -507,13 +504,12 @@ def visualize_embeddings(df, output_file=None):
     if "normal" in color_map:
         color_map["normal"] = "green"
     
-    # Create optimized scatter plot
+    # Create scatter plot
     spinner = Halo(text="Creating visualization plot", spinner='dots')
     spinner.start()
     
-    plt.figure(figsize=(16, 10))  # Larger figure for better readability
+    plt.figure(figsize=(16, 10))
     
-    # Use matplotlib directly for better performance with large datasets
     for label in unique_labels:
         mask = df_plot['label'] == label
         subset = df_plot[mask]
@@ -524,11 +520,11 @@ def visualize_embeddings(df, output_file=None):
             c=[color_map[label]], 
             label=label,
             alpha=0.6,
-            s=20,  # Smaller points for large datasets
-            edgecolors='none'  # Remove edges for better performance
+            s=20,
+            edgecolors='none'
         )
     
-    plt.title(f't-SNE Visualization: FastText Log Embeddings (All {len(unique_labels)} Classes)', fontsize=14)
+    plt.title(f't-SNE Visualization: LogBERT CLS Embeddings (All {len(unique_labels)} Classes)', fontsize=14)
     plt.xlabel('t-SNE Component 1', fontsize=12)
     plt.ylabel('t-SNE Component 2', fontsize=12)
     
@@ -541,7 +537,7 @@ def visualize_embeddings(df, output_file=None):
         plt.tight_layout(rect=[0,0,0.8,1])
     
     if output_file:
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')  # Slightly lower DPI for faster saving
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
         spinner.succeed(f"Saved visualization to {output_file}")
     else:
         plt.show()
@@ -552,25 +548,19 @@ def visualize_embeddings(df, output_file=None):
     # Clear memory
     del embeddings, reduced, df_plot
 
-def find_available_log_types():
-    """Find available log types in the processed directory."""
-    if not PROCESSED_DIR.exists():
-        return []
-    return sorted([path.name for path in PROCESSED_DIR.iterdir() 
-                  if path.is_dir() and list(path.glob("*.tfrecord"))])
 
 def save_embeddings_and_labels(df, output_dir, log_type_name):
-    """Save only log embeddings and label vectors as requested - optimized version."""
+    """Save only log embeddings and label vectors as requested - matching FastText format."""
     spinner = Halo(text=f"Saving embeddings for {log_type_name}", spinner='dots')
     spinner.start()
     
-    # Extract and save log embeddings as log_<type>.pkl (optimized)
+    # Extract and save log embeddings as log_<type>.pkl
     log_embeddings = np.vstack(df['log_embedding'].tolist()).astype(np.float32)
     log_filename = f"log_{log_type_name}.pkl"
     
     spinner.text = f"Saving log embeddings to {log_filename}"
     with open(output_dir / log_filename, 'wb') as f:
-        pickle.dump(log_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)  # Use highest protocol for speed
+        pickle.dump(log_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)
     
     # Extract and save binary label vectors as label_<type>.pkl
     if 'binary_labels' in df.columns and len(df['binary_labels']) > 0:
@@ -578,7 +568,7 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
         valid_vectors = [vec for vec in df['binary_labels'] if len(vec) > 0]
         
         if valid_vectors:
-            binary_vectors = np.vstack(valid_vectors).astype(np.int8)  # Memory efficient
+            binary_vectors = np.vstack(valid_vectors).astype(np.int8)
             label_filename = f"label_{log_type_name}.pkl"
             
             # Get class mapping information
@@ -641,14 +631,15 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
                 else:
                     f.write("No attack types found for this log type.\n")
                 
-                f.write(f"\nGenerated by FastText embeddings extraction\n")
-                f.write(f"Embedding dimension: 300D (FastText vectors)\n")
+                f.write(f"\nGenerated by LogBERT embeddings extraction\n")
+                f.write(f"Compatible with FastText embedding format\n")
+                f.write(f"Embedding dimension: 768D (BERT CLS vectors)\n")
                 
             spinner.succeed(f"Saved {log_filename}, {label_filename}, and {attack_info_filename}")
             
-            # Print summary with proper vector format
+            # Print summary
             print(f"\nSaved files for {log_type_name}:")
-            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape} (300D FastText vectors)")
+            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape} (768D BERT CLS vectors)")
             print(f"  - {label_filename}: Binary label vectors {binary_vectors.shape}")
             print(f"  - {attack_info_filename}: Attack types and column mapping details")
             print(f"  - Classes: {classes}")
@@ -657,19 +648,20 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
     else:
         spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained models")
+    parser = argparse.ArgumentParser(description="Generate LogBERT CLS embeddings for log data")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     args = parser.parse_args()
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Load pre-trained FastText model
-    model = load_pretrained_fasttext()
-    if model is None:
-        print("Failed to load pre-trained FastText model. Exiting.")
-        return
+    # Get device
+    device = get_device()
+    
+    # Set multiprocessing start method for compatibility
+    mp.set_start_method('spawn', force=True)
     
     # Find available log types
     spinner = Halo(text="Finding available log types", spinner='dots')
@@ -706,7 +698,7 @@ def main():
             display_data_distribution(df, log_type)
 
             # Process embeddings
-            df = process_embeddings(df, model, use_global_attack_list=False)
+            df = process_embeddings(df, device, use_global_attack_list=False)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
@@ -719,6 +711,10 @@ def main():
                 df, 
                 output_file=output_dir / "visualization.png"
             )
+            
+            # Clear memory
+            del df
+            clear_memory(device)
             
         except Exception as e:
             print(f"Error processing log type {log_type}: {e}")
@@ -735,7 +731,7 @@ def main():
                 print("No data found for combined log types")
             else:
                 display_data_distribution(df_all, "all combined")
-                df_all = process_embeddings(df_all, model, use_global_attack_list=True)
+                df_all = process_embeddings(df_all, device, use_global_attack_list=True)
                 
                 # Save combined outputs
                 save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
@@ -745,6 +741,10 @@ def main():
                     df_all,
                     output_file=OUTPUT_DIR / "visualization_all_combined.png"
                 )
+                
+                # Clear memory
+                del df_all
+                clear_memory(device)
         
         except Exception as e:
             print(f"Error processing combined log types: {e}")
@@ -753,7 +753,10 @@ def main():
     
     spinner = Halo(spinner='dots', text='Completing processing')
     spinner.start()
-    spinner.succeed("FastText embedding processing complete!")
+    spinner.succeed("LogBERT embedding processing complete!")
+    print("\nNote: Output format is compatible with FastText embeddings for downstream tasks.")
+    print("The only difference is the embedding dimension: 768D (BERT) vs 300D (FastText)")
+
 
 if __name__ == "__main__":
-    main()
+    main() 

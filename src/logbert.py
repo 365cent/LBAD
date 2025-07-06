@@ -3,9 +3,9 @@
 """LogBERT: Log Anomaly Detection via BERT
 Following the original LogBERT approach with modular commands.
 Usage:
-    python logbert.py vocab
-    python logbert.py train  
-    python logbert.py predict
+    python logbert.py vocab [--log-type TYPE]
+    python logbert.py train [--log-type TYPE]  
+    python logbert.py predict [--log-type TYPE]
 """
 
 from __future__ import annotations
@@ -37,10 +37,6 @@ from collections import Counter
 # ---------------------------------------------------------------------------
 PROCESSED_DIR = Path("processed")
 OUTPUT_DIR = Path("embeddings")
-MODEL_DIR = OUTPUT_DIR / "logbert_model"
-VOCAB_DIR = OUTPUT_DIR / "vocab"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-VOCAB_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
@@ -78,6 +74,32 @@ def clear_memory(device):
     gc.collect()
 
 
+def get_paths_for_log_type(log_type: Optional[str]):
+    """Get appropriate paths based on log type."""
+    if log_type:
+        # Specific log type processing
+        processed_dir = PROCESSED_DIR / log_type
+        output_dir = OUTPUT_DIR / log_type
+        model_dir = output_dir / "logbert_model"
+        vocab_dir = output_dir / "vocab"
+    else:
+        # All log types combined
+        processed_dir = PROCESSED_DIR
+        output_dir = OUTPUT_DIR
+        model_dir = output_dir / "logbert_model"
+        vocab_dir = output_dir / "vocab"
+    
+    return processed_dir, output_dir, model_dir, vocab_dir
+
+
+def find_available_log_types():
+    """Find available log types in the processed directory."""
+    if not PROCESSED_DIR.exists():
+        return []
+    return sorted([path.name for path in PROCESSED_DIR.iterdir() 
+                   if path.is_dir() and list(path.glob("*.tfrecord"))])
+
+
 def parse_tfrecord(example: tf.Tensor) -> Dict[str, tf.Tensor]:
     """Parse a serialized TFRecord example."""
     feature_description = {
@@ -103,7 +125,7 @@ def process_single_tfrecord(path: Path) -> Tuple[List[str], List[str]]:
     return logs, labels
 
 
-def load_tfrecords_parallel(directory: Path = PROCESSED_DIR) -> pd.DataFrame:
+def load_tfrecords_parallel(directory: Path) -> pd.DataFrame:
     """Load all TFRecord files using parallel processing."""
     tfrecord_files = list(directory.glob("**/*.tfrecord"))
     if not tfrecord_files:
@@ -139,8 +161,9 @@ def collect_attack_types(df: pd.DataFrame) -> List[str]:
     return sorted(attack_set)
 
 
-def save_vocab(attack_types: List[str]) -> None:
+def save_vocab(attack_types: List[str], vocab_dir: Path) -> None:
     """Save vocabulary information."""
+    vocab_dir.mkdir(parents=True, exist_ok=True)
     vocab_info = {
         "attack_types": attack_types,
         "vocab_size": len(attack_types),
@@ -148,24 +171,24 @@ def save_vocab(attack_types: List[str]) -> None:
         "idx_to_label": {i: lbl for i, lbl in enumerate(attack_types)}
     }
     
-    with open(VOCAB_DIR / "vocab.json", "w", encoding="utf-8") as f:
+    with open(vocab_dir / "vocab.json", "w", encoding="utf-8") as f:
         json.dump(vocab_info, f, indent=2)
     
     print(f"Vocabulary saved: {len(attack_types)} unique attack types")
-    print(f"Vocab file: {VOCAB_DIR / 'vocab.json'}")
+    print(f"Vocab file: {vocab_dir / 'vocab.json'}")
 
 
-def load_vocab() -> Dict:
+def load_vocab(vocab_dir: Path) -> Dict:
     """Load vocabulary information."""
-    vocab_path = VOCAB_DIR / "vocab.json"
+    vocab_path = vocab_dir / "vocab.json"
     if not vocab_path.exists():
-        raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}. Run 'python logbert.py vocab' first.")
+        raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}. Run vocab command first.")
     
     with open(vocab_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def plot_data_distribution(df: pd.DataFrame, attack_types: List[str]) -> None:
+def plot_data_distribution(df: pd.DataFrame, attack_types: List[str], output_dir: Path) -> None:
     """Create and save distribution charts for the data."""
     label_counts = Counter()
     log_lengths = []
@@ -238,10 +261,11 @@ def plot_data_distribution(df: pd.DataFrame, attack_types: List[str]) -> None:
              fontsize=12, verticalalignment='top', fontfamily='monospace')
     
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'data_distribution.png', dpi=300, bbox_inches='tight')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_dir / 'data_distribution.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Saved distribution charts to {OUTPUT_DIR / 'data_distribution.png'}")
+    print(f"Saved distribution charts to {output_dir / 'data_distribution.png'}")
 
 
 # ---------------------------------------------------------------------------
@@ -316,42 +340,52 @@ class LogBERTDataset(Dataset):
 # Commands following original LogBERT approach
 # ---------------------------------------------------------------------------
 
-def vocab_command():
+def vocab_command(log_type: Optional[str] = None):
     """Build vocabulary from the dataset."""
     print("=" * 50)
-    print("LogBERT: Building Vocabulary")
+    print(f"LogBERT: Building Vocabulary{f' for {log_type}' if log_type else ''}")
     print("=" * 50)
     
+    # Get paths based on log type
+    processed_dir, output_dir, model_dir, vocab_dir = get_paths_for_log_type(log_type)
+    
+    if log_type and not processed_dir.exists():
+        available_types = find_available_log_types()
+        raise FileNotFoundError(f"Log type '{log_type}' not found. Available types: {', '.join(available_types)}")
+    
     # Load data
-    df = load_tfrecords_parallel()
+    df = load_tfrecords_parallel(processed_dir)
     attack_types = collect_attack_types(df)
     
     # Save vocabulary
-    save_vocab(attack_types)
+    save_vocab(attack_types, vocab_dir)
     
     # Create distribution plots
-    plot_data_distribution(df, attack_types)
+    plot_data_distribution(df, attack_types, output_dir)
     
     print(f"\nVocabulary building complete!")
     print(f"Found {len(attack_types)} unique attack types")
     print(f"Total samples: {len(df):,}")
 
 
-def train_command():
+def train_command(log_type: Optional[str] = None):
     """Train the LogBERT model."""
     print("=" * 50)
-    print("LogBERT: Training Model")
+    print(f"LogBERT: Training Model{f' for {log_type}' if log_type else ''}")
     print("=" * 50)
     
     device = get_device()
     
+    # Get paths based on log type
+    processed_dir, output_dir, model_dir, vocab_dir = get_paths_for_log_type(log_type)
+    
     # Load vocabulary
-    vocab_info = load_vocab()
+    vocab_info = load_vocab(vocab_dir)
     attack_types = vocab_info["attack_types"]
     label_to_idx = vocab_info["label_to_idx"]
     
     # Load data
-    df = load_tfrecords_parallel()
+    df = load_tfrecords_parallel(processed_dir)
     print(f"Loaded {len(df)} samples with {len(attack_types)} attack types")
     
     # Initialize model and tokenizer
@@ -442,42 +476,45 @@ def train_command():
         # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(MODEL_DIR)
-            tokenizer.save_pretrained(MODEL_DIR)
-            print(f"Best model saved to {MODEL_DIR}")
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(model_dir)
+            tokenizer.save_pretrained(model_dir)
+            print(f"Best model saved to {model_dir}")
     
     print(f"\nTraining complete! Best validation loss: {best_val_loss:.4f}")
 
 
-def predict_command():
+def predict_command(log_type: Optional[str] = None):
     """Make predictions using the trained model and extract embeddings."""
     print("=" * 50)
-    print("LogBERT: Making Predictions & Extracting Embeddings")
+    print(f"LogBERT: Making Predictions & Extracting Embeddings{f' for {log_type}' if log_type else ''}")
     print("=" * 50)
     
     device = get_device()
     
+    # Get paths based on log type
+    processed_dir, output_dir, model_dir, vocab_dir = get_paths_for_log_type(log_type)
+    
     # Load vocabulary
-    vocab_info = load_vocab()
+    vocab_info = load_vocab(vocab_dir)
     attack_types = vocab_info["attack_types"]
     label_to_idx = vocab_info["label_to_idx"]
     idx_to_label = vocab_info["idx_to_label"]
     
     # Check if model exists
-    if not MODEL_DIR.exists():
-        raise FileNotFoundError(f"Model not found: {MODEL_DIR}. Run 'python logbert.py train' first.")
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model not found: {model_dir}. Run train command first.")
     
     # Load model and tokenizer with hidden states output enabled
-    tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
+    tokenizer = BertTokenizer.from_pretrained(model_dir)
     model = BertForSequenceClassification.from_pretrained(
-        MODEL_DIR,
+        model_dir,
         output_hidden_states=True
     ).to(device)
     model.eval()
     
     # Load test data
-    df = load_tfrecords_parallel()
+    df = load_tfrecords_parallel(processed_dir)
     test_ds = LogBERTDataset(df, tokenizer, label_to_idx, device)
     test_loader = DataLoader(
         test_ds, 
@@ -522,10 +559,63 @@ def predict_command():
     f1_micro = f1_score(all_true_labels, binary_predictions, average='micro')
     f1_macro = f1_score(all_true_labels, binary_predictions, average='macro')
     
+    # Calculate additional metrics for summary
+    total_samples = len(all_true_labels)
+    total_positive_predictions = np.sum(binary_predictions)
+    total_true_positives = np.sum(all_true_labels)
+    accuracy_per_label = []
+    
+    for i in range(len(attack_types)):
+        true_labels_col = all_true_labels[:, i]
+        pred_labels_col = binary_predictions[:, i]
+        if np.sum(true_labels_col) > 0:  # Only calculate if there are positive samples
+            accuracy = np.mean(true_labels_col == pred_labels_col)
+            accuracy_per_label.append((attack_types[i], accuracy, np.sum(true_labels_col), np.sum(pred_labels_col)))
+    
+    # Sort by accuracy for summary
+    accuracy_per_label.sort(key=lambda x: x[1], reverse=True)
+    
+    # Print results
     print(f"\nPrediction Results:")
     print(f"F1 Score (Micro): {f1_micro:.4f}")
     print(f"F1 Score (Macro): {f1_macro:.4f}")
     print(f"CLS Embeddings Shape: {all_cls_embeddings.shape}")
+    
+    # Create summary text
+    summary_lines = []
+    summary_lines.append("=" * 60)
+    summary_lines.append(f"LogBERT Classification Summary{f' - {log_type}' if log_type else ' - All Log Types'}")
+    summary_lines.append("=" * 60)
+    summary_lines.append(f"Total samples: {total_samples:,}")
+    summary_lines.append(f"Total attack types: {len(attack_types)}")
+    summary_lines.append(f"CLS embeddings shape: {all_cls_embeddings.shape}")
+    summary_lines.append("")
+    summary_lines.append("Overall Performance:")
+    summary_lines.append(f"  F1 Score (Micro): {f1_micro:.4f}")
+    summary_lines.append(f"  F1 Score (Macro): {f1_macro:.4f}")
+    summary_lines.append(f"  Total true positives: {total_true_positives:,}")
+    summary_lines.append(f"  Total predicted positives: {total_positive_predictions:,}")
+    summary_lines.append("")
+    
+    if accuracy_per_label:
+        summary_lines.append("Per-Attack-Type Performance (Top 10 by accuracy):")
+        summary_lines.append(f"{'Attack Type':<25} {'Accuracy':<10} {'True Count':<12} {'Pred Count':<12}")
+        summary_lines.append("-" * 65)
+        
+        for attack_type, accuracy, true_count, pred_count in accuracy_per_label[:10]:
+            summary_lines.append(f"{attack_type:<25} {accuracy:.4f}     {true_count:<12} {pred_count:<12}")
+        
+        if len(accuracy_per_label) > 10:
+            summary_lines.append(f"... and {len(accuracy_per_label) - 10} more attack types")
+        summary_lines.append("")
+    
+    summary_lines.append("Output Files:")
+    summary_lines.append(f"  Predictions: {output_dir / 'predictions.json'}")
+    summary_lines.append(f"  CLS Embeddings: {output_dir / 'logbert_cls_embeddings.npy'}")
+    summary_lines.append(f"  Summary: {output_dir / 'classification_summary.txt'}")
+    summary_lines.append("")
+    summary_lines.append("Note: CLS embeddings can be used for unsupervised learning")
+    summary_lines.append("(clustering, anomaly detection, etc.)")
     
     # Save predictions
     predictions_data = {
@@ -537,15 +627,22 @@ def predict_command():
         'f1_macro': f1_macro
     }
     
-    with open(OUTPUT_DIR / 'predictions.json', 'w') as f:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / 'predictions.json', 'w') as f:
         json.dump(predictions_data, f, indent=2)
     
     # Save CLS embeddings for unsupervised learning
-    embeddings_path = OUTPUT_DIR / 'logbert_cls_embeddings.npy'
+    embeddings_path = output_dir / 'logbert_cls_embeddings.npy'
     np.save(embeddings_path, all_cls_embeddings)
     
-    print(f"Predictions saved to {OUTPUT_DIR / 'predictions.json'}")
+    # Save summary to text file
+    summary_path = output_dir / 'classification_summary.txt'
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(summary_lines))
+    
+    print(f"Predictions saved to {output_dir / 'predictions.json'}")
     print(f"CLS embeddings saved to {embeddings_path}")
+    print(f"Classification summary saved to {summary_path}")
     print(f"Embeddings can be used for unsupervised learning (clustering, anomaly detection, etc.)")
 
 
@@ -554,18 +651,30 @@ def main():
     parser = argparse.ArgumentParser(description='LogBERT: Log Anomaly Detection via BERT')
     parser.add_argument('command', choices=['vocab', 'train', 'predict'], 
                         help='Command to run: vocab, train, or predict')
+    parser.add_argument('--log-type', type=str, default=None,
+                        help='Process specific log type (e.g., wp-error, dns, auth). If not specified, processes all log types combined.')
     
     args = parser.parse_args()
+    
+    # Validate log type if specified
+    if args.log_type:
+        available_types = find_available_log_types()
+        if not available_types:
+            print("No processed log types found. Run preprocessing first.")
+            return
+        if args.log_type not in available_types:
+            print(f"Log type '{args.log_type}' not found. Available types: {', '.join(available_types)}")
+            return
     
     # Set multiprocessing start method for compatibility
     mp.set_start_method('spawn', force=True)
     
     if args.command == 'vocab':
-        vocab_command()
+        vocab_command(args.log_type)
     elif args.command == 'train':
-        train_command()
+        train_command(args.log_type)
     elif args.command == 'predict':
-        predict_command()
+        predict_command(args.log_type)
 
 
 if __name__ == "__main__":
