@@ -15,13 +15,16 @@ XGBOOST_ML := $(SRC)/xgboost_ml.py
 MAIN := $(SRC)/main.py
 GAN := $(SRC)/gan_augmentation.py
 EVAL := $(SRC)/gan_evaluation.py
-LOGBERT := $(SRC)/logbert.py
+LOGBERT_EMBEDDINGS := $(SRC)/logbert_embeddings.py
+TRANSFORMER_UNSUPERVISED := $(SRC)/transformer_unsupervised_ml.py
 
 # Log types for specific processing
 # From src/preprocessing.py --log-type choices
 PREPROCESS_LOG_TYPES := web error auth dns firewall vpn audit kernel systemd
 # From src/fasttext_embedding.py LOG_TYPE_ATTACKS.keys()
 FASTTEXT_LOG_TYPES := dns network web error monitoring auth audit
+# Available log types for embeddings (both FastText and LogBERT)
+EMBEDDING_LOG_TYPES := dns network web error monitoring auth audit
 
 # Contexts for xgboost_ml.py and ml_models.py (specific logical types + all_combined)
 ML_CONTEXTS := all_combined $(FASTTEXT_LOG_TYPES)
@@ -52,10 +55,13 @@ help:
 	@echo "  xgboost-ml         Run XGBoost Multi-Label (OvR) for all_combined context"
 	@echo "  xgboost-ml-<ctx>   Run XGBoost Multi-Label (OvR) for a specific context"
 	@echo "                     Available contexts for xgboost-ml: $(ML_CONTEXTS)"
-	@echo "  logbert-vocab    Build LogBERT vocabulary and analyze data distribution"
-	@echo "  logbert-train    Train the LogBERT model"
-	@echo "  logbert-predict  Generate LogBERT predictions and evaluate"
-	@echo "  logbert          Run full LogBERT pipeline (vocab -> train -> predict)"
+	@echo "  logbert          Run LogBERT embeddings extraction (all log types, FastText-compatible format)"
+	@echo "  logbert-<type>   Run LogBERT embeddings for specific log type"
+	@echo "                     Available log types for logbert: $(EMBEDDING_LOG_TYPES)"
+	@echo "  transformer-ml   Run transformer-based unsupervised ML (all log types with embeddings)"
+	@echo "  transformer-ml-<type>  Run transformer unsupervised ML for specific log type"
+	@echo "  transformer-ml-fast    Run transformer unsupervised ML (skip transformer training)"
+	@echo "                     Available log types for transformer-ml: $(EMBEDDING_LOG_TYPES)"
 	@echo "  gan              Run VAE-GAN augmentation"
 	@echo "  eval             Evaluate VAE-GAN augmentation"
 	@echo "  gan-pipeline     Run augmentation and evaluation"
@@ -118,24 +124,27 @@ xgboost-ml-%:
 	@echo "Running XGBoost Multi-Label (OvR) for context: $*"
 	$(PYTHON) $(XGBOOST_ML) --context $*
 
-# LogBERT: Log Anomaly Detection via BERT
-logbert-vocab:
-	@echo "Building LogBERT vocabulary and analyzing data distribution"
-	$(PYTHON) $(LOGBERT) vocab
-
-logbert-train:
-	@echo "Training the LogBERT model"
-	$(PYTHON) $(LOGBERT) train
-
-logbert-predict:
-	@echo "Generating LogBERT predictions and evaluating"
-	$(PYTHON) $(LOGBERT) predict
-
-# Full LogBERT pipeline
+# LogBERT Embeddings (FastText-compatible format)
 logbert:
-	$(MAKE) logbert-vocab
-	$(MAKE) logbert-train
-	$(MAKE) logbert-predict
+	@echo "Extracting LogBERT CLS embeddings (all log types, FastText-compatible format)"
+	$(PYTHON) $(LOGBERT_EMBEDDINGS)
+
+logbert-%:
+	@echo "Extracting LogBERT CLS embeddings for log type: $*"
+	$(PYTHON) $(LOGBERT_EMBEDDINGS) --log-type $*
+
+# Transformer Unsupervised ML
+transformer-ml:
+	@echo "Running transformer-based unsupervised ML (all log types with embeddings)"
+	$(PYTHON) $(TRANSFORMER_UNSUPERVISED)
+
+transformer-ml-%:
+	@echo "Running transformer-based unsupervised ML for log type: $*"
+	$(PYTHON) $(TRANSFORMER_UNSUPERVISED) --log-type $*
+
+transformer-ml-fast:
+	@echo "Running transformer-based unsupervised ML (skip transformer training)"
+	$(PYTHON) $(TRANSFORMER_UNSUPERVISED) --skip-training
 
 ml-evaluate: ; $(PYTHON) $(ML) --no-train
 gan:         ; $(PYTHON) $(GAN)
@@ -164,8 +173,9 @@ clean-all:
 	$(MAKE) clean
 
 .PHONY: all install preprocess test fasttext word2vec tfidf ml ml-rf ml-xgb ml-knn ml-lr \
-        ml-evaluate xgboost-ml logbert logbert-vocab logbert-train logbert-predict \
-        gan eval gan-pipeline gan-small eval-fast clean clean-aug clean-all help \
+        ml-evaluate xgboost-ml logbert transformer-ml transformer-ml-fast gan eval gan-pipeline gan-small eval-fast clean clean-aug clean-all help \
         $(addprefix ml-,$(ML_CONTEXTS)) \
         $(foreach ctx,$(ML_CONTEXTS),$(addprefix ml-$(ctx)-,rf xgb knn lr)) \
-        $(addprefix xgboost-ml-,$(ML_CONTEXTS))
+        $(addprefix xgboost-ml-,$(ML_CONTEXTS)) \
+        $(addprefix logbert-,$(EMBEDDING_LOG_TYPES)) \
+        $(addprefix transformer-ml-,$(EMBEDDING_LOG_TYPES))
