@@ -48,6 +48,8 @@ from transformers import BertModel, BertTokenizer
 from torch.utils.data import DataLoader, Dataset
 from halo import Halo
 from typing import List, Dict, Tuple, Optional
+import time
+import psutil
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -56,6 +58,20 @@ VECTOR_SIZE = 768  # BERT hidden size
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
 NUM_WORKERS = 2
+
+# Performance thresholds for auto-optimization
+SMALL_DATASET_THRESHOLD = 10000    # < 10K entries
+MEDIUM_DATASET_THRESHOLD = 100000  # < 100K entries
+LARGE_DATASET_THRESHOLD = 500000   # < 500K entries
+# > 500K entries = Very Large Dataset
+
+# Performance configurations based on dataset size
+PERF_CONFIG = {
+    'small': {'batch_size': 16, 'workers': 4, 'clear_freq': 100},
+    'medium': {'batch_size': 12, 'workers': 3, 'clear_freq': 50},
+    'large': {'batch_size': 8, 'workers': 2, 'clear_freq': 25},
+    'very_large': {'batch_size': 4, 'workers': 1, 'clear_freq': 10}
+}
 
 # Enable TensorFlow optimizations but limit threads
 tf.config.threading.set_inter_op_parallelism_threads(2)
@@ -269,6 +285,90 @@ def display_data_distribution(df, log_type_name="all combined"):
     return attack_count, normal_count
 
 
+def estimate_dataset_size(directory=PROCESSED_DIR, log_type_filter=None):
+    """Estimate dataset size by examining TFRecord file sizes."""
+    # Get list of all tfrecord files
+    if log_type_filter:
+        log_type_dir_path = directory / log_type_filter
+        if not log_type_dir_path.exists():
+            return 0, "unknown"
+        tfrecord_files = list(log_type_dir_path.glob("*.tfrecord"))
+    else:
+        tfrecord_files = []
+        for log_dir_path in directory.iterdir():
+            if log_dir_path.is_dir():
+                tfrecord_files.extend(log_dir_path.glob("*.tfrecord"))
+    
+    if not tfrecord_files:
+        return 0, "unknown"
+    
+    # Estimate based on file sizes (rough approximation: 100 bytes per log entry on average)
+    total_size = sum(f.stat().st_size for f in tfrecord_files)
+    estimated_entries = total_size // 100  # rough estimate
+    
+    # Categorize dataset size
+    if estimated_entries < SMALL_DATASET_THRESHOLD:
+        category = "small"
+    elif estimated_entries < MEDIUM_DATASET_THRESHOLD:
+        category = "medium"
+    elif estimated_entries < LARGE_DATASET_THRESHOLD:
+        category = "large"
+    else:
+        category = "very_large"
+    
+    return estimated_entries, category
+
+
+def get_performance_config(dataset_size_category, device_type="cpu"):
+    """Get optimized performance configuration based on dataset size and device."""
+    config = PERF_CONFIG[dataset_size_category].copy()
+    
+    # Adjust for device capabilities
+    if device_type == "mps":  # M2 GPU
+        config['batch_size'] = min(config['batch_size'] * 2, 32)  # Double batch size for GPU
+        config['workers'] = min(config['workers'], 4)  # MPS works best with fewer workers
+    elif device_type == "cuda":
+        config['batch_size'] = min(config['batch_size'] * 3, 64)  # Triple for CUDA
+        config['workers'] = min(config['workers'], 6)
+    
+    # Adjust for system memory
+    memory_gb = psutil.virtual_memory().total / (1024**3)
+    if memory_gb < 8:  # Less than 8GB RAM
+        config['batch_size'] = max(config['batch_size'] // 2, 2)
+        config['workers'] = max(config['workers'] // 2, 1)
+    elif memory_gb > 32:  # More than 32GB RAM
+        config['batch_size'] = min(config['batch_size'] * 2, 64)
+        config['workers'] = min(config['workers'] * 2, 8)
+    
+    return config
+
+
+def estimate_processing_time(num_entries, batch_size, device_type="cpu"):
+    """Estimate processing time based on dataset size and hardware."""
+    # Base processing rates (entries per second) - empirically determined
+    base_rates = {
+        "cpu": 15,      # entries per second on CPU
+        "mps": 45,      # entries per second on M2 GPU
+        "cuda": 60      # entries per second on CUDA GPU
+    }
+    
+    rate = base_rates.get(device_type, base_rates["cpu"])
+    
+    # Adjust for batch size efficiency
+    efficiency_factor = min(batch_size / 8.0, 2.0)  # Optimal around batch size 8-16
+    adjusted_rate = rate * efficiency_factor
+    
+    estimated_seconds = num_entries / adjusted_rate
+    
+    # Format time estimate
+    if estimated_seconds < 60:
+        return f"{estimated_seconds:.0f} seconds"
+    elif estimated_seconds < 3600:
+        return f"{estimated_seconds/60:.1f} minutes"
+    else:
+        return f"{estimated_seconds/3600:.1f} hours"
+
+
 def find_available_log_types():
     """Find available log types in the processed directory."""
     if not PROCESSED_DIR.exists():
@@ -309,9 +409,20 @@ class LogBERTEmbeddingDataset(Dataset):
         }
 
 
-def extract_bert_embeddings(df, device):
+def extract_bert_embeddings(df, device, performance_config=None):
     """Extract BERT CLS embeddings for all logs in the dataframe."""
-    spinner = Halo(text='Initializing BERT model', spinner='dots')
+    if performance_config is None:
+        performance_config = {'batch_size': BATCH_SIZE, 'workers': NUM_WORKERS, 'clear_freq': 50}
+    
+    num_entries = len(df)
+    batch_size = performance_config['batch_size']
+    num_workers = performance_config['workers']
+    clear_freq = performance_config['clear_freq']
+    
+    # Estimate processing time
+    time_estimate = estimate_processing_time(num_entries, batch_size, device.type)
+    
+    spinner = Halo(text=f'Initializing BERT model (ETA: {time_estimate})', spinner='dots')
     spinner.start()
     
     # Load pre-trained BERT model and tokenizer
@@ -319,28 +430,47 @@ def extract_bert_embeddings(df, device):
     model = BertModel.from_pretrained('bert-base-uncased').to(device)
     model.eval()
     
-    spinner.succeed("BERT model loaded successfully")
+    spinner.succeed(f"BERT model loaded - Processing {num_entries:,} entries (batch_size={batch_size}, workers={num_workers})")
     
-    # Create dataset and dataloader
+    # Create dataset and dataloader with optimized settings
     dataset = LogBERTEmbeddingDataset(df['log'].tolist(), tokenizer)
     dataloader = DataLoader(
         dataset, 
-        batch_size=BATCH_SIZE, 
+        batch_size=batch_size, 
         shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type in ["cuda", "mps"]
+        num_workers=num_workers,
+        pin_memory=device.type in ["cuda", "mps"],
+        persistent_workers=num_workers > 0
     )
     
-    # Extract embeddings
+    # Extract embeddings with time tracking
     all_embeddings = []
+    start_time = time.time()
     
-    spinner = Halo(text='Extracting BERT CLS embeddings', spinner='dots')
+    spinner = Halo(text=f'Extracting BERT CLS embeddings (ETA: {time_estimate})', spinner='dots')
     spinner.start()
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            # Update progress with time estimation
             if batch_idx % 10 == 0:
-                spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
+                elapsed = time.time() - start_time
+                if batch_idx > 0:
+                    rate = (batch_idx * batch_size) / elapsed
+                    remaining_entries = num_entries - (batch_idx * batch_size)
+                    eta_seconds = remaining_entries / rate if rate > 0 else 0
+                    
+                    if eta_seconds < 60:
+                        eta_str = f"{eta_seconds:.0f}s"
+                    elif eta_seconds < 3600:
+                        eta_str = f"{eta_seconds/60:.1f}m"
+                    else:
+                        eta_str = f"{eta_seconds/3600:.1f}h"
+                    
+                    progress_pct = (batch_idx * batch_size) / num_entries * 100
+                    spinner.text = f'Extracting embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
+                else:
+                    spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
             
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -351,11 +481,13 @@ def extract_bert_embeddings(df, device):
             cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
             all_embeddings.append(cls_embeddings)
             
-            # Clear memory periodically
-            if batch_idx % 50 == 0:
+            # Clear memory periodically based on performance config
+            if batch_idx % clear_freq == 0:
                 clear_memory(device)
     
-    spinner.succeed("BERT embedding extraction complete")
+    total_time = time.time() - start_time
+    rate = num_entries / total_time
+    spinner.succeed(f"BERT embedding extraction complete ({total_time:.1f}s, {rate:.1f} entries/sec)")
     
     # Concatenate all embeddings
     all_embeddings = np.vstack(all_embeddings).astype(np.float32)
@@ -367,10 +499,10 @@ def extract_bert_embeddings(df, device):
     return all_embeddings
 
 
-def process_embeddings(df, device, use_global_attack_list=False):
+def process_embeddings(df, device, use_global_attack_list=False, performance_config=None):
     """Process logs and create BERT embeddings with binary label vectors."""
-    # Extract BERT embeddings
-    log_embeddings = extract_bert_embeddings(df, device)
+    # Extract BERT embeddings with performance optimization
+    log_embeddings = extract_bert_embeddings(df, device, performance_config)
     df['log_embedding'] = list(log_embeddings)
     
     # Process labels
@@ -652,6 +784,7 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
 def main():
     parser = argparse.ArgumentParser(description="Generate LogBERT CLS embeddings for log data")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
+    parser.add_argument("--sample-size", type=int, default=None, help="Process only this many log entries (for testing)")
     args = parser.parse_args()
 
     # Ensure output directories exist
@@ -663,26 +796,53 @@ def main():
     # Set multiprocessing start method for compatibility
     mp.set_start_method('spawn', force=True)
     
-    # Find available log types
-    spinner = Halo(text="Finding available log types", spinner='dots')
+    # Find available log types and estimate sizes
+    spinner = Halo(text="Analyzing available log types and estimating sizes", spinner='dots')
     spinner.start()
     available_types = find_available_log_types()
     if not available_types:
         spinner.fail("No log types with data found.")
         return
     
-    spinner.succeed(f"Found {len(available_types)} log types: {', '.join(available_types)}")
+    # Estimate sizes for each log type
+    log_type_info = {}
+    total_estimated = 0
+    for log_type in available_types:
+        estimated_size, category = estimate_dataset_size(log_type_filter=log_type)
+        log_type_info[log_type] = {'size': estimated_size, 'category': category}
+        total_estimated += estimated_size
     
-    # Determine log types to process
+    spinner.succeed(f"Found {len(available_types)} log types (total ~{total_estimated:,} entries)")
+    
+    # Display size analysis
+    print("\n" + "="*60)
+    print("DATASET SIZE ANALYSIS")
+    print("="*60)
+    for log_type in sorted(available_types, key=lambda x: log_type_info[x]['size']):
+        info = log_type_info[log_type]
+        print(f"{log_type:15} | ~{info['size']:,} entries ({info['category']} dataset)")
+    print("="*60)
+    
     if args.log_type:
         if args.log_type not in available_types:
             print(f"Log type '{args.log_type}' not found. Available types: {', '.join(available_types)}")
             return
         types_to_process = [args.log_type]
         run_combined = False
+        print(f"\nProcessing single log type: {args.log_type}")
     else:
-        types_to_process = available_types
+        # Sort by size (smallest first) for efficient processing
+        types_to_process = sorted(available_types, key=lambda x: log_type_info[x]['size'])
         run_combined = True
+        print(f"\nProcessing all log types (starting with smallest for efficiency)")
+    
+    # Estimate total processing time if processing all
+    if run_combined and not args.sample_size:
+        combined_estimate, combined_category = estimate_dataset_size()
+        combined_config = get_performance_config(combined_category, device.type)
+        combined_time = estimate_processing_time(combined_estimate, combined_config['batch_size'], device.type)
+        print(f"Estimated total processing time: {combined_time}")
+        print("Tip: Use --sample-size N to test with smaller dataset first")
 
     # Process individual log types
     for log_type in types_to_process:
@@ -694,11 +854,34 @@ def main():
                 print(f"No data for log type '{log_type}'. Skipping.")
                 continue
 
+            # Sample data if requested
+            original_size = len(df)
+            if args.sample_size and len(df) > args.sample_size:
+                print(f"Sampling {args.sample_size} entries from {len(df)} total entries")
+                df = df.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
+
+            # Get performance configuration based on actual dataset size
+            dataset_size = len(df)
+            if dataset_size < SMALL_DATASET_THRESHOLD:
+                size_category = "small"
+            elif dataset_size < MEDIUM_DATASET_THRESHOLD:
+                size_category = "medium"
+            elif dataset_size < LARGE_DATASET_THRESHOLD:
+                size_category = "large"
+            else:
+                size_category = "very_large"
+            
+            perf_config = get_performance_config(size_category, device.type)
+            time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
+            
+            print(f"Dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
+            print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
+
             # Display data distribution
             display_data_distribution(df, log_type)
 
-            # Process embeddings
-            df = process_embeddings(df, device, use_global_attack_list=False)
+            # Process embeddings with performance optimization
+            df = process_embeddings(df, device, use_global_attack_list=False, performance_config=perf_config)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
@@ -730,8 +913,30 @@ def main():
             if df_all.empty:
                 print("No data found for combined log types")
             else:
+                # Sample data if requested
+                if args.sample_size and len(df_all) > args.sample_size:
+                    print(f"Sampling {args.sample_size} entries from {len(df_all)} total entries")
+                    df_all = df_all.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
+                
+                # Get performance configuration
+                dataset_size = len(df_all)
+                if dataset_size < SMALL_DATASET_THRESHOLD:
+                    size_category = "small"
+                elif dataset_size < MEDIUM_DATASET_THRESHOLD:
+                    size_category = "medium"
+                elif dataset_size < LARGE_DATASET_THRESHOLD:
+                    size_category = "large"
+                else:
+                    size_category = "very_large"
+                
+                perf_config = get_performance_config(size_category, device.type)
+                time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
+                
+                print(f"Combined dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
+                print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
+                
                 display_data_distribution(df_all, "all combined")
-                df_all = process_embeddings(df_all, device, use_global_attack_list=True)
+                df_all = process_embeddings(df_all, device, use_global_attack_list=True, performance_config=perf_config)
                 
                 # Save combined outputs
                 save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
