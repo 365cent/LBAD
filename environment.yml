@@ -1,4 +1,4 @@
-name: base
+name: logbert
 channels:
   - ehmoussi
   - conda-forge
