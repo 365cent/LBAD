@@ -54,6 +54,8 @@ from typing import Dict, List, Tuple, Optional, Any
 from halo import Halo
 import json
 import warnings
+# Memory management for large datasets - auto-detect and use up to 80% of resources
+import psutil
 warnings.filterwarnings('ignore')
 
 # Configuration
@@ -72,12 +74,30 @@ RANDOM_STATE = 42
 TOP_K_LABELS = 5
 N_LABEL_CLUSTERS = 8
 
-# Memory management for large datasets
-MAX_MEMORY_GB = 8.0  # Maximum memory to use for embeddings (GB)
-GRADIENT_ACCUMULATION_STEPS = 4  # Accumulate gradients over multiple batches
-CHUNK_SIZE = 10000  # Process embeddings in chunks of this size
+def get_memory_limits():
+    """Auto-detect system resources and set limits to use up to 80% of available memory."""
+    total_memory_gb = psutil.virtual_memory().total / (1024**3)
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    max_memory_gb = min(total_memory_gb, available_memory_gb) * 0.8
+    
+    # Adjust other parameters based on available memory
+    if max_memory_gb > 16:
+        gradient_accumulation_steps = 2
+        chunk_size = 50000
+        max_samples = 1000000
+    elif max_memory_gb > 8:
+        gradient_accumulation_steps = 4
+        chunk_size = 25000
+        max_samples = 750000
+    else:
+        gradient_accumulation_steps = 8
+        chunk_size = 10000
+        max_samples = 500000
+    
+    return max_memory_gb, gradient_accumulation_steps, chunk_size, max_samples
+
+MAX_MEMORY_GB, GRADIENT_ACCUMULATION_STEPS, CHUNK_SIZE, MAX_SAMPLES_FOR_FULL_TRAINING = get_memory_limits()
 SUBSAMPLE_LARGE_DATASETS = True  # Whether to subsample very large datasets
-MAX_SAMPLES_FOR_FULL_TRAINING = 500000  # Above this, use subsampling
 
 # Set random seeds for reproducibility
 torch.manual_seed(RANDOM_STATE)
