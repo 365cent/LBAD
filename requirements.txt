@@ -9,7 +9,6 @@ google-pasta==0.2.0
 google_auth_oauthlib==1.0.0
 GPUtil==1.4.0
 grpcio==1.67.0
-h5py==3.8.0
 jupyter==1.1.1
 keras==2.14.0
 libclang==14.0.1
