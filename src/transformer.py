@@ -40,6 +40,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for clusters
 import matplotlib.pyplot as plt
 import seaborn as sns
+from halo import Halo
 
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -217,12 +218,14 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
 # =============================================================================
 
 class ProgressTracker:
-    """Track training progress with file outputs"""
+    """Track training progress with file outputs and time estimation"""
     
     def __init__(self, output_dir: Path, log_type: str):
         self.output_dir = output_dir
         self.log_type = log_type
         self.metrics = []
+        self.start_time = None
+        self.epoch_times = []
         
         # Setup logging
         log_file = output_dir / f"training_{log_type}.log"
@@ -235,6 +238,50 @@ class ProgressTracker:
             ]
         )
         self.logger = logging.getLogger(__name__)
+    
+    def start_training(self, total_epochs: int):
+        """Start training timer"""
+        self.start_time = time.time()
+        self.total_epochs = total_epochs
+        self.epoch_times = []
+    
+    def update_epoch_progress(self, epoch: int, epoch_time: float):
+        """Update epoch progress and estimate completion time"""
+        self.epoch_times.append(epoch_time)
+        
+        if len(self.epoch_times) >= 2:
+            avg_epoch_time = np.mean(self.epoch_times[-5:])  # Use last 5 epochs for better estimate
+            remaining_epochs = self.total_epochs - epoch - 1
+            estimated_remaining = avg_epoch_time * remaining_epochs
+            
+            elapsed = time.time() - self.start_time
+            estimated_total = elapsed + estimated_remaining
+            
+            # Format time strings
+            elapsed_str = self._format_time(elapsed)
+            remaining_str = self._format_time(estimated_remaining)
+            total_str = self._format_time(estimated_total)
+            
+            return {
+                'epoch': epoch + 1,
+                'total_epochs': self.total_epochs,
+                'elapsed': elapsed_str,
+                'remaining': remaining_str,
+                'estimated_total': total_str,
+                'avg_epoch_time': f"{avg_epoch_time:.2f}s"
+            }
+        return None
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format time in human readable format"""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            minutes = seconds / 60
+            return f"{minutes:.1f}m"
+        else:
+            hours = seconds / 3600
+            return f"{hours:.1f}h"
     
     def log_step(self, step: str, data: Dict[str, Any]):
         """Log step results to file and console"""
@@ -404,25 +451,49 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         "mixed_precision": scaler is not None
     })
     
-    # Training loop
+    # Training loop with progress tracking
     model.train()
-    for epoch in range(100):  # Reduced epochs for faster iteration
+    total_epochs = 100  # Reduced epochs for faster iteration
+    tracker.start_training(total_epochs)
+    
+    for epoch in range(total_epochs):
+        epoch_start = time.time()
         epoch_losses = []
         
         if config.is_distributed:
             sampler.set_epoch(epoch)
         
-        for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            x_batch = x_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
-            
-            optimizer.zero_grad()
-            
-            if scaler:
-                with autocast():
+        # Progress spinner for batches
+        with Halo(text=f"Epoch {epoch+1}/{total_epochs}", spinner='dots') as spinner:
+            for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+                x_batch = x_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+                
+                optimizer.zero_grad()
+                
+                if scaler:
+                    with autocast():
+                        outputs = model(x_batch)
+                        
+                        # Multi-component loss
+                        recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
+                        label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
+                        
+                        if C is not None:
+                            C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
+                            cluster_targets = torch.matmul(y_batch, C_tensor)
+                            cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
+                        else:
+                            cluster_loss = torch.tensor(0.0, device=device)
+                        
+                        total_loss = recon_loss + 0.5 * label_loss + 0.3 * cluster_loss
+                    
+                    scaler.scale(total_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     outputs = model(x_batch)
                     
-                    # Multi-component loss
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
                     
@@ -434,30 +505,21 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         cluster_loss = torch.tensor(0.0, device=device)
                     
                     total_loss = recon_loss + 0.5 * label_loss + 0.3 * cluster_loss
+                    total_loss.backward()
+                    optimizer.step()
                 
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(x_batch)
+                epoch_losses.append(total_loss.item())
                 
-                recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
-                
-                if C is not None:
-                    C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
-                    cluster_targets = torch.matmul(y_batch, C_tensor)
-                    cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
-                else:
-                    cluster_loss = torch.tensor(0.0, device=device)
-                
-                total_loss = recon_loss + 0.5 * label_loss + 0.3 * cluster_loss
-                total_loss.backward()
-                optimizer.step()
-            
-            epoch_losses.append(total_loss.item())
+                # Update spinner text with batch progress
+                if batch_idx % 10 == 0:  # Update every 10 batches
+                    progress = (batch_idx + 1) / len(dataloader) * 100
+                    spinner.text = f"Epoch {epoch+1}/{total_epochs} - Batch {batch_idx+1}/{len(dataloader)} ({progress:.1f}%)"
         
         scheduler.step()
+        
+        # Calculate epoch time and update progress
+        epoch_time = time.time() - epoch_start
+        progress_info = tracker.update_epoch_progress(epoch, epoch_time)
         
         # Log metrics
         avg_loss = np.mean(epoch_losses)
@@ -467,11 +529,19 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 "recon_loss": recon_loss.item(),
                 "label_loss": label_loss.item(),
                 "cluster_loss": cluster_loss.item(),
-                "lr": scheduler.get_last_lr()[0]
+                "lr": scheduler.get_last_lr()[0],
+                "epoch_time": epoch_time
             })
         
-        if epoch % 10 == 0 and config.rank == 0:
-            print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
+        # Print progress with time estimation
+        if config.rank == 0 and progress_info:
+            print(f"Epoch {progress_info['epoch']}/{progress_info['total_epochs']} - "
+                  f"Loss: {avg_loss:.6f} - "
+                  f"Elapsed: {progress_info['elapsed']} - "
+                  f"Remaining: {progress_info['remaining']} - "
+                  f"ETA: {progress_info['estimated_total']}")
+        elif config.rank == 0:
+            print(f"Epoch {epoch+1}/{total_epochs} - Loss: {avg_loss:.6f} - Time: {epoch_time:.2f}s")
     
     return model, None  # Return None for scaler placeholder
 
@@ -594,28 +664,36 @@ def process_log_type(log_type: str, config: SystemConfig):
     tracker = ProgressTracker(output_dir, log_type)
     
     try:
-        # Load data
-        embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
+        # Load data with progress
+        with Halo(text=f"Loading data for {log_type}...", spinner='dots') as spinner:
+            embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
+            spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
         
         # Train model
         tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
-        model, _ = train_model(embeddings, classes, C, config, tracker)
+        with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
+            model, _ = train_model(embeddings, classes, C, config, tracker)
+            spinner.succeed(f"Training completed for {log_type}")
         
         # Evaluate and save
-        results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type)
+        with Halo(text=f"Evaluating model for {log_type}...", spinner='dots') as spinner:
+            results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type)
+            spinner.succeed(f"Evaluation completed for {log_type}")
         
         # Save model
         if config.rank == 0:
-            model_path = Path("models") / f"transformer_{log_type}.pth"
-            model_path.parent.mkdir(exist_ok=True)
-            
-            model_to_save = model.module if hasattr(model, 'module') else model
-            torch.save({
-                'model_state_dict': model_to_save.state_dict(),
-                'config': config.__dict__,
-                'classes': classes,
-                'results': results
-            }, model_path)
+            with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
+                model_path = Path("models") / f"transformer_{log_type}.pth"
+                model_path.parent.mkdir(exist_ok=True)
+                
+                model_to_save = model.module if hasattr(model, 'module') else model
+                torch.save({
+                    'model_state_dict': model_to_save.state_dict(),
+                    'config': config.__dict__,
+                    'classes': classes,
+                    'results': results
+                }, model_path)
+                spinner.succeed(f"Model saved to {model_path}")
         
         tracker.log_step("Completion", {"status": "success", "results": results})
         
@@ -652,10 +730,11 @@ def main():
             print(f"Available types: {available_types}")
         
         # Process each log type
-        for log_type in available_types:
+        total_types = len(available_types)
+        for idx, log_type in enumerate(available_types, 1):
             if config.rank == 0:
                 print(f"\n{'='*60}")
-                print(f"Processing: {log_type}")
+                print(f"Processing: {log_type} ({idx}/{total_types})")
                 print(f"{'='*60}")
             
             start_time = time.time()
@@ -663,7 +742,16 @@ def main():
             
             if config.rank == 0:
                 elapsed = time.time() - start_time
-                print(f"Completed {log_type} in {elapsed:.2f} seconds")
+                remaining_types = total_types - idx
+                if remaining_types > 0:
+                    avg_time = elapsed / idx
+                    estimated_remaining = avg_time * remaining_types
+                    print(f"Completed {log_type} in {elapsed:.2f} seconds")
+                    print(f"Progress: {idx}/{total_types} ({idx/total_types*100:.1f}%)")
+                    print(f"Estimated time remaining: {estimated_remaining:.2f} seconds")
+                else:
+                    print(f"Completed {log_type} in {elapsed:.2f} seconds")
+                    print(f"All processing completed!")
         
         if config.rank == 0:
             print(f"\n{'='*60}")
