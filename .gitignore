@@ -74,9 +74,9 @@ Thumbs.db
 
 # Project specific files and directories
 # Data and model outputs (temporary)
-# processed/
-# embedding/
-# embeddings/
+processed/
+embedding/
+embeddings/
 models/
 results/
 output/
