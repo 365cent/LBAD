@@ -73,10 +73,10 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific files and directories
-# Data and model outputs
-processed/
-embedding/
-embeddings/
+# Data and model outputs (temporary)
+# processed/
+# embedding/
+# embeddings/
 models/
 results/
 output/
