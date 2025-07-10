@@ -582,15 +582,28 @@ def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer,
     
     tracker.log_step("Evaluation Results", results)
     
-    # Save detailed results
+    # Generate comprehensive classification summary
+    classification_summary = generate_classification_summary(predictions, binary_predictions, classes, log_type)
+    
+    # Print classification summary
+    if config.rank == 0:
+        print_classification_summary(classification_summary)
+    
+    # Save detailed results with classification summary
     save_path = output_dir / f"results_{log_type}.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump({
             'predictions': predictions,
             'binary_predictions': binary_predictions,
             'classes': classes,
-            'results': results
+            'results': results,
+            'classification_summary': classification_summary
         }, f)
+    
+    # Save classification summary as separate JSON file for easy access
+    summary_path = output_dir / f"classification_summary_{log_type}.json"
+    with open(summary_path, 'w') as f:
+        json.dump(classification_summary, f, indent=2)
     
     # Create visualization if reasonable size
     if len(embeddings) <= 5000:
@@ -640,6 +653,195 @@ def create_visualization(embeddings: np.ndarray, predictions: np.ndarray,
         print(f"Visualization failed: {e}")
 
 # =============================================================================
+# Model Management and Classification Summary
+# =============================================================================
+
+def check_model_exists(log_type: str) -> bool:
+    """Check if a trained model already exists for the given log type"""
+    model_path = Path("models") / f"transformer_{log_type}.pth"
+    return model_path.exists()
+
+def load_existing_model(log_type: str, config: SystemConfig) -> Tuple[UnsupervisedMultiLabelTransformer, List[str], Dict]:
+    """Load an existing trained model"""
+    model_path = Path("models") / f"transformer_{log_type}.pth"
+    
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location=config.device)
+    
+    # Extract model parameters
+    classes = checkpoint.get('classes', [])
+    results = checkpoint.get('results', {})
+    
+    # Reconstruct model architecture
+    input_dim = checkpoint.get('input_dim', 768)  # Default embedding dimension
+    latent_dim = min(512, input_dim)
+    n_labels = len(classes) if classes else 1
+    n_clusters = checkpoint.get('n_clusters', 1)
+    
+    model = UnsupervisedMultiLabelTransformer(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        n_labels=n_labels,
+        n_clusters=n_clusters
+    ).to(config.device)
+    
+    # Load state dict
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    return model, classes, results
+
+def generate_classification_summary(predictions: np.ndarray, binary_predictions: np.ndarray, 
+                                  classes: List[str], log_type: str) -> Dict:
+    """Generate comprehensive classification summary for each class"""
+    
+    summary = {
+        "log_type": log_type,
+        "total_samples": len(predictions),
+        "total_classes": len(classes),
+        "classification_threshold": 0.5,
+        "class_summaries": {},
+        "overall_metrics": {}
+    }
+    
+    # Overall metrics
+    labels_per_sample = binary_predictions.sum(axis=1)
+    summary["overall_metrics"] = {
+        "avg_labels_per_sample": float(labels_per_sample.mean()),
+        "std_labels_per_sample": float(labels_per_sample.std()),
+        "min_labels_per_sample": int(labels_per_sample.min()),
+        "max_labels_per_sample": int(labels_per_sample.max()),
+        "samples_with_no_labels": int((labels_per_sample == 0).sum()),
+        "samples_with_single_label": int((labels_per_sample == 1).sum()),
+        "samples_with_multiple_labels": int((labels_per_sample > 1).sum())
+    }
+    
+    # Per-class analysis
+    for i, class_name in enumerate(classes):
+        class_predictions = predictions[:, i]
+        class_binary = binary_predictions[:, i]
+        
+        # Basic statistics
+        positive_samples = int(class_binary.sum())
+        negative_samples = len(class_binary) - positive_samples
+        positive_rate = positive_samples / len(class_binary)
+        
+        # Confidence statistics
+        positive_confidences = class_predictions[class_binary == 1]
+        negative_confidences = class_predictions[class_binary == 0]
+        
+        class_summary = {
+            "class_name": class_name,
+            "positive_samples": positive_samples,
+            "negative_samples": negative_samples,
+            "positive_rate": float(positive_rate),
+            "total_samples": len(class_binary),
+            "confidence_stats": {
+                "mean_confidence": float(class_predictions.mean()),
+                "std_confidence": float(class_predictions.std()),
+                "min_confidence": float(class_predictions.min()),
+                "max_confidence": float(class_predictions.max()),
+                "median_confidence": float(np.median(class_predictions))
+            },
+            "positive_confidence_stats": {
+                "mean": float(positive_confidences.mean()) if len(positive_confidences) > 0 else 0.0,
+                "std": float(positive_confidences.std()) if len(positive_confidences) > 0 else 0.0,
+                "min": float(positive_confidences.min()) if len(positive_confidences) > 0 else 0.0,
+                "max": float(positive_confidences.max()) if len(positive_confidences) > 0 else 0.0
+            },
+            "negative_confidence_stats": {
+                "mean": float(negative_confidences.mean()) if len(negative_confidences) > 0 else 0.0,
+                "std": float(negative_confidences.std()) if len(negative_confidences) > 0 else 0.0,
+                "min": float(negative_confidences.min()) if len(negative_confidences) > 0 else 0.0,
+                "max": float(negative_confidences.max()) if len(negative_confidences) > 0 else 0.0
+            }
+        }
+        
+        # Confidence distribution bins
+        confidence_bins = np.linspace(0, 1, 11)  # 0.0, 0.1, 0.2, ..., 1.0
+        bin_counts, _ = np.histogram(class_predictions, bins=confidence_bins)
+        class_summary["confidence_distribution"] = {
+            "bins": confidence_bins.tolist(),
+            "counts": bin_counts.tolist()
+        }
+        
+        summary["class_summaries"][class_name] = class_summary
+    
+    # Top classes by positive rate
+    class_positive_rates = [(class_name, summary["class_summaries"][class_name]["positive_rate"]) 
+                           for class_name in classes]
+    class_positive_rates.sort(key=lambda x: x[1], reverse=True)
+    
+    summary["top_classes_by_positive_rate"] = [
+        {"class_name": class_name, "positive_rate": rate} 
+        for class_name, rate in class_positive_rates[:10]
+    ]
+    
+    # Classes with highest confidence
+    class_avg_confidences = [(class_name, summary["class_summaries"][class_name]["confidence_stats"]["mean_confidence"]) 
+                             for class_name in classes]
+    class_avg_confidences.sort(key=lambda x: x[1], reverse=True)
+    
+    summary["top_classes_by_confidence"] = [
+        {"class_name": class_name, "avg_confidence": conf} 
+        for class_name, conf in class_avg_confidences[:10]
+    ]
+    
+    return summary
+
+def print_classification_summary(summary: Dict):
+    """Print a formatted classification summary"""
+    print(f"\n{'='*80}")
+    print(f"CLASSIFICATION SUMMARY FOR: {summary['log_type'].upper()}")
+    print(f"{'='*80}")
+    
+    # Overall statistics
+    overall = summary["overall_metrics"]
+    print(f"\nOVERALL STATISTICS:")
+    print(f"  Total Samples: {summary['total_samples']:,}")
+    print(f"  Total Classes: {summary['total_classes']}")
+    print(f"  Average Labels per Sample: {overall['avg_labels_per_sample']:.3f} ± {overall['std_labels_per_sample']:.3f}")
+    print(f"  Labels per Sample Range: {overall['min_labels_per_sample']} - {overall['max_labels_per_sample']}")
+    print(f"  Samples with No Labels: {overall['samples_with_no_labels']:,} ({overall['samples_with_no_labels']/summary['total_samples']*100:.1f}%)")
+    print(f"  Samples with Single Label: {overall['samples_with_single_label']:,} ({overall['samples_with_single_label']/summary['total_samples']*100:.1f}%)")
+    print(f"  Samples with Multiple Labels: {overall['samples_with_multiple_labels']:,} ({overall['samples_with_multiple_labels']/summary['total_samples']*100:.1f}%)")
+    
+    # Top classes by positive rate
+    print(f"\nTOP 10 CLASSES BY POSITIVE RATE:")
+    print(f"{'Rank':<4} {'Class Name':<40} {'Positive Rate':<15} {'Positive Samples':<15}")
+    print(f"{'-'*80}")
+    for i, item in enumerate(summary["top_classes_by_positive_rate"][:10], 1):
+        class_name = item["class_name"]
+        rate = item["positive_rate"]
+        positive_samples = summary["class_summaries"][class_name]["positive_samples"]
+        print(f"{i:<4} {class_name:<40} {rate:<15.3f} {positive_samples:<15,}")
+    
+    # Top classes by confidence
+    print(f"\nTOP 10 CLASSES BY AVERAGE CONFIDENCE:")
+    print(f"{'Rank':<4} {'Class Name':<40} {'Avg Confidence':<15} {'Std Confidence':<15}")
+    print(f"{'-'*80}")
+    for i, item in enumerate(summary["top_classes_by_confidence"][:10], 1):
+        class_name = item["class_name"]
+        avg_conf = item["avg_confidence"]
+        std_conf = summary["class_summaries"][class_name]["confidence_stats"]["std_confidence"]
+        print(f"{i:<4} {class_name:<40} {avg_conf:<15.3f} {std_conf:<15.3f}")
+    
+    # Classes with zero positive samples
+    zero_positive = [class_name for class_name, data in summary["class_summaries"].items() 
+                     if data["positive_samples"] == 0]
+    if zero_positive:
+        print(f"\nCLASSES WITH ZERO POSITIVE SAMPLES ({len(zero_positive)}):")
+        for class_name in zero_positive[:20]:  # Show first 20
+            print(f"  - {class_name}")
+        if len(zero_positive) > 20:
+            print(f"  ... and {len(zero_positive) - 20} more")
+    
+    print(f"\n{'='*80}")
+
+# =============================================================================
 # Main Execution
 # =============================================================================
 
@@ -664,44 +866,158 @@ def process_log_type(log_type: str, config: SystemConfig):
     tracker = ProgressTracker(output_dir, log_type)
     
     try:
-        # Load data with progress
-        with Halo(text=f"Loading data for {log_type}...", spinner='dots') as spinner:
-            embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
-            spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
+        # Check if model already exists
+        model_exists = check_model_exists(log_type)
         
-        # Train model
-        tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
-        with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
-            model, _ = train_model(embeddings, classes, C, config, tracker)
-            spinner.succeed(f"Training completed for {log_type}")
+        if model_exists and config.rank == 0:
+            print(f"Model already exists for {log_type}, loading existing model...")
         
-        # Evaluate and save
-        with Halo(text=f"Evaluating model for {log_type}...", spinner='dots') as spinner:
-            results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type)
-            spinner.succeed(f"Evaluation completed for {log_type}")
-        
-        # Save model
-        if config.rank == 0:
-            with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
-                model_path = Path("models") / f"transformer_{log_type}.pth"
-                model_path.parent.mkdir(exist_ok=True)
-                
-                model_to_save = model.module if hasattr(model, 'module') else model
-                torch.save({
-                    'model_state_dict': model_to_save.state_dict(),
-                    'config': config.__dict__,
-                    'classes': classes,
-                    'results': results
-                }, model_path)
-                spinner.succeed(f"Model saved to {model_path}")
-        
-        tracker.log_step("Completion", {"status": "success", "results": results})
+        if model_exists:
+            # Load existing model
+            with Halo(text=f"Loading existing model for {log_type}...", spinner='dots') as spinner:
+                model, classes, existing_results = load_existing_model(log_type, config)
+                spinner.succeed(f"Model loaded for {log_type}")
+            
+            # Load data for evaluation
+            with Halo(text=f"Loading data for evaluation of {log_type}...", spinner='dots') as spinner:
+                embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
+                spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
+            
+            # Evaluate existing model
+            with Halo(text=f"Evaluating existing model for {log_type}...", spinner='dots') as spinner:
+                results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type)
+                spinner.succeed(f"Evaluation completed for {log_type}")
+            
+            tracker.log_step("Completion", {"status": "success", "model_loaded": True, "results": results})
+            
+        else:
+            # Load data with progress
+            with Halo(text=f"Loading data for {log_type}...", spinner='dots') as spinner:
+                embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
+                spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
+            
+            # Train model
+            tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
+            with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
+                model, _ = train_model(embeddings, classes, C, config, tracker)
+                spinner.succeed(f"Training completed for {log_type}")
+            
+            # Evaluate and save
+            with Halo(text=f"Evaluating model for {log_type}...", spinner='dots') as spinner:
+                results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type)
+                spinner.succeed(f"Evaluation completed for {log_type}")
+            
+            # Save model
+            if config.rank == 0:
+                with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
+                    model_path = Path("models") / f"transformer_{log_type}.pth"
+                    model_path.parent.mkdir(exist_ok=True)
+                    
+                    model_to_save = model.module if hasattr(model, 'module') else model
+                    torch.save({
+                        'model_state_dict': model_to_save.state_dict(),
+                        'config': config.__dict__,
+                        'classes': classes,
+                        'results': results,
+                        'input_dim': embeddings.shape[1],
+                        'n_clusters': C.shape[1] if C is not None else 1
+                    }, model_path)
+                    spinner.succeed(f"Model saved to {model_path}")
+            
+            tracker.log_step("Completion", {"status": "success", "model_trained": True, "results": results})
         
     except Exception as e:
         tracker.logger.error(f"Error processing {log_type}: {e}")
         import traceback
         tracker.logger.error(traceback.format_exc())
         raise
+
+def generate_comprehensive_summary():
+    """Generate a comprehensive summary report for all processed log types"""
+    results_dir = Path("results")
+    if not results_dir.exists():
+        print("No results directory found.")
+        return
+    
+    summary_report = {
+        "generated_at": datetime.now().isoformat(),
+        "total_log_types": 0,
+        "log_types": {},
+        "overall_statistics": {}
+    }
+    
+    # Find all classification summary files
+    summary_files = list(results_dir.rglob("classification_summary_*.json"))
+    
+    if not summary_files:
+        print("No classification summary files found.")
+        return
+    
+    print(f"\n{'='*80}")
+    print("COMPREHENSIVE CLASSIFICATION SUMMARY REPORT")
+    print(f"{'='*80}")
+    print(f"Found {len(summary_files)} log type(s) with results")
+    
+    total_samples = 0
+    total_classes = 0
+    all_positive_rates = []
+    all_avg_confidences = []
+    
+    for summary_file in summary_files:
+        try:
+            with open(summary_file, 'r') as f:
+                summary = json.load(f)
+            
+            log_type = summary['log_type']
+            summary_report["log_types"][log_type] = summary
+            
+            # Aggregate statistics
+            total_samples += summary['total_samples']
+            total_classes += summary['total_classes']
+            
+            # Collect positive rates and confidences for overall analysis
+            for class_name, class_data in summary['class_summaries'].items():
+                all_positive_rates.append(class_data['positive_rate'])
+                all_avg_confidences.append(class_data['confidence_stats']['mean_confidence'])
+            
+            print(f"\n{log_type.upper()}:")
+            print(f"  Samples: {summary['total_samples']:,}")
+            print(f"  Classes: {summary['total_classes']}")
+            print(f"  Avg Labels per Sample: {summary['overall_metrics']['avg_labels_per_sample']:.3f}")
+            
+            # Show top 3 classes by positive rate
+            top_classes = summary['top_classes_by_positive_rate'][:3]
+            print(f"  Top Classes: {', '.join([c['class_name'] for c in top_classes])}")
+            
+        except Exception as e:
+            print(f"Error reading {summary_file}: {e}")
+    
+    # Overall statistics
+    summary_report["overall_statistics"] = {
+        "total_samples": total_samples,
+        "total_classes": total_classes,
+        "avg_positive_rate": np.mean(all_positive_rates) if all_positive_rates else 0.0,
+        "avg_confidence": np.mean(all_avg_confidences) if all_avg_confidences else 0.0,
+        "std_positive_rate": np.std(all_positive_rates) if all_positive_rates else 0.0,
+        "std_confidence": np.std(all_avg_confidences) if all_avg_confidences else 0.0
+    }
+    
+    summary_report["total_log_types"] = len(summary_report["log_types"])
+    
+    # Save comprehensive report
+    report_path = results_dir / "comprehensive_summary_report.json"
+    with open(report_path, 'w') as f:
+        json.dump(summary_report, f, indent=2)
+    
+    print(f"\n{'='*80}")
+    print("OVERALL STATISTICS:")
+    print(f"  Total Log Types: {summary_report['total_log_types']}")
+    print(f"  Total Samples: {total_samples:,}")
+    print(f"  Total Classes: {total_classes}")
+    print(f"  Average Positive Rate: {summary_report['overall_statistics']['avg_positive_rate']:.3f} ± {summary_report['overall_statistics']['std_positive_rate']:.3f}")
+    print(f"  Average Confidence: {summary_report['overall_statistics']['avg_confidence']:.3f} ± {summary_report['overall_statistics']['std_confidence']:.3f}")
+    print(f"\nComprehensive report saved to: {report_path}")
+    print(f"{'='*80}")
 
 def main():
     """Main execution with distributed support"""
@@ -759,6 +1075,9 @@ def main():
             print(f"Results saved to: results/")
             print(f"Models saved to: models/")
             print(f"{'='*60}")
+            
+            # Generate comprehensive summary
+            generate_comprehensive_summary()
     
     except Exception as e:
         print(f"Fatal error: {e}")
