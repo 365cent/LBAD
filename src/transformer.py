@@ -181,8 +181,8 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             nn.Linear(latent_dim, latent_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(latent_dim // 2, n_labels),
-            nn.Sigmoid()
+            nn.Linear(latent_dim // 2, n_labels)
+            # No Sigmoid - using logits for mixed precision safety
         )
         
         # Cluster matcher
@@ -424,7 +424,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     # Multi-component loss
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                    label_loss = F.binary_cross_entropy(outputs['labels'], y_batch)
+                    label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
                     
                     if C is not None:
                         C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -442,7 +442,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 outputs = model(x_batch)
                 
                 recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                label_loss = F.binary_cross_entropy(outputs['labels'], y_batch)
+                label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
                 
                 if C is not None:
                     C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -492,7 +492,10 @@ def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer,
         for i in range(0, len(embeddings), batch_size):
             batch = torch.from_numpy(embeddings[i:i+batch_size]).to(device)
             outputs = model(batch)
-            predictions.append(outputs['labels'].cpu().numpy())
+            # Convert logits to probabilities for evaluation
+            logits = outputs['labels']
+            probs = torch.sigmoid(logits)
+            predictions.append(probs.cpu().numpy())
     
     predictions = np.vstack(predictions)
     
