@@ -190,35 +190,59 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.n_labels = n_labels
         
-        # Encoder
+        # More complex encoder with residual connections
         self.input_proj = nn.Linear(input_dim, latent_dim)
+        self.input_norm = nn.LayerNorm(latent_dim)
+        
+        # Deeper encoder with 6 transformer blocks
         self.encoder_blocks = nn.ModuleList([
-            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(3)
+            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(6)
         ])
         
-        # Decoder
+        # Additional feed-forward network after encoder
+        self.encoder_ffn = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+        
+        # Deeper decoder with 4 blocks
         self.decoder_blocks = nn.ModuleList([
-            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(2)
+            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(4)
         ])
         self.output_proj = nn.Linear(latent_dim, input_dim)
         
-        # Multi-label head
+        # More complex multi-label head with attention mechanism
+        self.label_attention = nn.MultiheadAttention(latent_dim, 4, dropout=dropout, batch_first=True)
         self.label_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(latent_dim, latent_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim // 2, n_labels)
-            # No Sigmoid - using logits for mixed precision safety
         )
         
-        # Cluster matcher
-        self.cluster_head = nn.Linear(latent_dim, n_clusters)
-        
-        # Contrastive projection head for better representation learning
-        self.contrastive_head = nn.Sequential(
+        # Enhanced cluster head
+        self.cluster_head = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
             nn.GELU(),
-            nn.Linear(latent_dim // 2, 128)  # Project to 128-dim for contrastive learning
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim // 2, n_clusters)
+        )
+        
+        # Enhanced contrastive projection head
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.BatchNorm1d(latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.BatchNorm1d(latent_dim // 2),
+            nn.GELU(),
+            nn.Linear(latent_dim // 2, 256)  # Larger projection dimension
         )
         
         # Initialize weights for stable training
@@ -227,19 +251,32 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for stable training"""
         if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
+            # Use smaller initialization for stability
+            nn.init.xavier_uniform_(module.weight, gain=0.5)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.MultiheadAttention):
+            nn.init.xavier_uniform_(module.in_proj_weight, gain=0.5)
         
     def forward(self, x):
-        # Encode
-        z = self.input_proj(x).unsqueeze(1)  # Add sequence dimension
-        for block in self.encoder_blocks:
+        # Encode with residual connections
+        z = self.input_proj(x)
+        z = self.input_norm(z)
+        z = z.unsqueeze(1)  # Add sequence dimension
+        
+        # Encoder with residual connections
+        for i, block in enumerate(self.encoder_blocks):
+            z_residual = z
             z = block(z)
+            if i % 2 == 1:  # Add residual every 2 blocks
+                z = z + z_residual
+        
+        # Apply FFN with residual
         z_flat = z.squeeze(1)
+        z_flat = z_flat + self.encoder_ffn(z_flat)
         
         # Decode
         z_dec = z
@@ -247,8 +284,13 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             z_dec = block(z_dec)
         x_recon = self.output_proj(z_dec.squeeze(1))
         
-        # Predictions
-        labels = self.label_head(z_flat)
+        # Label prediction with self-attention
+        z_attn = z_flat.unsqueeze(1)
+        z_attn, _ = self.label_attention(z_attn, z_attn, z_attn)
+        z_attn = z_attn.squeeze(1)
+        labels = self.label_head(z_attn + z_flat)  # Residual connection
+        
+        # Cluster prediction
         clusters = self.cluster_head(z_flat)
         
         # Contrastive projection
@@ -548,7 +590,12 @@ def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 
         pseudo_labels[i][~mask] *= 0.1  # Reduce but don't zero out
         
     # 5. Normalize to probability distribution
-    pseudo_labels = pseudo_labels / (pseudo_labels.sum(axis=1, keepdims=True) + 1e-8)
+    row_sums = pseudo_labels.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-8)  # Avoid division by zero
+    pseudo_labels = pseudo_labels / row_sums
+    
+    # Ensure no NaN values
+    pseudo_labels = np.nan_to_num(pseudo_labels, nan=0.0, posinf=1.0, neginf=0.0)
     
     # 6. Add confidence based on local density
     # Samples in dense regions get higher confidence
@@ -603,7 +650,7 @@ def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torc
     
     return pos_loss + neg_loss
 
-def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
+def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
     """
     Compute simplified contrastive loss for self-supervised learning
     
@@ -685,9 +732,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     )
     
     # Training setup with improved hyperparameters
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)  # Lower learning rate
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)  # Much lower learning rate for stability
     scaler = GradScaler() if config.device == "cuda" else None
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)  # Better schedule
+    
+    # Gradient clipping for stability
+    max_grad_norm = 1.0
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
@@ -777,20 +827,30 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                             cluster_loss = torch.tensor(0.0, device=device)
                         
                         # Contrastive loss - create augmented batch
-                        # Simple augmentation: add small noise
                         x_augmented = x_batch + torch.randn_like(x_batch) * 0.1
                         outputs_aug = model(x_augmented)
                         
                         # Compute contrastive loss between original and augmented
-                        contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'], temperature=0.1)
+                        contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'])
                         
                         # Mutual learning loss
                         mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
                         
-                        # Weighted combination of losses
-                        total_loss = recon_loss + 0.3 * label_loss + 0.2 * cluster_loss + 0.5 * contrast_loss + 0.1 * mutual_loss
+                        # Weighted combination of losses with smaller weights
+                        total_loss = 0.1 * recon_loss + 0.3 * label_loss + 0.1 * cluster_loss + 0.2 * contrast_loss + 0.1 * mutual_loss
+                        
+                        # Check for nan/inf
+                        if torch.isnan(total_loss) or torch.isinf(total_loss):
+                            print(f"Warning: NaN/Inf detected in loss. Skipping batch.")
+                            optimizer.zero_grad()
+                            continue
                     
                     scaler.scale(total_loss).backward()
+                    
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -812,14 +872,25 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     outputs_aug = model(x_augmented)
                     
                     # Compute contrastive loss between original and augmented
-                    contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'], temperature=0.1)
+                    contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'])
                     
                     # Mutual learning loss
                     mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
                     
-                    # Weighted combination of losses
-                    total_loss = recon_loss + 0.3 * label_loss + 0.2 * cluster_loss + 0.5 * contrast_loss + 0.1 * mutual_loss
+                    # Weighted combination of losses with smaller weights
+                    total_loss = 0.1 * recon_loss + 0.3 * label_loss + 0.1 * cluster_loss + 0.2 * contrast_loss + 0.1 * mutual_loss
+                    
+                    # Check for nan/inf
+                    if torch.isnan(total_loss) or torch.isinf(total_loss):
+                        print(f"Warning: NaN/Inf detected in loss. Skipping batch.")
+                        optimizer.zero_grad()
+                        continue
+                    
                     total_loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
                     optimizer.step()
                 
                 epoch_losses.append(total_loss.item())
