@@ -327,7 +327,8 @@ class TwoStagePredictor:
             'log_type_counts': {},
             'all_predictions': [],
             'all_probabilities': [],
-            'all_classes': []
+            'all_classes': [],
+            'log_type_indices': []  # Track which log type each prediction belongs to
         }
         
         # Group embeddings by predicted log type
@@ -341,6 +342,7 @@ class TwoStagePredictor:
             # Get embeddings for this log type
             mask = log_types == log_type
             log_type_embeddings = embeddings[mask]
+            log_type_indices = np.where(mask)[0]  # Original indices
             
             if len(log_type_embeddings) == 0:
                 continue
@@ -379,15 +381,18 @@ class TwoStagePredictor:
             results['probabilities'][log_type] = predictions
             results['log_type_counts'][log_type] = len(log_type_embeddings)
             
-            # Add to combined results
-            results['all_predictions'].extend(binary_predictions)
-            results['all_probabilities'].extend(predictions)
-            results['all_classes'].extend([classes] * len(binary_predictions))
-        
-        # Convert to arrays
-        if results['all_predictions']:
-            results['all_predictions'] = np.array(results['all_predictions'])
-            results['all_probabilities'] = np.array(results['all_probabilities'])
+            # Store per-log-type results with indices
+            for i, orig_idx in enumerate(log_type_indices):
+                results['all_predictions'].append({
+                    'index': orig_idx,
+                    'log_type': log_type,
+                    'predictions': binary_predictions[i],
+                    'probabilities': predictions[i],
+                    'classes': classes
+                })
+                results['all_probabilities'].append(predictions[i])
+                results['all_classes'].append(classes)
+                results['log_type_indices'].append(orig_idx)
         
         return results
     
@@ -399,15 +404,40 @@ class TwoStagePredictor:
         print("Stage 2: Predicting labels...")
         label_results = self.predict_labels(embeddings, log_types)
         
+        # Create unified results format
+        n_samples = len(embeddings)
+        
+        # Initialize unified arrays
+        unified_predictions = []
+        unified_probabilities = []
+        unified_classes = []
+        
+        # Sort results by original index to maintain order
+        sorted_results = sorted(label_results['all_predictions'], key=lambda x: x['index'])
+        
+        for result in sorted_results:
+            unified_predictions.append(result['predictions'])
+            unified_probabilities.append(result['probabilities'])
+            unified_classes.append(result['classes'])
+        
+        # Convert to arrays if all have same shape
+        try:
+            unified_predictions = np.array(unified_predictions)
+            unified_probabilities = np.array(unified_probabilities)
+        except ValueError:
+            # If shapes are different, keep as list
+            print("Warning: Different log types have different numbers of classes. Keeping predictions as separate structures.")
+        
         # Combine results
         results = {
             'log_types': log_types,
             'log_type_probabilities': log_type_probs,
-            'label_predictions': label_results['all_predictions'],
-            'label_probabilities': label_results['all_probabilities'],
-            'label_classes': label_results['all_classes'],
+            'label_predictions': unified_predictions,
+            'label_probabilities': unified_probabilities,
+            'label_classes': unified_classes,
             'log_type_counts': label_results['log_type_counts'],
-            'per_log_type_results': label_results['predictions']
+            'per_log_type_results': label_results['predictions'],
+            'detailed_results': label_results['all_predictions']
         }
         
         return results
@@ -484,13 +514,11 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
     
     # Save labels in evaluation format
     if len(results['label_predictions']) > 0:
-        # Get the most common classes (assuming all models have similar class structure)
-        all_classes = results['label_classes']
-        if all_classes:
-            # Use classes from the first model as reference
-            reference_classes = all_classes[0]
+        # Check if we have unified predictions or separate structures
+        if isinstance(results['label_predictions'], np.ndarray):
+            # All predictions have same shape - create unified output
+            reference_classes = results['label_classes'][0] if results['label_classes'] else []
             
-            # Create label data in evaluation format
             label_data = {
                 'vectors': results['label_predictions'].astype(np.int8),
                 'classes': reference_classes,
@@ -501,7 +529,8 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
                     'model_type': 'two_stage_transformer',
                     'threshold': 0.5,
                     'prediction_time_seconds': prediction_time,
-                    'n_samples': len(embeddings)
+                    'n_samples': len(embeddings),
+                    'unified_format': True
                 }
             }
             
@@ -509,7 +538,45 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
             with open(label_file, 'wb') as f:
                 pickle.dump(label_data, f)
             
-            print(f"Labels saved to: {label_file}")
+            print(f"Unified labels saved to: {label_file}")
+            
+        else:
+            # Different log types have different class structures - save per-log-type
+            print("Saving predictions per log type due to different class structures...")
+            
+            for log_type in results['log_type_counts'].keys():
+                if log_type in results['per_log_type_results']:
+                    predictions = results['per_log_type_results'][log_type]
+                    probabilities = results['probabilities'][log_type]
+                    
+                    # Get classes for this log type
+                    log_type_classes = None
+                    for result in results['detailed_results']:
+                        if result['log_type'] == log_type:
+                            log_type_classes = result['classes']
+                            break
+                    
+                    if log_type_classes:
+                        label_data = {
+                            'vectors': predictions.astype(np.int8),
+                            'classes': log_type_classes,
+                            'probabilities': probabilities.astype(np.float32),
+                            'log_type': log_type,
+                            'metadata': {
+                                'timestamp': datetime.now().isoformat(),
+                                'model_type': 'two_stage_transformer',
+                                'threshold': 0.5,
+                                'prediction_time_seconds': prediction_time,
+                                'n_samples': len(predictions),
+                                'unified_format': False
+                            }
+                        }
+                        
+                        label_file = output_dir / f"label_predictions_{log_type}_{timestamp}.pkl"
+                        with open(label_file, 'wb') as f:
+                            pickle.dump(label_data, f)
+                        
+                        print(f"Labels for {log_type} saved to: {label_file}")
     
     # Print summary
     print(f"\n{'='*60}")
@@ -526,10 +593,20 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
         print(f"  {log_type}: {count} samples ({percentage:.1f}%)")
     
     if len(results['label_predictions']) > 0:
-        avg_labels = np.mean(results['label_predictions'].sum(axis=1))
-        print(f"\nLabel prediction summary:")
-        print(f"  Average labels per sample: {avg_labels:.2f}")
-        print(f"  Total label predictions: {len(results['label_predictions'])}")
+        if isinstance(results['label_predictions'], np.ndarray):
+            # Unified format
+            avg_labels = np.mean(results['label_predictions'].sum(axis=1))
+            print(f"\nLabel prediction summary (unified):")
+            print(f"  Average labels per sample: {avg_labels:.2f}")
+            print(f"  Total label predictions: {len(results['label_predictions'])}")
+        else:
+            # Per-log-type format
+            print(f"\nLabel prediction summary (per log type):")
+            for log_type, count in results['log_type_counts'].items():
+                if log_type in results['per_log_type_results']:
+                    predictions = results['per_log_type_results'][log_type]
+                    avg_labels = np.mean(predictions.sum(axis=1))
+                    print(f"  {log_type}: {count} samples, {avg_labels:.2f} avg labels")
     
     print(f"\nResults saved to: {results_file}")
     print(f"{'='*60}")
