@@ -203,15 +203,19 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             OptimizedTransformerBlock(latent_dim, 16, dropout) for _ in range(12)  # 16 heads, 12 layers
         ])
         
-        # Multi-scale feature extraction
-        self.multi_scale_conv = nn.ModuleList([
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=k, padding=k//2) 
-            for k in [3, 5, 7, 9]
+        # Multi-scale feature extraction using different linear transformations
+        self.multi_scale_transforms = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(4)  # 4 different transformations
         ])
         
         # Feature fusion network
         self.feature_fusion = nn.Sequential(
-            nn.Linear(latent_dim * 5, latent_dim * 2),  # 4 conv + 1 original
+            nn.Linear(latent_dim * 5, latent_dim * 2),  # 4 transforms + 1 original
             nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -308,16 +312,15 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         
         z_flat = z.squeeze(1)
         
-        # Multi-scale feature extraction
-        z_conv_features = []
-        z_conv_input = z_flat.unsqueeze(2)  # Add channel dimension for conv1d
+        # Multi-scale feature extraction using different transformations
+        z_transform_features = []
         
-        for conv in self.multi_scale_conv:
-            conv_out = conv(z_conv_input.transpose(1, 2)).transpose(1, 2)
-            z_conv_features.append(conv_out.squeeze(2))
+        for transform in self.multi_scale_transforms:
+            transform_out = transform(z_flat)
+            z_transform_features.append(transform_out)
         
         # Combine all features
-        all_features = torch.cat([z_flat] + z_conv_features, dim=1)
+        all_features = torch.cat([z_flat] + z_transform_features, dim=1)
         z_fused = self.feature_fusion(all_features)
         
         # Deep decoder
