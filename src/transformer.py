@@ -605,7 +605,7 @@ def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torc
 
 def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
-    Compute NT-Xent loss (InfoNCE) for contrastive learning
+    Compute simplified contrastive loss for self-supervised learning
     
     Args:
         z_i: First set of normalized embeddings (batch_size, embedding_dim)
@@ -617,24 +617,20 @@ def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 
     """
     batch_size = z_i.shape[0]
     
-    # Concatenate representations
-    representations = torch.cat([z_i, z_j], dim=0)  # 2*batch_size x embedding_dim
+    # Compute cosine similarity between corresponding pairs
+    positive_sim = F.cosine_similarity(z_i, z_j, dim=1) / temperature
     
-    # Compute similarity matrix
-    similarity_matrix = torch.matmul(representations, representations.T)
+    # Compute negative similarities (z_i vs all z_j except corresponding pair)
+    all_similarities = torch.matmul(z_i, z_j.T) / temperature
     
-    # Create mask for positive pairs
-    mask = torch.eye(batch_size, dtype=torch.bool, device=z_i.device)
-    mask = torch.cat([torch.cat([mask, mask], dim=1), 
-                     torch.cat([mask, mask], dim=1)], dim=0)
+    # Create mask to exclude positive pairs from negatives
+    mask = torch.eye(batch_size, device=z_i.device, dtype=torch.bool)
+    negative_similarities = all_similarities.masked_fill(mask, float('-inf'))
     
-    # Extract positive and negative pairs
-    positives = similarity_matrix[mask].view(2 * batch_size, 1)
-    negatives = similarity_matrix[~mask].view(2 * batch_size, -1)
-    
-    # Compute loss
-    logits = torch.cat([positives, negatives], dim=1) / temperature
-    labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z_i.device)
+    # Compute InfoNCE loss
+    # For each sample, positive is the corresponding pair, negatives are all other pairs
+    logits = torch.cat([positive_sim.unsqueeze(1), negative_similarities], dim=1)
+    labels = torch.zeros(batch_size, dtype=torch.long, device=z_i.device)
     
     loss = F.cross_entropy(logits, labels)
     
