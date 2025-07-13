@@ -292,6 +292,9 @@ class ProgressTracker:
         self.start_time = None
         self.epoch_times = []
         
+        # Ensure output directory exists
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
         # Setup logging with node information
         log_file = output_dir / f"training_{log_type}_{config.node_name}_{config.job_id}.log"
         logging.basicConfig(
