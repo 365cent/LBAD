@@ -180,7 +180,7 @@ class OptimizedTransformerBlock(nn.Module):
 # Log type classifier removed - each log file can only be one type
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
-    """Optimized transformer for unsupervised multi-label learning on Nibi"""
+    """Ultra-powerful transformer for unsupervised multi-label learning optimized for H100 GPU"""
     
     def __init__(self, input_dim: int, latent_dim: int, n_labels: int, 
                  n_clusters: int, dropout: float = 0.1):
@@ -190,60 +190,87 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.n_labels = n_labels
         
-        # More complex encoder with residual connections
-        self.input_proj = nn.Linear(input_dim, latent_dim)
-        self.input_norm = nn.LayerNorm(latent_dim)
+        # Much deeper and more powerful encoder
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         
-        # Deeper encoder with 6 transformer blocks
+        # Very deep encoder with 12 transformer blocks and skip connections
         self.encoder_blocks = nn.ModuleList([
-            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(6)
+            OptimizedTransformerBlock(latent_dim, 16, dropout) for _ in range(12)  # 16 heads, 12 layers
         ])
         
-        # Additional feed-forward network after encoder
-        self.encoder_ffn = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
+        # Multi-scale feature extraction
+        self.multi_scale_conv = nn.ModuleList([
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=k, padding=k//2) 
+            for k in [3, 5, 7, 9]
+        ])
+        
+        # Feature fusion network
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(latent_dim * 5, latent_dim * 2),  # 4 conv + 1 original
+            nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim * 2, latent_dim),
             nn.LayerNorm(latent_dim)
         )
         
-        # Deeper decoder with 4 blocks
+        # Very deep decoder with 8 blocks
         self.decoder_blocks = nn.ModuleList([
-            OptimizedTransformerBlock(latent_dim, 8, dropout) for _ in range(4)
+            OptimizedTransformerBlock(latent_dim, 16, dropout) for _ in range(8)
         ])
         self.output_proj = nn.Linear(latent_dim, input_dim)
         
-        # More complex multi-label head with attention mechanism
-        self.label_attention = nn.MultiheadAttention(latent_dim, 4, dropout=dropout, batch_first=True)
-        self.label_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim // 2, n_labels)
-        )
+        # Sophisticated multi-label prediction head with multiple branches
+        self.label_attention = nn.MultiheadAttention(latent_dim, 8, dropout=dropout, batch_first=True)
         
-        # Enhanced cluster head
+        # Multiple prediction branches for ensemble-like behavior
+        self.label_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(latent_dim, latent_dim // 2),
+                nn.LayerNorm(latent_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(latent_dim // 2, n_labels)
+            ) for _ in range(3)  # 3 branches for ensemble
+        ])
+        
+        # Advanced cluster prediction with hierarchical clustering
         self.cluster_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim // 2, n_clusters)
         )
         
-        # Enhanced contrastive projection head
+        # Very sophisticated contrastive projection head
         self.contrastive_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.BatchNorm1d(latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 2, latent_dim),
             nn.BatchNorm1d(latent_dim),
             nn.GELU(),
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.BatchNorm1d(latent_dim // 2),
-            nn.GELU(),
-            nn.Linear(latent_dim // 2, 256)  # Larger projection dimension
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim, 512)  # Much larger projection space
         )
+        
+        # Label relationship modeling
+        self.label_correlation = nn.Parameter(torch.randn(n_labels, n_labels) * 0.1)
         
         # Initialize weights for stable training
         self.apply(self._init_weights)
@@ -251,58 +278,86 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for stable training"""
         if isinstance(module, nn.Linear):
-            # Use smaller initialization for stability
-            nn.init.xavier_uniform_(module.weight, gain=0.5)
+            # Better initialization for deeper networks
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='gelu')
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='gelu')
         elif isinstance(module, nn.MultiheadAttention):
-            nn.init.xavier_uniform_(module.in_proj_weight, gain=0.5)
+            nn.init.kaiming_normal_(module.in_proj_weight, mode='fan_out', nonlinearity='gelu')
         
     def forward(self, x):
-        # Encode with residual connections
+        batch_size = x.shape[0]
+        
+        # Enhanced input processing
         z = self.input_proj(x)
-        z = self.input_norm(z)
         z = z.unsqueeze(1)  # Add sequence dimension
         
-        # Encoder with residual connections
+        # Very deep encoder with residual connections every 3 blocks
+        encoder_outputs = []
         for i, block in enumerate(self.encoder_blocks):
             z_residual = z
             z = block(z)
-            if i % 2 == 1:  # Add residual every 2 blocks
-                z = z + z_residual
+            if i % 3 == 2 and i > 0:  # Residual every 3 blocks
+                z = z + encoder_outputs[-1] if encoder_outputs else z
+            encoder_outputs.append(z)
         
-        # Apply FFN with residual
         z_flat = z.squeeze(1)
-        z_flat = z_flat + self.encoder_ffn(z_flat)
         
-        # Decode
-        z_dec = z
+        # Multi-scale feature extraction
+        z_conv_features = []
+        z_conv_input = z_flat.unsqueeze(2)  # Add channel dimension for conv1d
+        
+        for conv in self.multi_scale_conv:
+            conv_out = conv(z_conv_input.transpose(1, 2)).transpose(1, 2)
+            z_conv_features.append(conv_out.squeeze(2))
+        
+        # Combine all features
+        all_features = torch.cat([z_flat] + z_conv_features, dim=1)
+        z_fused = self.feature_fusion(all_features)
+        
+        # Deep decoder
+        z_dec = z_fused.unsqueeze(1)
         for block in self.decoder_blocks:
             z_dec = block(z_dec)
         x_recon = self.output_proj(z_dec.squeeze(1))
         
-        # Label prediction with self-attention
-        z_attn = z_flat.unsqueeze(1)
+        # Advanced label prediction with attention and ensemble
+        z_attn = z_fused.unsqueeze(1)
         z_attn, _ = self.label_attention(z_attn, z_attn, z_attn)
         z_attn = z_attn.squeeze(1)
-        labels = self.label_head(z_attn + z_flat)  # Residual connection
+        
+        # Ensemble prediction from multiple branches
+        branch_predictions = []
+        for branch in self.label_branches:
+            branch_pred = branch(z_attn + z_fused)  # Residual connection
+            branch_predictions.append(branch_pred)
+        
+        # Average ensemble predictions
+        labels = torch.stack(branch_predictions, dim=0).mean(dim=0)
+        
+        # Apply label correlation matrix
+        label_correlations = torch.sigmoid(self.label_correlation)
+        labels = labels + 0.1 * torch.matmul(torch.sigmoid(labels), label_correlations)
         
         # Cluster prediction
-        clusters = self.cluster_head(z_flat)
+        clusters = self.cluster_head(z_fused)
         
-        # Contrastive projection
-        z_contrastive = self.contrastive_head(z_flat)
-        z_contrastive = F.normalize(z_contrastive, dim=1)  # L2 normalize
+        # Enhanced contrastive projection
+        z_contrastive = self.contrastive_head(z_fused)
+        z_contrastive = F.normalize(z_contrastive, dim=1)
         
         return {
-            'latent': z_flat,
+            'latent': z_fused,
             'reconstructed': x_recon,
             'labels': labels,
             'clusters': clusters,
-            'contrastive': z_contrastive
+            'contrastive': z_contrastive,
+            'branch_predictions': branch_predictions  # For additional loss
         }
 
 # =============================================================================
@@ -499,114 +554,142 @@ def create_label_clusters(classes: List[str], n_clusters: int) -> Optional[np.nd
     
     return C
 
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 1.0, gamma: float = 2.0) -> torch.Tensor:
+    """
+    Focal loss for addressing class imbalance and improving confidence
+    
+    Args:
+        logits: Model predictions (before sigmoid)
+        targets: Target labels
+        alpha: Weighting factor for rare class
+        gamma: Focusing parameter
+    
+    Returns:
+        Focal loss value
+    """
+    # Apply sigmoid to get probabilities
+    probs = torch.sigmoid(logits)
+    
+    # Calculate focal loss
+    ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = probs * targets + (1 - probs) * (1 - targets)
+    focal_weight = alpha * (1 - p_t) ** gamma
+    focal_loss = focal_weight * ce_loss
+    
+    return focal_loss.mean()
+
+def confidence_regularization_loss(predictions: torch.Tensor, confidence_target: float = 0.8) -> torch.Tensor:
+    """
+    Encourage higher confidence predictions
+    
+    Args:
+        predictions: Model predictions (after sigmoid)
+        confidence_target: Target confidence level
+    
+    Returns:
+        Confidence regularization loss
+    """
+    # Calculate prediction confidence (distance from 0.5)
+    confidence = torch.abs(predictions - 0.5) * 2
+    
+    # Penalize low confidence predictions
+    confidence_loss = F.mse_loss(confidence, torch.full_like(confidence, confidence_target))
+    
+    return confidence_loss
+
 def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 3, true_labels: np.ndarray = None) -> np.ndarray:
-    """Generate pseudo-labels using self-supervised mutual learning approach with optional true labels"""
+    """Generate pseudo-labels using self-supervised mutual learning approach with higher confidence"""
     if not classes:
         return np.random.rand(len(embeddings), 1).astype(np.float32)
     
     n_samples = len(embeddings)
     n_classes = len(classes)
     
-    # Initialize pseudo-labels
+    # Initialize pseudo-labels with higher confidence
     if true_labels is not None:
-        # If we have true labels, use them as initialization with some noise
+        # If we have true labels, use them with higher confidence
         pseudo_labels = true_labels.astype(np.float32)
-        # Add small noise to prevent overfitting
-        noise = np.random.rand(n_samples, n_classes) * 0.1
-        pseudo_labels = pseudo_labels * 0.8 + noise * 0.2
+        # Add less noise to maintain higher confidence
+        noise = np.random.rand(n_samples, n_classes) * 0.05  # Reduced noise
+        pseudo_labels = pseudo_labels * 0.9 + noise * 0.1  # Higher weight for true labels
         
-        # For unlabeled samples (all zeros), initialize with random values
+        # For unlabeled samples, initialize with more confident random values
         unlabeled_mask = (true_labels.sum(axis=1) == 0)
         if np.any(unlabeled_mask):
-            pseudo_labels[unlabeled_mask] = np.random.rand(np.sum(unlabeled_mask), n_classes) * 0.3
+            # Generate more confident initial labels
+            confident_labels = np.random.rand(np.sum(unlabeled_mask), n_classes)
+            # Make them more binary-like (closer to 0 or 1)
+            confident_labels = (confident_labels > 0.3).astype(float) * 0.8 + 0.1
+            pseudo_labels[unlabeled_mask] = confident_labels
     else:
-        # Initialize with small random values to break symmetry
-        pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32) * 0.1
+        # Initialize with more confident random values
+        pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
+        # Make initial labels more confident
+        pseudo_labels = (pseudo_labels > 0.4).astype(float) * 0.7 + 0.15
     
-    # 1. Compute pairwise similarities between embeddings
-    # Normalize embeddings for cosine similarity
+    # 1. Compute pairwise similarities with higher threshold
     embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
     
-    # Compute similarity matrix in chunks to manage memory
-    chunk_size = min(1000, n_samples)
-    similarity_threshold = 0.7  # High similarity threshold
+    # Use higher similarity threshold for more confident propagation
+    similarity_threshold = 0.8  # Increased from 0.7
     
-    # 2. Propagate labels based on embedding similarity
+    # 2. Propagate labels with confidence weighting
+    chunk_size = min(1000, n_samples)
+    
     for i in range(0, n_samples, chunk_size):
         end_i = min(i + chunk_size, n_samples)
         chunk_i = embeddings_norm[i:end_i]
         
-        # Compute similarities with all other embeddings
         similarities = np.dot(chunk_i, embeddings_norm.T)
         
-        # For each sample in chunk, find highly similar samples
         for j in range(len(chunk_i)):
             global_idx = i + j
             
-            # Find samples with high similarity
+            # Find highly similar samples
             similar_indices = np.where(similarities[j] > similarity_threshold)[0]
             
-            if len(similar_indices) > 1:  # Exclude self
-                # If we have true labels, give more weight to labeled samples
-                if true_labels is not None:
-                    # Check if any similar samples have true labels
-                    labeled_similar = similar_indices[true_labels[similar_indices].sum(axis=1) > 0]
-                    if len(labeled_similar) > 0:
-                        # Use labeled samples with higher weight
-                        similar_labels = pseudo_labels[labeled_similar].mean(axis=0)
-                        momentum = 0.7  # Lower momentum for labeled data
-                    else:
-                        # Use all similar samples
-                        similar_labels = pseudo_labels[similar_indices].mean(axis=0)
-                        momentum = 0.9
-                else:
-                    # Average pseudo-labels of similar samples
-                    similar_labels = pseudo_labels[similar_indices].mean(axis=0)
-                    momentum = 0.9
+            if len(similar_indices) > 1:
+                # Weight by similarity for more confident propagation
+                sim_weights = similarities[j][similar_indices]
+                sim_weights = sim_weights / sim_weights.sum()
                 
-                # Update current sample's pseudo-labels with momentum
+                # Weighted average with confidence boost
+                similar_labels = np.average(pseudo_labels[similar_indices], axis=0, weights=sim_weights)
+                
+                # Higher momentum for more confident updates
+                momentum = 0.8  # Increased from 0.7-0.9
                 pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * similar_labels
     
-    # 3. Apply diversity regularization to prevent collapse
-    # Ensure each class has reasonable representation
-    class_assignments = pseudo_labels.sum(axis=0)
-    min_samples_per_class = max(10, n_samples // (n_classes * 2))
-    
-    for class_idx in range(n_classes):
-        if class_assignments[class_idx] < min_samples_per_class:
-            # Find samples with low total assignment and assign to this class
-            total_assignments = pseudo_labels.sum(axis=1)
-            low_assignment_indices = np.argsort(total_assignments)[:min_samples_per_class]
-            pseudo_labels[low_assignment_indices, class_idx] += 0.5
-    
-    # 4. Apply sparsity constraint - each sample should have limited labels
+    # 3. Apply confidence boosting
+    # Enhance the most confident predictions
     for i in range(n_samples):
-        # Keep only top-k labels per sample
-        top_k_indices = np.argsort(pseudo_labels[i])[-k:]
-        mask = np.zeros(n_classes, dtype=bool)
-        mask[top_k_indices] = True
+        # Get top predictions
+        top_indices = np.argsort(pseudo_labels[i])[-k:]
         
-        # Soft assignment with temperature
-        pseudo_labels[i][~mask] *= 0.1  # Reduce but don't zero out
+        # Boost confidence of top predictions
+        confidence_boost = 0.2
+        pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + confidence_boost, 1.0)
         
-    # 5. Normalize to probability distribution
+        # Reduce confidence of low predictions
+        low_indices = pseudo_labels[i] < 0.3
+        pseudo_labels[i][low_indices] *= 0.5
+    
+    # 4. Apply sharpening to increase confidence
+    temperature = 0.5  # Lower temperature = higher confidence
+    pseudo_labels = pseudo_labels ** (1/temperature)
+    
+    # 5. Normalize with confidence preservation
     row_sums = pseudo_labels.sum(axis=1, keepdims=True)
-    row_sums = np.maximum(row_sums, 1e-8)  # Avoid division by zero
+    row_sums = np.maximum(row_sums, 1e-8)
     pseudo_labels = pseudo_labels / row_sums
     
-    # Ensure no NaN values
-    pseudo_labels = np.nan_to_num(pseudo_labels, nan=0.0, posinf=1.0, neginf=0.0)
+    # 6. Apply minimum confidence threshold
+    min_confidence = 0.1
+    max_confidence = 0.9
+    pseudo_labels = np.clip(pseudo_labels, min_confidence, max_confidence)
     
-    # 6. Add confidence based on local density
-    # Samples in dense regions get higher confidence
-    for i in range(n_samples):
-        # Count neighbors within similarity threshold
-        similarities = np.dot(embeddings_norm[i], embeddings_norm.T)
-        n_neighbors = np.sum(similarities > similarity_threshold) - 1  # Exclude self
-        
-        # Confidence based on local density
-        density_confidence = np.tanh(n_neighbors / 20.0)  # Normalize to [0, 1]
-        pseudo_labels[i] *= (0.5 + 0.5 * density_confidence)
+    # Ensure no NaN values
+    pseudo_labels = np.nan_to_num(pseudo_labels, nan=0.1, posinf=0.9, neginf=0.1)
     
     return pseudo_labels
 
@@ -706,9 +789,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     elif config.n_gpus > 1:
         model = nn.DataParallel(model)
     
-    # Generate pseudo-labels (use true labels if available from tracker)
+    # Generate initial pseudo-labels (use true labels if available from tracker)
     true_labels = getattr(tracker, 'true_labels', None)
-    pseudo_labels = generate_pseudo_labels(embeddings, classes, true_labels=true_labels)
+    pseudo_labels = advanced_pseudo_label_generation(embeddings, classes, true_labels=true_labels, epoch=0, total_epochs=50)
     
     # Store initial pseudo-labels for refinement
     current_pseudo_labels = pseudo_labels.copy()
@@ -731,13 +814,22 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         pin_memory=True
     )
     
-    # Training setup with improved hyperparameters
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)  # Much lower learning rate for stability
+    # Advanced training setup optimized for H100
+    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # Higher learning rate for deeper model
     scaler = GradScaler() if config.device == "cuda" else None
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)  # Better schedule
+    
+    # Advanced scheduler with warmup
+    def lr_lambda(epoch):
+        warmup_epochs = 5
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        else:
+            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (50 - warmup_epochs)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Gradient clipping for stability
-    max_grad_norm = 1.0
+    max_grad_norm = 2.0  # Higher for deeper model
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
@@ -760,7 +852,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         if config.is_distributed:
             sampler.set_epoch(epoch)
         
-        # Refine pseudo-labels periodically based on model predictions
+        # Advanced pseudo-label refinement with curriculum learning
         if epoch > 0 and epoch % refinement_interval == 0:
             model.eval()
             with torch.no_grad():
@@ -773,11 +865,19 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 all_predictions = np.vstack(all_predictions)
                 
-                # Combine predictions with original pseudo-labels
-                # Use momentum to prevent drastic changes
-                refinement_momentum = 0.7
-                current_pseudo_labels = (refinement_momentum * current_pseudo_labels + 
-                                       (1 - refinement_momentum) * all_predictions)
+                # Generate new pseudo-labels with curriculum learning
+                new_pseudo_labels = advanced_pseudo_label_generation(
+                    embeddings, classes, true_labels=true_labels, 
+                    epoch=epoch, total_epochs=total_epochs
+                )
+                
+                # Combine model predictions with curriculum-generated labels
+                progress = epoch / total_epochs
+                model_weight = min(0.7, 0.3 + 0.4 * progress)  # Increase model influence over time
+                current_pseudo_labels = (
+                    model_weight * all_predictions + 
+                    (1 - model_weight) * new_pseudo_labels
+                )
                 
                 # Update dataset with refined pseudo-labels
                 dataset = TensorDataset(
@@ -794,10 +894,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     pin_memory=True
                 )
                 
-                tracker.log_step("Pseudo-label Refinement", {
+                tracker.log_step("Advanced Pseudo-label Refinement", {
                     "epoch": epoch,
                     "avg_confidence": float(np.mean(all_predictions.max(axis=1))),
-                    "label_density": float(np.mean(all_predictions.sum(axis=1)))
+                    "label_density": float(np.mean(all_predictions.sum(axis=1))),
+                    "model_weight": model_weight,
+                    "curriculum_progress": progress
                 })
             
             model.train()
@@ -814,9 +916,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     with autocast():
                         outputs = model(x_batch)
                         
-                        # Multi-component loss
+                        # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                        label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
+                        
+                        # Use focal loss instead of BCE for better confidence
+                        label_loss = focal_loss(outputs['labels'], y_batch, alpha=1.0, gamma=2.0)
+                        
+                        # Add confidence regularization
+                        predictions = torch.sigmoid(outputs['labels'])
+                        confidence_loss = confidence_regularization_loss(predictions, confidence_target=0.8)
+                        
+                        # Ensemble consistency loss
+                        ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
                         
                         if C is not None:
                             C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -836,8 +947,16 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         # Mutual learning loss
                         mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
                         
-                        # Weighted combination of losses with smaller weights
-                        total_loss = 0.1 * recon_loss + 0.3 * label_loss + 0.1 * cluster_loss + 0.2 * contrast_loss + 0.1 * mutual_loss
+                        # Curriculum-based loss weighting
+                        loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
+                        
+                        total_loss = (loss_weights['recon'] * recon_loss + 
+                                    loss_weights['label'] * label_loss + 
+                                    loss_weights['cluster'] * cluster_loss + 
+                                    loss_weights['contrastive'] * contrast_loss + 
+                                    loss_weights['mutual'] * mutual_loss + 
+                                    loss_weights['confidence'] * confidence_loss + 
+                                    loss_weights['ensemble'] * ensemble_loss)
                         
                         # Check for nan/inf
                         if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -857,7 +976,16 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     outputs = model(x_batch)
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                    label_loss = F.binary_cross_entropy_with_logits(outputs['labels'], y_batch)
+                    
+                    # Use focal loss instead of BCE for better confidence
+                    label_loss = focal_loss(outputs['labels'], y_batch, alpha=1.0, gamma=2.0)
+                    
+                    # Add confidence regularization
+                    predictions = torch.sigmoid(outputs['labels'])
+                    confidence_loss = confidence_regularization_loss(predictions, confidence_target=0.8)
+                    
+                    # Ensemble consistency loss
+                    ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
                     
                     if C is not None:
                         C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -877,8 +1005,16 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     # Mutual learning loss
                     mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
                     
-                    # Weighted combination of losses with smaller weights
-                    total_loss = 0.1 * recon_loss + 0.3 * label_loss + 0.1 * cluster_loss + 0.2 * contrast_loss + 0.1 * mutual_loss
+                    # Curriculum-based loss weighting
+                    loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
+                    
+                    total_loss = (loss_weights['recon'] * recon_loss + 
+                                loss_weights['label'] * label_loss + 
+                                loss_weights['cluster'] * cluster_loss + 
+                                loss_weights['contrastive'] * contrast_loss + 
+                                loss_weights['mutual'] * mutual_loss + 
+                                loss_weights['confidence'] * confidence_loss + 
+                                loss_weights['ensemble'] * ensemble_loss)
                     
                     # Check for nan/inf
                     if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -916,6 +1052,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 "cluster_loss": cluster_loss.item(),
                 "contrastive_loss": contrast_loss.item() if 'contrast_loss' in locals() else 0.0,
                 "mutual_loss": mutual_loss.item() if 'mutual_loss' in locals() else 0.0,
+                "confidence_loss": confidence_loss.item() if 'confidence_loss' in locals() else 0.0,
+                "ensemble_loss": ensemble_loss.item() if 'ensemble_loss' in locals() else 0.0,
                 "lr": scheduler.get_last_lr()[0],
                 "epoch_time": epoch_time
             })
@@ -956,7 +1094,35 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
             predictions.append(probs.cpu().numpy())
     
     predictions = np.vstack(predictions)
-    binary_predictions = (predictions > 0.5).astype(int)
+    
+    # Use intelligent adaptive thresholding for optimal F1 score
+    # Calculate per-class thresholds based on distribution but less aggressive
+    adaptive_thresholds = []
+    for class_idx in range(predictions.shape[1]):
+        class_preds = predictions[:, class_idx]
+        
+        # Use a more balanced approach: 60th percentile or 0.4, whichever is lower
+        percentile_threshold = np.percentile(class_preds, 60)
+        threshold = min(max(0.25, percentile_threshold), 0.5)  # Clamp between 0.25 and 0.5
+        adaptive_thresholds.append(threshold)
+    
+    # Apply adaptive thresholds
+    binary_predictions = np.zeros_like(predictions, dtype=int)
+    for class_idx, threshold in enumerate(adaptive_thresholds):
+        binary_predictions[:, class_idx] = (predictions[:, class_idx] > threshold).astype(int)
+    
+    # Ensure each sample has at least 1-3 labels (multi-label nature)
+    for idx in range(len(binary_predictions)):
+        n_labels = binary_predictions[idx].sum()
+        if n_labels == 0:
+            # Assign top 2 predictions if no labels
+            top_indices = np.argsort(predictions[idx])[-2:]
+            binary_predictions[idx, top_indices] = 1
+        elif n_labels > 5:  # Cap at 5 labels maximum
+            # Keep only top 5 predictions
+            top_indices = np.argsort(predictions[idx])[-5:]
+            binary_predictions[idx] = 0
+            binary_predictions[idx, top_indices] = 1
     
     # Calculate comprehensive metrics
     metrics = calculate_comprehensive_metrics(binary_predictions, classes)
@@ -1323,6 +1489,155 @@ def create_visualization(embeddings: np.ndarray, predictions: np.ndarray,
         
     except Exception as e:
         print(f"Visualization failed: {e}")
+
+def ensemble_consistency_loss(branch_predictions: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Encourage consistency between ensemble branches
+    """
+    if len(branch_predictions) < 2:
+        return torch.tensor(0.0, device=branch_predictions[0].device)
+    
+    consistency_loss = 0.0
+    n_pairs = 0
+    
+    for i in range(len(branch_predictions)):
+        for j in range(i + 1, len(branch_predictions)):
+            pred_i = torch.sigmoid(branch_predictions[i])
+            pred_j = torch.sigmoid(branch_predictions[j])
+            consistency_loss += F.mse_loss(pred_i, pred_j)
+            n_pairs += 1
+    
+    return consistency_loss / max(n_pairs, 1)
+
+def curriculum_weight_scheduler(epoch: int, total_epochs: int) -> Dict[str, float]:
+    """
+    Curriculum learning: gradually increase difficulty of learning
+    """
+    progress = epoch / total_epochs
+    
+    # Start with simple reconstruction, gradually add complex losses
+    weights = {
+        'recon': max(0.3, 0.5 - 0.2 * progress),  # Decrease reconstruction importance
+        'label': min(0.6, 0.2 + 0.4 * progress),  # Increase label importance
+        'cluster': 0.1,
+        'contrastive': min(0.3, 0.1 + 0.2 * progress),  # Gradually add contrastive
+        'mutual': min(0.2, 0.05 + 0.15 * progress),  # Gradually add mutual
+        'confidence': min(0.3, 0.1 + 0.2 * progress),  # Gradually add confidence
+        'ensemble': min(0.2, 0.0 + 0.2 * progress)  # Add ensemble consistency later
+    }
+    
+    return weights
+
+def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str], 
+                                   true_labels: np.ndarray = None, 
+                                   epoch: int = 0, total_epochs: int = 50) -> np.ndarray:
+    """
+    Advanced pseudo-label generation with curriculum learning and confidence boosting
+    """
+    if not classes:
+        return np.random.rand(len(embeddings), 1).astype(np.float32)
+    
+    n_samples = len(embeddings)
+    n_classes = len(classes)
+    
+    # Curriculum learning: start conservative, become more aggressive
+    progress = epoch / max(total_epochs, 1)
+    
+    if true_labels is not None:
+        # Use true labels as strong supervision
+        pseudo_labels = true_labels.astype(np.float32)
+        
+        # Apply curriculum noise reduction
+        noise_factor = max(0.02, 0.1 - 0.08 * progress)
+        noise = np.random.rand(n_samples, n_classes) * noise_factor
+        pseudo_labels = pseudo_labels * (0.95 + 0.05 * progress) + noise * (1 - progress)
+        
+        # For unlabeled samples, use confident initialization
+        unlabeled_mask = (true_labels.sum(axis=1) == 0)
+        if np.any(unlabeled_mask):
+            n_unlabeled = np.sum(unlabeled_mask)
+            # More confident initialization as training progresses
+            base_confidence = 0.3 + 0.4 * progress
+            confident_labels = np.random.rand(n_unlabeled, n_classes)
+            confident_labels = (confident_labels > (1 - base_confidence)).astype(float) * 0.8 + 0.1
+            pseudo_labels[unlabeled_mask] = confident_labels
+    else:
+        # Start with moderate confidence, increase over time
+        base_confidence = 0.2 + 0.5 * progress
+        pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
+        pseudo_labels = (pseudo_labels > (1 - base_confidence)).astype(float) * 0.7 + 0.15
+    
+    # Advanced similarity-based propagation
+    embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+    
+    # Adaptive similarity threshold based on curriculum
+    similarity_threshold = 0.75 + 0.1 * progress  # Start at 0.75, go to 0.85
+    
+    # Multi-scale propagation with different neighborhood sizes
+    for scale in [500, 1000, 2000]:  # Different scales
+        chunk_size = min(scale, n_samples)
+        
+        for i in range(0, n_samples, chunk_size):
+            end_i = min(i + chunk_size, n_samples)
+            chunk_i = embeddings_norm[i:end_i]
+            
+            similarities = np.dot(chunk_i, embeddings_norm.T)
+            
+            for j in range(len(chunk_i)):
+                global_idx = i + j
+                
+                # Find top-k similar samples (adaptive k)
+                k_neighbors = min(20 + int(10 * progress), n_samples // 10)
+                top_k_indices = np.argsort(similarities[j])[-k_neighbors:]
+                top_k_similarities = similarities[j][top_k_indices]
+                
+                # Only use highly similar samples
+                valid_mask = top_k_similarities > similarity_threshold
+                if np.any(valid_mask):
+                    valid_indices = top_k_indices[valid_mask]
+                    valid_similarities = top_k_similarities[valid_mask]
+                    
+                    # Weighted propagation
+                    weights = valid_similarities / valid_similarities.sum()
+                    propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
+                    
+                    # Adaptive momentum based on curriculum
+                    momentum = 0.7 + 0.2 * progress
+                    pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+    
+    # Progressive confidence boosting
+    for i in range(n_samples):
+        # Dynamic k based on curriculum
+        k = min(3 + int(2 * progress), n_classes)
+        top_indices = np.argsort(pseudo_labels[i])[-k:]
+        
+        # Stronger boosting as training progresses
+        boost_factor = 0.1 + 0.3 * progress
+        pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + boost_factor, 0.95)
+        
+        # Suppress weak predictions more aggressively
+        weak_threshold = 0.4 - 0.1 * progress
+        weak_mask = pseudo_labels[i] < weak_threshold
+        pseudo_labels[i][weak_mask] *= (0.8 - 0.3 * progress)
+    
+    # Progressive sharpening
+    temperature = max(0.3, 0.8 - 0.5 * progress)
+    pseudo_labels = pseudo_labels ** (1/temperature)
+    
+    # Normalization with confidence preservation
+    row_sums = pseudo_labels.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-8)
+    pseudo_labels = pseudo_labels / row_sums
+    
+    # Progressive confidence bounds
+    min_conf = max(0.05, 0.15 - 0.1 * progress)
+    max_conf = min(0.95, 0.8 + 0.15 * progress)
+    pseudo_labels = np.clip(pseudo_labels, min_conf, max_conf)
+    
+    # Ensure no invalid values
+    pseudo_labels = np.nan_to_num(pseudo_labels, nan=min_conf, posinf=max_conf, neginf=min_conf)
+    
+    return pseudo_labels
 
 # =============================================================================
 # Main Execution
