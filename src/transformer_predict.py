@@ -228,7 +228,16 @@ class TwoStagePredictor:
         classifier_path = classifier_files[0]  # Use the first one found
         print(f"Loading log type classifier from: {classifier_path}")
         
-        checkpoint = torch.load(classifier_path, map_location=self.device)
+        # Fix for PyTorch 2.6 weights_only issue
+        try:
+            checkpoint = torch.load(classifier_path, map_location=self.device, weights_only=False)
+        except Exception as e:
+            print(f"Warning: Failed to load with weights_only=False, trying alternative method: {e}")
+            # Try with safe globals
+            from torch.serialization import add_safe_globals
+            add_safe_globals([StandardScaler])
+            checkpoint = torch.load(classifier_path, map_location=self.device)
+        
         self.log_type_mapping = checkpoint['log_type_to_idx']
         self.idx_to_log_type = checkpoint['idx_to_log_type']
         
@@ -246,7 +255,16 @@ class TwoStagePredictor:
                 model_path = model_files[0]  # Use the first one found
                 print(f"Loading label model for {log_type} from: {model_path}")
                 
-                checkpoint = torch.load(model_path, map_location=self.device)
+                # Fix for PyTorch 2.6 weights_only issue
+                try:
+                    checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+                except Exception as e:
+                    print(f"Warning: Failed to load with weights_only=False, trying alternative method: {e}")
+                    # Try with safe globals
+                    from torch.serialization import add_safe_globals
+                    add_safe_globals([StandardScaler])
+                    checkpoint = torch.load(model_path, map_location=self.device)
+                
                 classes = checkpoint.get('classes', [])
                 
                 if classes:
@@ -398,6 +416,34 @@ class TwoStagePredictor:
 # Main Prediction Function
 # =============================================================================
 
+def find_embedding_file(log_type: str) -> str:
+    """Find the embedding file for a given log type"""
+    embeddings_dir = Path("embeddings")
+    
+    # Check if it's a direct file path
+    if Path(log_type).exists():
+        return log_type
+    
+    # Check if it's a log type name
+    log_file = embeddings_dir / log_type / f"log_{log_type}.pkl"
+    if log_file.exists():
+        return str(log_file)
+    
+    # Check if it's in the root embeddings directory
+    log_file = embeddings_dir / f"log_{log_type}.pkl"
+    if log_file.exists():
+        return str(log_file)
+    
+    # List available options
+    available_files = []
+    for file_path in embeddings_dir.rglob("log_*.pkl"):
+        available_files.append(str(file_path))
+    
+    raise FileNotFoundError(
+        f"Embedding file not found for '{log_type}'. "
+        f"Available files:\n" + "\n".join(available_files)
+    )
+
 def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions"):
     """Main prediction function"""
     
@@ -410,9 +456,12 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
     if not models_dir.exists():
         raise FileNotFoundError("Models directory not found. Please train models first.")
     
+    # Find the actual embedding file
+    actual_embeddings_path = find_embedding_file(embeddings_path)
+    print(f"Loading embeddings from: {actual_embeddings_path}")
+    
     # Load embeddings
-    print(f"Loading embeddings from: {embeddings_path}")
-    with open(embeddings_path, 'rb') as f:
+    with open(actual_embeddings_path, 'rb') as f:
         embeddings = pickle.load(f)
     
     print(f"Loaded {len(embeddings)} embeddings with shape {embeddings.shape}")
@@ -493,7 +542,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Two-stage transformer prediction")
     parser.add_argument("--embeddings", "-e", required=True, 
-                       help="Path to embeddings file (.pkl)")
+                       help="Log type name (e.g., 'wp-error', 'wp-access') or path to embeddings file")
     parser.add_argument("--output", "-o", default="predictions",
                        help="Output directory for results")
     
