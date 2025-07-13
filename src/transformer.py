@@ -278,17 +278,17 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for stable training"""
         if isinstance(module, nn.Linear):
-            # Better initialization for deeper networks
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='gelu')
+            # Better initialization for deeper networks (use 'relu' as closest supported option to 'gelu')
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Conv1d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='gelu')
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
         elif isinstance(module, nn.MultiheadAttention):
-            nn.init.kaiming_normal_(module.in_proj_weight, mode='fan_out', nonlinearity='gelu')
+            nn.init.kaiming_normal_(module.in_proj_weight, mode='fan_out', nonlinearity='relu')
         
     def forward(self, x):
         batch_size = x.shape[0]
@@ -498,6 +498,16 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
                         "label_density": np.mean(true_labels.sum(axis=1))
                     })
     
+    # Handle case where no labels exist (all logs are normal/benign)
+    if not classes:
+        classes = ['normal']  # Default class for unlabeled logs
+        true_labels = np.ones((len(embeddings), 1), dtype=np.float32)  # All samples are normal
+        tracker.log_step("No Labels Found - Using Normal Class", {
+            "n_samples": len(embeddings),
+            "default_class": "normal",
+            "note": "All logs treated as normal/benign"
+        })
+    
     # Aggressive subsampling for memory efficiency
     max_samples = min(50000, int(config.gpu_memory_gb * 500))  # Much smaller for memory safety
     if len(embeddings) > max_samples:
@@ -521,7 +531,7 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     embeddings = normalize(embeddings, norm='l2', axis=1)
     
     # Create label clusters
-    n_clusters = min(8, len(classes), len(embeddings) // 1000)
+    n_clusters = min(8, len(classes), max(1, len(embeddings) // 1000))
     C = create_label_clusters(classes, n_clusters)
     
     # Store true labels in tracker for later use
@@ -543,6 +553,10 @@ def create_label_clusters(classes: List[str], n_clusters: int) -> Optional[np.nd
     """Create semantic label clusters"""
     if not classes or n_clusters <= 0:
         return None
+    
+    # For single class (like 'normal'), create a single cluster
+    if len(classes) == 1:
+        return np.ones((1, 1), dtype=np.float32)
     
     n_clusters = min(n_clusters, len(classes))
     C = np.zeros((len(classes), n_clusters))
@@ -600,7 +614,8 @@ def confidence_regularization_loss(predictions: torch.Tensor, confidence_target:
 def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 3, true_labels: np.ndarray = None) -> np.ndarray:
     """Generate pseudo-labels using self-supervised mutual learning approach with higher confidence"""
     if not classes:
-        return np.random.rand(len(embeddings), 1).astype(np.float32)
+        # If no classes, create a single 'normal' class
+        return np.ones((len(embeddings), 1), dtype=np.float32) * 0.8
     
     n_samples = len(embeddings)
     n_classes = len(classes)
@@ -1535,7 +1550,9 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
     Advanced pseudo-label generation with curriculum learning and confidence boosting
     """
     if not classes:
-        return np.random.rand(len(embeddings), 1).astype(np.float32)
+        # If no classes, create a single 'normal' class with high confidence
+        confidence = 0.7 + 0.2 * (epoch / max(total_epochs, 1))  # Increase confidence over time
+        return np.ones((len(embeddings), 1), dtype=np.float32) * confidence
     
     n_samples = len(embeddings)
     n_classes = len(classes)
