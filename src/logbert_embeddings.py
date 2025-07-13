@@ -15,7 +15,9 @@ Key Features:
 - Visualization shows ALL classes without sampling/reduction
 
 Output files per log type (3 files for clarity):
-- log_{type}.pkl: Raw log text embeddings (768D BERT CLS vectors, float32)
+- log_{type}.pkl: Raw log text embeddings (2314D enhanced BERT vectors, float32)
+  * Combines CLS token (768D) + mean pooling (768D) + max pooling (768D) + attention features (10D)
+  * Captures global context, average meaning, key features, and attention patterns
 - label_{type}.pkl: Binary label vectors with metadata (same format as FastText)
   * 'vectors': Binary arrays where [0 1 0] means only second class is present
   * 'classes': List of attack types corresponding to each column
@@ -54,7 +56,7 @@ import psutil
 # Configuration
 OUTPUT_DIR = Path("embeddings")
 PROCESSED_DIR = Path("processed")
-VECTOR_SIZE = 768  # BERT hidden size
+VECTOR_SIZE = 2314  # Enhanced BERT: CLS(768) + Mean(768) + Max(768) + Attention(10)
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
 NUM_WORKERS = 2
@@ -110,6 +112,9 @@ def parse_tfrecord(example: tf.Tensor) -> Dict[str, tf.Tensor]:
         "y": tf.io.FixedLenFeature([], tf.string),
     }
     return tf.io.parse_single_example(example, feature_description)
+
+
+
 
 
 def process_single_tfrecord(path: Path) -> Tuple[List[str], List[str]]:
@@ -382,7 +387,7 @@ def find_available_log_types():
 # ---------------------------------------------------------------------------
 
 class LogBERTEmbeddingDataset(Dataset):
-    """Dataset class for LogBERT embedding extraction."""
+    """Dataset class for LogBERT embedding extraction from preprocessed TFRecord data."""
     
     def __init__(self, texts: List[str], tokenizer: BertTokenizer, max_length: int = MAX_SEQ_LENGTH):
         self.texts = texts
@@ -394,6 +399,8 @@ class LogBERTEmbeddingDataset(Dataset):
     
     def __getitem__(self, idx):
         text = self.texts[idx]
+        
+        # The text is already preprocessed from TFRecord files
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -410,7 +417,7 @@ class LogBERTEmbeddingDataset(Dataset):
 
 
 def extract_bert_embeddings(df, device, performance_config=None):
-    """Extract BERT CLS embeddings for all logs in the dataframe."""
+    """Extract enhanced BERT embeddings capturing multiple features for better anomaly detection."""
     if performance_config is None:
         performance_config = {'batch_size': BATCH_SIZE, 'workers': NUM_WORKERS, 'clear_freq': 50}
     
@@ -443,11 +450,14 @@ def extract_bert_embeddings(df, device, performance_config=None):
         persistent_workers=num_workers > 0
     )
     
-    # Extract embeddings with time tracking
-    all_embeddings = []
+    # Extract multiple types of embeddings
+    all_cls_embeddings = []
+    all_mean_embeddings = []
+    all_max_embeddings = []
+    all_attention_features = []
     start_time = time.time()
     
-    spinner = Halo(text=f'Extracting BERT CLS embeddings (ETA: {time_estimate})', spinner='dots')
+    spinner = Halo(text=f'Extracting enhanced BERT embeddings (ETA: {time_estimate})', spinner='dots')
     spinner.start()
     
     with torch.no_grad():
@@ -468,18 +478,66 @@ def extract_bert_embeddings(df, device, performance_config=None):
                         eta_str = f"{eta_seconds/3600:.1f}h"
                     
                     progress_pct = (batch_idx * batch_size) / num_entries * 100
-                    spinner.text = f'Extracting embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
+                    spinner.text = f'Extracting enhanced embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
                 else:
                     spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
             
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # Get outputs with attention weights
+            outputs = model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                output_attentions=True
+            )
             
-            # Extract CLS token embeddings (first token)
+            # 1. CLS token embeddings (global context)
             cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            all_embeddings.append(cls_embeddings)
+            all_cls_embeddings.append(cls_embeddings)
+            
+            # 2. Mean pooling (average representation)
+            token_embeddings = outputs.last_hidden_state
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            mean_embeddings = (sum_embeddings / sum_mask).cpu().numpy()
+            all_mean_embeddings.append(mean_embeddings)
+            
+            # 3. Max pooling (capture key features)
+            # Set padding tokens to large negative value before max pooling
+            token_embeddings_masked = token_embeddings.clone()
+            token_embeddings_masked[input_mask_expanded == 0] = -1e9
+            max_embeddings = torch.max(token_embeddings_masked, 1)[0].cpu().numpy()
+            all_max_embeddings.append(max_embeddings)
+            
+            # 4. Attention-based features (which tokens are important)
+            # Average attention from last layer, focusing on CLS token's attention
+            last_attention = outputs.attentions[-1]  # [batch, heads, seq, seq]
+            # Average over heads and take CLS token's attention to other tokens
+            cls_attention = last_attention.mean(dim=1)[:, 0, :].cpu().numpy()
+            
+            # Get top-k attention scores as features
+            top_k = 10
+            batch_attention_features = []
+            for i in range(cls_attention.shape[0]):
+                # Get actual sequence length for this sample
+                seq_len = attention_mask[i].sum().item()
+                # Only consider attention to actual tokens (not padding)
+                valid_attention = cls_attention[i, :seq_len]
+                
+                if len(valid_attention) > 1:  # Ensure we have more than just CLS token
+                    # Sort and get top-k values (excluding CLS token itself)
+                    top_values = np.sort(valid_attention[1:])[-top_k:]
+                    # Pad if necessary
+                    if len(top_values) < top_k:
+                        top_values = np.pad(top_values, (0, top_k - len(top_values)), 'constant')
+                else:
+                    top_values = np.zeros(top_k)
+                
+                batch_attention_features.append(top_values)
+            
+            all_attention_features.append(np.array(batch_attention_features))
             
             # Clear memory periodically based on performance config
             if batch_idx % clear_freq == 0:
@@ -487,16 +545,30 @@ def extract_bert_embeddings(df, device, performance_config=None):
     
     total_time = time.time() - start_time
     rate = num_entries / total_time
-    spinner.succeed(f"BERT embedding extraction complete ({total_time:.1f}s, {rate:.1f} entries/sec)")
+    spinner.succeed(f"Enhanced BERT embedding extraction complete ({total_time:.1f}s, {rate:.1f} entries/sec)")
     
-    # Concatenate all embeddings
-    all_embeddings = np.vstack(all_embeddings).astype(np.float32)
+    # Concatenate all features
+    cls_features = np.vstack(all_cls_embeddings).astype(np.float32)
+    mean_features = np.vstack(all_mean_embeddings).astype(np.float32)
+    max_features = np.vstack(all_max_embeddings).astype(np.float32)
+    attention_features = np.vstack(all_attention_features).astype(np.float32)
+    
+    # Combine all features into a single embedding
+    # This creates a richer representation while maintaining a single vector per log
+    combined_embeddings = np.hstack([
+        cls_features,      # 768D - global context
+        mean_features,     # 768D - average meaning
+        max_features,      # 768D - key features
+        attention_features # 10D - attention patterns
+    ])  # Total: 2314D
+    
+    spinner.text = f"Combined embedding shape: {combined_embeddings.shape} (2314D per log)"
     
     # Clear model from memory
     del model, tokenizer
     clear_memory(device)
     
-    return all_embeddings
+    return combined_embeddings
 
 
 def process_embeddings(df, device, use_global_attack_list=False, performance_config=None):
@@ -763,15 +835,19 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
                 else:
                     f.write("No attack types found for this log type.\n")
                 
-                f.write(f"\nGenerated by LogBERT embeddings extraction\n")
+                f.write(f"\nGenerated by Enhanced LogBERT embeddings extraction\n")
                 f.write(f"Compatible with FastText embedding format\n")
-                f.write(f"Embedding dimension: 768D (BERT CLS vectors)\n")
+                f.write(f"Embedding dimension: 2314D (Enhanced BERT vectors)\n")
+                f.write(f"  - CLS token: 768D (global context)\n")
+                f.write(f"  - Mean pooling: 768D (average representation)\n")
+                f.write(f"  - Max pooling: 768D (key features)\n")
+                f.write(f"  - Attention features: 10D (important token patterns)\n")
                 
             spinner.succeed(f"Saved {log_filename}, {label_filename}, and {attack_info_filename}")
             
             # Print summary
             print(f"\nSaved files for {log_type_name}:")
-            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape} (768D BERT CLS vectors)")
+            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape} (2314D enhanced BERT vectors)")
             print(f"  - {label_filename}: Binary label vectors {binary_vectors.shape}")
             print(f"  - {attack_info_filename}: Attack types and column mapping details")
             print(f"  - Classes: {classes}")
@@ -958,9 +1034,15 @@ def main():
     
     spinner = Halo(spinner='dots', text='Completing processing')
     spinner.start()
-    spinner.succeed("LogBERT embedding processing complete!")
+    spinner.succeed("Enhanced LogBERT embedding processing complete!")
     print("\nNote: Output format is compatible with FastText embeddings for downstream tasks.")
-    print("The only difference is the embedding dimension: 768D (BERT) vs 300D (FastText)")
+    print("The main difference is the embedding dimension: 2314D (Enhanced BERT) vs 300D (FastText)")
+    print("\nEnhanced embeddings capture:")
+    print("  1. Global context (CLS token) - what the log means overall")
+    print("  2. Average representation (mean pooling) - typical patterns")
+    print("  3. Key features (max pooling) - most important elements")
+    print("  4. Attention patterns - which parts of the log are most significant")
+    print("\nThis richer representation should improve anomaly detection performance.")
 
 
 if __name__ == "__main__":
