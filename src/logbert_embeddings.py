@@ -79,6 +79,9 @@ PERF_CONFIG = {
 tf.config.threading.set_inter_op_parallelism_threads(2)
 tf.config.threading.set_intra_op_parallelism_threads(2)
 
+# Set CUDA memory allocation configuration to avoid fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -99,10 +102,41 @@ def clear_memory(device):
     """Clear memory based on device type."""
     if device.type == "cuda":
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Wait for all operations to complete
     elif device.type == "mps":
         pass  # MPS doesn't need explicit cleanup
     import gc
     gc.collect()
+
+
+def get_available_gpu_memory(device):
+    """Get available GPU memory in MB."""
+    if device.type == "cuda":
+        return torch.cuda.get_device_properties(device).total_memory / (1024**2)
+    elif device.type == "mps":
+        return 8192  # Assume 8GB for M2 GPU
+    return 0
+
+
+def adjust_batch_size_for_memory(initial_batch_size, device):
+    """Adjust batch size based on available GPU memory."""
+    if device.type == "cuda":
+        try:
+            # Get memory info
+            total_memory = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
+            allocated_memory = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+            free_memory = total_memory - allocated_memory
+            
+            # If less than 2GB free, use very small batch size
+            if free_memory < 2.0:
+                return max(initial_batch_size // 4, 1)
+            elif free_memory < 4.0:
+                return max(initial_batch_size // 2, 1)
+            else:
+                return initial_batch_size
+        except:
+            return max(initial_batch_size // 2, 1)
+    return initial_batch_size
 
 
 def parse_tfrecord(example: tf.Tensor) -> Dict[str, tf.Tensor]:
@@ -333,17 +367,20 @@ def get_performance_config(dataset_size_category, device_type="cpu"):
         config['batch_size'] = min(config['batch_size'] * 2, 32)  # Double batch size for GPU
         config['workers'] = min(config['workers'], 4)  # MPS works best with fewer workers
     elif device_type == "cuda":
-        config['batch_size'] = min(config['batch_size'] * 3, 64)  # Triple for CUDA
-        config['workers'] = min(config['workers'], 6)
+        # Be more conservative with CUDA batch sizes due to memory constraints
+        config['batch_size'] = min(config['batch_size'], 4)  # Keep small batch sizes for CUDA
+        config['workers'] = min(config['workers'], 2)  # Reduce workers to save memory
+        config['clear_freq'] = max(config['clear_freq'] // 2, 1)  # Clear memory more frequently
     
     # Adjust for system memory
     memory_gb = psutil.virtual_memory().total / (1024**3)
     if memory_gb < 8:  # Less than 8GB RAM
-        config['batch_size'] = max(config['batch_size'] // 2, 2)
+        config['batch_size'] = max(config['batch_size'] // 2, 1)
         config['workers'] = max(config['workers'] // 2, 1)
-    elif memory_gb > 32:  # More than 32GB RAM
-        config['batch_size'] = min(config['batch_size'] * 2, 64)
-        config['workers'] = min(config['workers'] * 2, 8)
+    elif memory_gb > 32:  # More than 32GB RAM and not CUDA
+        if device_type != "cuda":
+            config['batch_size'] = min(config['batch_size'] * 2, 64)
+            config['workers'] = min(config['workers'] * 2, 8)
     
     return config
 
@@ -432,10 +469,22 @@ def extract_bert_embeddings(df, device, performance_config=None):
     spinner = Halo(text=f'Initializing BERT model (ETA: {time_estimate})', spinner='dots')
     spinner.start()
     
-    # Load pre-trained BERT model and tokenizer
+    # Clear memory before loading model
+    clear_memory(device)
+    
+    # Load pre-trained BERT model and tokenizer with attention implementation fix
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertModel.from_pretrained('bert-base-uncased').to(device)
+    model = BertModel.from_pretrained('bert-base-uncased', attn_implementation="eager").to(device)
     model.eval()
+    
+    # Clear memory after loading model
+    clear_memory(device)
+    
+    # Adjust batch size based on available GPU memory
+    adjusted_batch_size = adjust_batch_size_for_memory(batch_size, device)
+    if adjusted_batch_size != batch_size:
+        print(f"Adjusted batch size from {batch_size} to {adjusted_batch_size} due to memory constraints")
+        batch_size = adjusted_batch_size
     
     spinner.succeed(f"BERT model loaded - Processing {num_entries:,} entries (batch_size={batch_size}, workers={num_workers})")
     
@@ -482,15 +531,49 @@ def extract_bert_embeddings(df, device, performance_config=None):
                 else:
                     spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
             
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            # Clear memory before processing each batch for CUDA
+            if device.type == "cuda" and batch_idx % 5 == 0:
+                clear_memory(device)
             
-            # Get outputs with attention weights
-            outputs = model(
-                input_ids=input_ids, 
-                attention_mask=attention_mask,
-                output_attentions=True
-            )
+            try:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                
+                # Get outputs with attention weights
+                outputs = model(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask,
+                    output_attentions=True
+                )
+            except torch.cuda.OutOfMemoryError:
+                # If we run out of memory, clear everything and process samples one by one
+                spinner.text = f'Memory error at batch {batch_idx+1}, switching to single-sample processing'
+                clear_memory(device)
+                
+                # Process each sample in the batch individually
+                batch_outputs = []
+                for i in range(len(batch['input_ids'])):
+                    single_input = batch['input_ids'][i:i+1].to(device)
+                    single_mask = batch['attention_mask'][i:i+1].to(device)
+                    
+                    single_output = model(
+                        input_ids=single_input,
+                        attention_mask=single_mask,
+                        output_attentions=True
+                    )
+                    batch_outputs.append(single_output)
+                    
+                    # Clear after each sample
+                    single_input = single_input.cpu()
+                    single_mask = single_mask.cpu()
+                    clear_memory(device)
+                
+                # Combine outputs
+                outputs = type(batch_outputs[0])(
+                    last_hidden_state=torch.cat([out.last_hidden_state for out in batch_outputs], dim=0),
+                    attentions=tuple(torch.cat([out.attentions[i] for out in batch_outputs], dim=0) 
+                                   for i in range(len(batch_outputs[0].attentions)))
+                )
             
             # 1. CLS token embeddings (global context)
             cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
@@ -542,6 +625,11 @@ def extract_bert_embeddings(df, device, performance_config=None):
             # Clear memory periodically based on performance config
             if batch_idx % clear_freq == 0:
                 clear_memory(device)
+            
+            # Move tensors to CPU immediately after processing to free GPU memory
+            if device.type == "cuda":
+                input_ids = input_ids.cpu()
+                attention_mask = attention_mask.cpu()
     
     total_time = time.time() - start_time
     rate = num_entries / total_time
