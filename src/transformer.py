@@ -589,17 +589,18 @@ def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = None,
     
     # Calculate class weights if alpha not provided
     if alpha is None:
-        # Calculate per-class positive rates
-        pos_counts = targets.sum(dim=0)
-        neg_counts = targets.shape[0] - pos_counts
+        # Calculate per-class positive rates with stability
+        pos_counts = targets.sum(dim=0).clamp(min=1.0)  # Avoid division by zero
+        neg_counts = (targets.shape[0] - pos_counts).clamp(min=1.0)
         
-        # Inverse frequency weighting
-        pos_weights = 1.0 / (pos_counts + 1.0)
-        neg_weights = 1.0 / (neg_counts + 1.0)
+        # Inverse frequency weighting with smoothing
+        total_samples = targets.shape[0]
+        pos_weights = torch.sqrt(total_samples / (2.0 * pos_counts))
+        neg_weights = torch.sqrt(total_samples / (2.0 * neg_counts))
         
-        # Normalize weights
-        pos_weights = pos_weights / pos_weights.mean()
-        neg_weights = neg_weights / neg_weights.mean()
+        # Clamp weights to reasonable range
+        pos_weights = pos_weights.clamp(min=0.1, max=10.0)
+        neg_weights = neg_weights.clamp(min=0.1, max=10.0)
         
         # Apply class-specific weights
         alpha_t = targets * pos_weights.unsqueeze(0) + (1 - targets) * neg_weights.unsqueeze(0)
@@ -730,76 +731,113 @@ def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 
     
     return pseudo_labels
 
-def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
-    Mutual learning loss between two views of the data
+    Mutual learning loss between two views of the data with numerical stability
     
     Args:
         z1, z2: Two different views/representations of the same batch
         pseudo_labels: Pseudo-labels for the batch
-        temperature: Temperature for scaling
+        temperature: Temperature for scaling (increased for stability)
     
     Returns:
         Mutual learning loss value
     """
     batch_size = z1.shape[0]
     
-    # Normalize representations
-    z1_norm = F.normalize(z1, dim=1)
-    z2_norm = F.normalize(z2, dim=1)
+    # Normalize representations with epsilon for stability
+    z1_norm = F.normalize(z1, dim=1, eps=1e-6)
+    z2_norm = F.normalize(z2, dim=1, eps=1e-6)
     
-    # Compute cross-view similarity
+    # Compute cross-view similarity with clamping
     cross_sim = torch.matmul(z1_norm, z2_norm.T) / temperature
+    cross_sim = torch.clamp(cross_sim, min=-10, max=10)  # Prevent extreme values
     
     # Create pseudo-label similarity matrix
     label_sim = torch.matmul(pseudo_labels, pseudo_labels.T)
     label_sim = (label_sim > 0.5).float()  # Binary similarity based on shared labels
     
+    # Ensure diagonal is excluded (self-similarity)
+    mask_diagonal = torch.eye(batch_size, device=z1.device)
+    label_sim = label_sim * (1 - mask_diagonal)
+    
     # Mutual learning loss: encourage similar pseudo-labels to have similar representations
-    # Use a soft version of the loss to handle uncertainty in pseudo-labels
     pos_mask = label_sim
-    neg_mask = 1 - label_sim
+    neg_mask = (1 - label_sim) * (1 - mask_diagonal)
     
-    # Positive pairs should have high similarity
-    pos_loss = -torch.log(torch.sigmoid(cross_sim) + 1e-8) * pos_mask
-    pos_loss = pos_loss.sum() / (pos_mask.sum() + 1e-8)
+    # Count valid pairs
+    n_pos = pos_mask.sum()
+    n_neg = neg_mask.sum()
     
-    # Negative pairs should have low similarity
-    neg_loss = -torch.log(1 - torch.sigmoid(cross_sim) + 1e-8) * neg_mask
-    neg_loss = neg_loss.sum() / (neg_mask.sum() + 1e-8)
+    # Only compute loss if we have valid pairs
+    pos_loss = torch.tensor(0.0, device=z1.device)
+    neg_loss = torch.tensor(0.0, device=z1.device)
     
-    return pos_loss + neg_loss
+    if n_pos > 0:
+        # Positive pairs should have high similarity
+        pos_sim = torch.sigmoid(cross_sim)
+        pos_sim = torch.clamp(pos_sim, min=1e-7, max=1-1e-7)  # Numerical stability
+        pos_loss = -torch.log(pos_sim) * pos_mask
+        pos_loss = pos_loss.sum() / n_pos
+    
+    if n_neg > 0:
+        # Negative pairs should have low similarity
+        neg_sim = torch.sigmoid(-cross_sim)
+        neg_sim = torch.clamp(neg_sim, min=1e-7, max=1-1e-7)  # Numerical stability
+        neg_loss = -torch.log(neg_sim) * neg_mask
+        neg_loss = neg_loss.sum() / n_neg
+    
+    total_loss = pos_loss + neg_loss
+    
+    # Final safety check
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        return torch.tensor(0.0, device=z1.device)
+    
+    return total_loss
 
-def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
-    Compute simplified contrastive loss for self-supervised learning
+    Compute simplified contrastive loss for self-supervised learning with numerical stability
     
     Args:
         z_i: First set of normalized embeddings (batch_size, embedding_dim)
         z_j: Second set of normalized embeddings (batch_size, embedding_dim)
-        temperature: Temperature parameter for scaling
+        temperature: Temperature parameter for scaling (increased for stability)
     
     Returns:
         Contrastive loss value
     """
     batch_size = z_i.shape[0]
     
+    # Ensure normalized inputs
+    z_i = F.normalize(z_i, dim=1, eps=1e-6)
+    z_j = F.normalize(z_j, dim=1, eps=1e-6)
+    
     # Compute cosine similarity between corresponding pairs
     positive_sim = F.cosine_similarity(z_i, z_j, dim=1) / temperature
+    positive_sim = torch.clamp(positive_sim, min=-10, max=10)  # Prevent overflow
     
     # Compute negative similarities (z_i vs all z_j except corresponding pair)
     all_similarities = torch.matmul(z_i, z_j.T) / temperature
+    all_similarities = torch.clamp(all_similarities, min=-10, max=10)  # Prevent overflow
     
     # Create mask to exclude positive pairs from negatives
     mask = torch.eye(batch_size, device=z_i.device, dtype=torch.bool)
-    negative_similarities = all_similarities.masked_fill(mask, float('-inf'))
+    
+    # Use a large negative value instead of -inf for stability
+    negative_similarities = all_similarities.masked_fill(mask, -50.0)
     
     # Compute InfoNCE loss
     # For each sample, positive is the corresponding pair, negatives are all other pairs
     logits = torch.cat([positive_sim.unsqueeze(1), negative_similarities], dim=1)
     labels = torch.zeros(batch_size, dtype=torch.long, device=z_i.device)
     
-    loss = F.cross_entropy(logits, labels)
+    # Add label smoothing for stability
+    loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
+    
+    # Final safety check
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(0.0, device=z_i.device)
     
     return loss
 
@@ -851,8 +889,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         pin_memory=True
     )
     
-    # Advanced training setup optimized for H100
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # Higher learning rate for deeper model
+    # Advanced training setup with reduced learning rate for stability
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # Reduced for stability
     scaler = GradScaler() if config.device == "cuda" else None
     
     # Advanced scheduler with warmup
@@ -866,7 +904,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Gradient clipping for stability
-    max_grad_norm = 2.0  # Higher for deeper model
+    max_grad_norm = 1.0  # Reduced for better stability
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
@@ -1001,9 +1039,26 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                                     loss_weights['confidence'] * confidence_loss + 
                                     loss_weights['ensemble'] * ensemble_loss)
                         
-                        # Check for nan/inf
-                        if torch.isnan(total_loss) or torch.isinf(total_loss):
-                            print(f"Warning: NaN/Inf detected in loss. Skipping batch.")
+                        # Check for nan/inf in individual losses
+                        loss_dict = {
+                            'recon': recon_loss,
+                            'label': label_loss,
+                            'cluster': cluster_loss,
+                            'contrastive': contrast_loss,
+                            'mutual': mutual_loss,
+                            'confidence': confidence_loss,
+                            'ensemble': ensemble_loss
+                        }
+                        
+                        # Check each loss component
+                        skip_batch = False
+                        for loss_name, loss_val in loss_dict.items():
+                            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                                print(f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}")
+                                skip_batch = True
+                        
+                        if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
+                            print(f"Skipping batch due to numerical instability.")
                             optimizer.zero_grad()
                             continue
                     
@@ -1059,9 +1114,26 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                                 loss_weights['confidence'] * confidence_loss + 
                                 loss_weights['ensemble'] * ensemble_loss)
                     
-                    # Check for nan/inf
-                    if torch.isnan(total_loss) or torch.isinf(total_loss):
-                        print(f"Warning: NaN/Inf detected in loss. Skipping batch.")
+                    # Check for nan/inf in individual losses
+                    loss_dict = {
+                        'recon': recon_loss,
+                        'label': label_loss,
+                        'cluster': cluster_loss,
+                        'contrastive': contrast_loss,
+                        'mutual': mutual_loss,
+                        'confidence': confidence_loss,
+                        'ensemble': ensemble_loss
+                    }
+                    
+                    # Check each loss component
+                    skip_batch = False
+                    for loss_name, loss_val in loss_dict.items():
+                        if torch.isnan(loss_val) or torch.isinf(loss_val):
+                            print(f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}")
+                            skip_batch = True
+                    
+                    if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
+                        print(f"Skipping batch due to numerical instability.")
                         optimizer.zero_grad()
                         continue
                     
@@ -1657,19 +1729,20 @@ def ensemble_consistency_loss(branch_predictions: List[torch.Tensor]) -> torch.T
 
 def curriculum_weight_scheduler(epoch: int, total_epochs: int) -> Dict[str, float]:
     """
-    Curriculum learning: gradually increase difficulty of learning
+    Curriculum learning: gradually increase difficulty of learning with reduced weights for stability
     """
     progress = epoch / total_epochs
     
     # Start with simple reconstruction, gradually add complex losses
+    # Reduced weights to prevent numerical overflow
     weights = {
-        'recon': max(0.3, 0.5 - 0.2 * progress),  # Decrease reconstruction importance
-        'label': min(0.6, 0.2 + 0.4 * progress),  # Increase label importance
-        'cluster': 0.1,
-        'contrastive': min(0.3, 0.1 + 0.2 * progress),  # Gradually add contrastive
-        'mutual': min(0.2, 0.05 + 0.15 * progress),  # Gradually add mutual
-        'confidence': min(0.3, 0.1 + 0.2 * progress),  # Gradually add confidence
-        'ensemble': min(0.2, 0.0 + 0.2 * progress)  # Add ensemble consistency later
+        'recon': max(0.1, 0.2 - 0.1 * progress),  # Decrease reconstruction importance
+        'label': min(0.3, 0.1 + 0.2 * progress),  # Increase label importance
+        'cluster': 0.05,  # Reduced
+        'contrastive': min(0.1, 0.05 + 0.05 * progress),  # Gradually add contrastive
+        'mutual': min(0.1, 0.02 + 0.08 * progress),  # Gradually add mutual
+        'confidence': min(0.15, 0.05 + 0.1 * progress),  # Gradually add confidence
+        'ensemble': min(0.1, 0.0 + 0.1 * progress)  # Add ensemble consistency later
     }
     
     return weights
