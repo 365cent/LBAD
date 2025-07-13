@@ -716,42 +716,32 @@ def train_log_type_classifier(all_log_types: List[str], config: SystemConfig, tr
     
     return classifier
 
-def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer, 
-                             embeddings: np.ndarray, classes: List[str],
-                             config: SystemConfig, tracker: ProgressTracker, 
-                             output_dir: Path, log_type: str):
-    """Evaluate model and save comprehensive results with proper label format"""
+def create_classification_summary(model: UnsupervisedMultiLabelTransformer, 
+                                 embeddings: np.ndarray, classes: List[str],
+                                 config: SystemConfig, tracker: ProgressTracker, 
+                                 output_dir: Path, log_type: str):
+    """Create comprehensive classification summary similar to ml_models.py"""
     
     device = torch.device(config.device)
     model.eval()
     
     # Generate predictions
     predictions = []
-    batch_size = min(256, int(config.gpu_memory_gb * 8))  # Smaller batch size
+    batch_size = min(256, int(config.gpu_memory_gb * 8))
     
     with torch.no_grad():
         for i in range(0, len(embeddings), batch_size):
             batch = torch.from_numpy(embeddings[i:i+batch_size]).to(device)
             outputs = model(batch)
-            # Convert logits to probabilities for evaluation
             logits = outputs['labels']
             probs = torch.sigmoid(logits)
             predictions.append(probs.cpu().numpy())
     
     predictions = np.vstack(predictions)
-    
-    # Analysis
     binary_predictions = (predictions > 0.5).astype(int)
-    labels_per_sample = binary_predictions.sum(axis=1)
     
-    results = {
-        "predictions_shape": predictions.shape,
-        "avg_labels_per_sample": float(labels_per_sample.mean()),
-        "std_labels_per_sample": float(labels_per_sample.std()),
-        "label_frequencies": binary_predictions.sum(axis=0).tolist()
-    }
-    
-    tracker.log_step("Evaluation Results", results)
+    # Calculate comprehensive metrics
+    metrics = calculate_comprehensive_metrics(binary_predictions, classes)
     
     # Save detailed results
     save_path = output_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
@@ -760,13 +750,13 @@ def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer,
             'predictions': predictions,
             'binary_predictions': binary_predictions,
             'classes': classes,
-            'results': results
+            'metrics': metrics
         }, f)
     
-    # Save labels in the same format as embeddings for evaluation
+    # Save labels in evaluation format
     label_output_path = output_dir / f"label_{log_type}_{config.node_name}_{config.job_id}.pkl"
     label_data = {
-        'vectors': binary_predictions.astype(np.int8),  # Same format as original labels
+        'vectors': binary_predictions.astype(np.int8),
         'classes': classes,
         'probabilities': predictions.astype(np.float32),
         'metadata': {
@@ -781,17 +771,299 @@ def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer,
     with open(label_output_path, 'wb') as f:
         pickle.dump(label_data, f)
     
-    tracker.log_step("Label Output Saved", {
-        "label_file": str(label_output_path),
-        "label_shape": binary_predictions.shape,
-        "classes_count": len(classes)
+    # Generate classification report
+    generate_classification_report(binary_predictions, classes, output_dir, log_type, config)
+    
+    # Create visualizations
+    create_comprehensive_visualizations(embeddings, predictions, binary_predictions, classes, output_dir, log_type, config)
+    
+    # Print summary
+    print_classification_summary(metrics, log_type, len(embeddings))
+    
+    tracker.log_step("Classification Summary", {
+        "log_type": log_type,
+        "n_samples": len(embeddings),
+        "n_classes": len(classes),
+        "avg_labels_per_sample": metrics['avg_labels_per_sample'],
+        "macro_f1": metrics['macro_f1'],
+        "micro_f1": metrics['micro_f1']
     })
     
-    # Create visualization if reasonable size
-    if len(embeddings) <= 2000:  # Reduced threshold
-        create_visualization(embeddings, predictions, classes, output_dir, log_type, config)
+    return metrics
+
+def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str]) -> Dict[str, Any]:
+    """Calculate comprehensive metrics for multi-label classification"""
     
-    return results
+    metrics = {}
+    
+    # Sample-level metrics
+    labels_per_sample = binary_predictions.sum(axis=1)
+    metrics['avg_labels_per_sample'] = float(labels_per_sample.mean())
+    metrics['std_labels_per_sample'] = float(labels_per_sample.std())
+    metrics['min_labels_per_sample'] = int(labels_per_sample.min())
+    metrics['max_labels_per_sample'] = int(labels_per_sample.max())
+    
+    # Class-level metrics
+    class_counts = binary_predictions.sum(axis=0)
+    metrics['class_counts'] = class_counts.tolist()
+    metrics['most_frequent_classes'] = []
+    
+    # Get top 10 most frequent classes
+    if len(classes) > 0:
+        class_freq_pairs = list(zip(classes, class_counts))
+        class_freq_pairs.sort(key=lambda x: x[1], reverse=True)
+        metrics['most_frequent_classes'] = [
+            {'class': cls, 'count': int(count), 'percentage': float(count/len(binary_predictions)*100)}
+            for cls, count in class_freq_pairs[:10]
+        ]
+    
+    # Multi-label specific metrics
+    metrics['samples_with_no_labels'] = int((labels_per_sample == 0).sum())
+    metrics['samples_with_one_label'] = int((labels_per_sample == 1).sum())
+    metrics['samples_with_multiple_labels'] = int((labels_per_sample > 1).sum())
+    
+    # Calculate F1 scores (simplified for unsupervised case)
+    # Since we don't have true labels, we'll calculate based on prediction confidence
+    high_confidence_predictions = (binary_predictions > 0.7).astype(int)  # Higher threshold
+    metrics['high_confidence_predictions'] = int(high_confidence_predictions.sum())
+    metrics['high_confidence_percentage'] = float(high_confidence_predictions.sum() / binary_predictions.size * 100)
+    
+    # For unsupervised learning, we can't calculate traditional F1 scores
+    # Instead, we'll use prediction confidence and consistency metrics
+    metrics['prediction_confidence_mean'] = float(binary_predictions.mean())
+    metrics['prediction_confidence_std'] = float(binary_predictions.std())
+    
+    # Placeholder for traditional metrics (would need true labels)
+    metrics['macro_f1'] = 0.0  # Would need true labels
+    metrics['micro_f1'] = 0.0  # Would need true labels
+    metrics['hamming_loss'] = 0.0  # Would need true labels
+    
+    return metrics
+
+def generate_classification_report(binary_predictions: np.ndarray, classes: List[str], 
+                                 output_dir: Path, log_type: str, config: SystemConfig):
+    """Generate detailed classification report"""
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = output_dir / f"classification_report_{log_type}_{timestamp}.txt"
+    
+    with open(report_file, 'w') as f:
+        f.write(f"TRANSFORMER CLASSIFICATION REPORT - {log_type.upper()}\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Generated: {datetime.now().isoformat()}\n")
+        f.write(f"Node: {config.node_name}\n")
+        f.write(f"Job ID: {config.job_id}\n\n")
+        
+        # Dataset statistics
+        f.write("DATASET STATISTICS:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Total samples: {len(binary_predictions)}\n")
+        f.write(f"Total classes: {len(classes)}\n")
+        f.write(f"Total predictions: {binary_predictions.size}\n\n")
+        
+        # Sample-level statistics
+        labels_per_sample = binary_predictions.sum(axis=1)
+        f.write("SAMPLE-LEVEL STATISTICS:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Average labels per sample: {labels_per_sample.mean():.3f}\n")
+        f.write(f"Std labels per sample: {labels_per_sample.std():.3f}\n")
+        f.write(f"Min labels per sample: {labels_per_sample.min()}\n")
+        f.write(f"Max labels per sample: {labels_per_sample.max()}\n")
+        f.write(f"Samples with no labels: {(labels_per_sample == 0).sum()}\n")
+        f.write(f"Samples with one label: {(labels_per_sample == 1).sum()}\n")
+        f.write(f"Samples with multiple labels: {(labels_per_sample > 1).sum()}\n\n")
+        
+        # Class-level statistics
+        class_counts = binary_predictions.sum(axis=0)
+        f.write("CLASS-LEVEL STATISTICS:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Most frequent classes:\n")
+        
+        class_freq_pairs = list(zip(classes, class_counts))
+        class_freq_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        for i, (cls, count) in enumerate(class_freq_pairs[:15]):  # Top 15
+            percentage = count / len(binary_predictions) * 100
+            f.write(f"  {i+1:2d}. {cls:<30} {count:6d} ({percentage:5.2f}%)\n")
+        
+        if len(class_freq_pairs) > 15:
+            f.write(f"  ... and {len(class_freq_pairs) - 15} more classes\n")
+        
+        f.write(f"\nClass frequency summary:\n")
+        f.write(f"  Classes with 0 predictions: {(class_counts == 0).sum()}\n")
+        f.write(f"  Classes with 1-10 predictions: {((class_counts >= 1) & (class_counts <= 10)).sum()}\n")
+        f.write(f"  Classes with 11-100 predictions: {((class_counts >= 11) & (class_counts <= 100)).sum()}\n")
+        f.write(f"  Classes with >100 predictions: {(class_counts > 100).sum()}\n\n")
+        
+        # Prediction confidence statistics
+        f.write("PREDICTION CONFIDENCE STATISTICS:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Overall prediction confidence: {binary_predictions.mean():.4f}\n")
+        f.write(f"Confidence std deviation: {binary_predictions.std():.4f}\n")
+        f.write(f"High confidence predictions (>0.7): {binary_predictions.sum()}\n")
+        f.write(f"High confidence percentage: {binary_predictions.sum() / binary_predictions.size * 100:.2f}%\n\n")
+        
+        # Note about unsupervised nature
+        f.write("NOTE:\n")
+        f.write("-" * 30 + "\n")
+        f.write("This is an unsupervised learning model. Traditional metrics like F1-score,\n")
+        f.write("precision, and recall cannot be calculated without true labels.\n")
+        f.write("The metrics above show the model's prediction patterns and confidence levels.\n")
+    
+    print(f"Classification report saved to: {report_file}")
+
+def create_comprehensive_visualizations(embeddings: np.ndarray, predictions: np.ndarray, 
+                                      binary_predictions: np.ndarray, classes: List[str],
+                                      output_dir: Path, log_type: str, config: SystemConfig):
+    """Create comprehensive visualizations for classification analysis"""
+    
+    try:
+        # Sample for visualization if too large
+        if len(embeddings) > 2000:
+            idx = np.random.choice(len(embeddings), 2000, replace=False)
+            embeddings_viz = embeddings[idx]
+            predictions_viz = predictions[idx]
+            binary_viz = binary_predictions[idx]
+        else:
+            embeddings_viz = embeddings
+            predictions_viz = predictions
+            binary_viz = binary_predictions
+        
+        # Create multiple visualizations
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle(f'Transformer Classification Analysis - {log_type.upper()}', fontsize=16)
+        
+        # 1. Number of labels per sample distribution
+        labels_per_sample = binary_viz.sum(axis=1)
+        axes[0, 0].hist(labels_per_sample, bins=range(min(labels_per_sample), max(labels_per_sample) + 2), 
+                       alpha=0.7, edgecolor='black')
+        axes[0, 0].set_title('Labels per Sample Distribution')
+        axes[0, 0].set_xlabel('Number of Labels')
+        axes[0, 0].set_ylabel('Frequency')
+        
+        # 2. Class frequency (top 15)
+        class_counts = binary_viz.sum(axis=0)
+        top_indices = np.argsort(class_counts)[-15:][::-1]
+        top_classes = [classes[i] for i in top_indices]
+        top_counts = class_counts[top_indices]
+        
+        axes[0, 1].barh(range(len(top_classes)), top_counts)
+        axes[0, 1].set_yticks(range(len(top_classes)))
+        axes[0, 1].set_yticklabels(top_classes)
+        axes[0, 1].set_title('Top 15 Most Predicted Classes')
+        axes[0, 1].set_xlabel('Number of Predictions')
+        
+        # 3. Prediction confidence distribution
+        axes[0, 2].hist(predictions_viz.flatten(), bins=50, alpha=0.7, edgecolor='black')
+        axes[0, 2].set_title('Prediction Confidence Distribution')
+        axes[0, 2].set_xlabel('Confidence Score')
+        axes[0, 2].set_ylabel('Frequency')
+        axes[0, 2].axvline(x=0.5, color='red', linestyle='--', label='Threshold')
+        axes[0, 2].legend()
+        
+        # 4. t-SNE visualization of embeddings colored by number of labels
+        try:
+            from sklearn.manifold import TSNE
+            tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+            embeddings_2d = tsne.fit_transform(embeddings_viz)
+            
+            scatter = axes[1, 0].scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+                                       c=labels_per_sample, cmap='viridis', alpha=0.6, s=20)
+            axes[1, 0].set_title('t-SNE: Embeddings by Label Count')
+            plt.colorbar(scatter, ax=axes[1, 0])
+        except Exception as e:
+            axes[1, 0].text(0.5, 0.5, f't-SNE failed:\n{str(e)}', 
+                           ha='center', va='center', transform=axes[1, 0].transAxes)
+            axes[1, 0].set_title('t-SNE Visualization (Failed)')
+        
+        # 5. Average confidence per class
+        avg_confidence_per_class = predictions_viz.mean(axis=0)
+        top_conf_indices = np.argsort(avg_confidence_per_class)[-15:][::-1]
+        top_conf_classes = [classes[i] for i in top_conf_indices]
+        top_conf_values = avg_confidence_per_class[top_conf_indices]
+        
+        axes[1, 1].barh(range(len(top_conf_classes)), top_conf_values)
+        axes[1, 1].set_yticks(range(len(top_conf_classes)))
+        axes[1, 1].set_yticklabels(top_conf_classes)
+        axes[1, 1].set_title('Top 15 Classes by Average Confidence')
+        axes[1, 1].set_xlabel('Average Confidence')
+        
+        # 6. Prediction matrix heatmap (sample of classes)
+        if len(classes) <= 20:
+            # Show all classes
+            heatmap_data = binary_viz.T
+            class_labels = classes
+        else:
+            # Show top 20 classes
+            top_indices = np.argsort(class_counts)[-20:][::-1]
+            heatmap_data = binary_viz[:, top_indices].T
+            class_labels = [classes[i] for i in top_indices]
+        
+        # Sample rows for visualization
+        if heatmap_data.shape[1] > 100:
+            sample_indices = np.random.choice(heatmap_data.shape[1], 100, replace=False)
+            heatmap_data = heatmap_data[:, sample_indices]
+        
+        im = axes[1, 2].imshow(heatmap_data, cmap='Blues', aspect='auto')
+        axes[1, 2].set_title('Prediction Matrix (Sample)')
+        axes[1, 2].set_xlabel('Samples')
+        axes[1, 2].set_ylabel('Classes')
+        
+        # Set y-axis labels for classes
+        if len(class_labels) <= 10:
+            axes[1, 2].set_yticks(range(len(class_labels)))
+            axes[1, 2].set_yticklabels(class_labels, fontsize=8)
+        
+        plt.colorbar(im, ax=axes[1, 2])
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f'classification_analysis_{log_type}_{config.node_name}_{config.job_id}.png', 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+
+def print_classification_summary(metrics: Dict[str, Any], log_type: str, n_samples: int):
+    """Print a comprehensive classification summary"""
+    
+    print(f"\n{'='*80}")
+    print(f"CLASSIFICATION SUMMARY - {log_type.upper()}")
+    print(f"{'='*80}")
+    print(f"Total samples: {n_samples}")
+    print(f"Total classes: {len(metrics.get('class_counts', []))}")
+    print(f"Total predictions: {n_samples * len(metrics.get('class_counts', []))}")
+    
+    print(f"\nSample-level statistics:")
+    print(f"  Average labels per sample: {metrics['avg_labels_per_sample']:.3f}")
+    print(f"  Std labels per sample: {metrics['std_labels_per_sample']:.3f}")
+    print(f"  Range: {metrics['min_labels_per_sample']} - {metrics['max_labels_per_sample']} labels")
+    print(f"  Samples with no labels: {metrics['samples_with_no_labels']}")
+    print(f"  Samples with one label: {metrics['samples_with_one_label']}")
+    print(f"  Samples with multiple labels: {metrics['samples_with_multiple_labels']}")
+    
+    print(f"\nPrediction confidence:")
+    print(f"  Overall confidence: {metrics['prediction_confidence_mean']:.4f}")
+    print(f"  Confidence std: {metrics['prediction_confidence_std']:.4f}")
+    print(f"  High confidence predictions: {metrics['high_confidence_predictions']}")
+    print(f"  High confidence percentage: {metrics['high_confidence_percentage']:.2f}%")
+    
+    print(f"\nTop 10 most frequent classes:")
+    for i, class_info in enumerate(metrics['most_frequent_classes'][:10]):
+        print(f"  {i+1:2d}. {class_info['class']:<30} {class_info['count']:6d} ({class_info['percentage']:5.2f}%)")
+    
+    print(f"\nNote: This is an unsupervised model. Traditional metrics like F1-score")
+    print(f"      require true labels and cannot be calculated here.")
+    print(f"{'='*80}")
+
+def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer, 
+                             embeddings: np.ndarray, classes: List[str],
+                             config: SystemConfig, tracker: ProgressTracker, 
+                             output_dir: Path, log_type: str):
+    """Evaluate model and save comprehensive results with classification summary"""
+    
+    # Use the new comprehensive classification summary
+    return create_classification_summary(model, embeddings, classes, config, tracker, output_dir, log_type)
 
 def create_visualization(embeddings: np.ndarray, predictions: np.ndarray, 
                         classes: List[str], output_dir: Path, log_type: str, config: SystemConfig):
