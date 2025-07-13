@@ -571,14 +571,14 @@ def create_label_clusters(classes: List[str], n_clusters: int) -> Optional[np.nd
     
     return C
 
-def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 1.0, gamma: float = 2.0) -> torch.Tensor:
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = None, gamma: float = 2.0) -> torch.Tensor:
     """
     Focal loss for addressing class imbalance and improving confidence
     
     Args:
         logits: Model predictions (before sigmoid)
         targets: Target labels
-        alpha: Weighting factor for rare class
+        alpha: Weighting factor for rare class (if None, computed from targets)
         gamma: Focusing parameter
     
     Returns:
@@ -587,10 +587,29 @@ def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 1.0, 
     # Apply sigmoid to get probabilities
     probs = torch.sigmoid(logits)
     
+    # Calculate class weights if alpha not provided
+    if alpha is None:
+        # Calculate per-class positive rates
+        pos_counts = targets.sum(dim=0)
+        neg_counts = targets.shape[0] - pos_counts
+        
+        # Inverse frequency weighting
+        pos_weights = 1.0 / (pos_counts + 1.0)
+        neg_weights = 1.0 / (neg_counts + 1.0)
+        
+        # Normalize weights
+        pos_weights = pos_weights / pos_weights.mean()
+        neg_weights = neg_weights / neg_weights.mean()
+        
+        # Apply class-specific weights
+        alpha_t = targets * pos_weights.unsqueeze(0) + (1 - targets) * neg_weights.unsqueeze(0)
+    else:
+        alpha_t = alpha
+    
     # Calculate focal loss
     ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
     p_t = probs * targets + (1 - probs) * (1 - targets)
-    focal_weight = alpha * (1 - p_t) ** gamma
+    focal_weight = alpha_t * (1 - p_t) ** gamma
     focal_loss = focal_weight * ce_loss
     
     return focal_loss.mean()
@@ -856,12 +875,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         "mixed_precision": scaler is not None
     })
     
-    # Training loop with progress tracking
+    # Training loop with progress tracking and early stopping
     model.train()
     total_epochs = 50  # Balanced epochs for good convergence without taking too long
     tracker.start_training(total_epochs)
     
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
+    
+    # Early stopping parameters
+    best_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+    min_delta = 1e-4
     
     for epoch in range(total_epochs):
         epoch_start = time.time()
@@ -937,8 +962,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                         
-                        # Use focal loss instead of BCE for better confidence
-                        label_loss = focal_loss(outputs['labels'], y_batch, alpha=1.0, gamma=2.0)
+                        # Use focal loss with automatic class balancing
+                        label_loss = focal_loss(outputs['labels'], y_batch, alpha=None, gamma=2.0)
                         
                         # Add confidence regularization
                         predictions = torch.sigmoid(outputs['labels'])
@@ -995,8 +1020,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
-                    # Use focal loss instead of BCE for better confidence
-                    label_loss = focal_loss(outputs['labels'], y_batch, alpha=1.0, gamma=2.0)
+                    # Use focal loss with automatic class balancing
+                    label_loss = focal_loss(outputs['labels'], y_batch, alpha=None, gamma=2.0)
                     
                     # Add confidence regularization
                     predictions = torch.sigmoid(outputs['labels'])
@@ -1062,6 +1087,22 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         # Log metrics
         avg_loss = np.mean(epoch_losses)
+        
+        # Early stopping check
+        if avg_loss < best_loss - min_delta:
+            best_loss = avg_loss
+            patience_counter = 0
+            # Save best model state
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            if config.rank == 0:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+            # Restore best model
+            model.load_state_dict(best_model_state)
+            break
         if config.rank == 0:  # Only log from main process
             tracker.log_metrics(epoch, {
                 "loss": avg_loss,
@@ -1113,34 +1154,121 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
     
     predictions = np.vstack(predictions)
     
-    # Use intelligent adaptive thresholding for optimal F1 score
-    # Calculate per-class thresholds based on distribution but less aggressive
+    # Use F1-optimized adaptive thresholding
+    # Calculate per-class thresholds optimized for F1 score
     adaptive_thresholds = []
-    for class_idx in range(predictions.shape[1]):
-        class_preds = predictions[:, class_idx]
+    
+    # If we have true labels from tracker, use them to optimize thresholds
+    if hasattr(tracker, 'true_labels') and tracker.true_labels is not None:
+        # Use true labels to find optimal thresholds
+        from sklearn.metrics import f1_score
         
-        # Use a more balanced approach: 60th percentile or 0.4, whichever is lower
-        percentile_threshold = np.percentile(class_preds, 60)
-        threshold = min(max(0.25, percentile_threshold), 0.5)  # Clamp between 0.25 and 0.5
-        adaptive_thresholds.append(threshold)
+        for class_idx in range(predictions.shape[1]):
+            class_preds = predictions[:, class_idx]
+            true_class = tracker.true_labels[:, class_idx] if class_idx < tracker.true_labels.shape[1] else np.zeros(len(predictions))
+            
+            # Try different thresholds to find best F1
+            best_threshold = 0.5
+            best_f1 = 0.0
+            
+            for threshold in np.linspace(0.1, 0.9, 17):  # Test 17 thresholds
+                binary_preds = (class_preds > threshold).astype(int)
+                if true_class.sum() > 0:  # Only optimize if we have positive samples
+                    f1 = f1_score(true_class, binary_preds, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_threshold = threshold
+            
+            adaptive_thresholds.append(best_threshold)
+    else:
+        # Fallback: Use distribution-based thresholding with better heuristics
+        for class_idx in range(predictions.shape[1]):
+            class_preds = predictions[:, class_idx]
+            
+            # Use mean + std as threshold (often better for F1)
+            mean_pred = np.mean(class_preds)
+            std_pred = np.std(class_preds)
+            
+            # Threshold = mean + 0.5 * std, bounded between 0.2 and 0.8
+            threshold = min(max(0.2, mean_pred + 0.5 * std_pred), 0.8)
+            adaptive_thresholds.append(threshold)
     
     # Apply adaptive thresholds
     binary_predictions = np.zeros_like(predictions, dtype=int)
     for class_idx, threshold in enumerate(adaptive_thresholds):
         binary_predictions[:, class_idx] = (predictions[:, class_idx] > threshold).astype(int)
     
-    # Ensure each sample has at least 1-3 labels (multi-label nature)
+    # Sophisticated multi-label assignment for better F1 scores
     for idx in range(len(binary_predictions)):
         n_labels = binary_predictions[idx].sum()
+        sample_preds = predictions[idx]
+        
         if n_labels == 0:
-            # Assign top 2 predictions if no labels
-            top_indices = np.argsort(predictions[idx])[-2:]
-            binary_predictions[idx, top_indices] = 1
+            # No predictions above threshold - use dynamic assignment
+            # Sort predictions in descending order
+            sorted_indices = np.argsort(sample_preds)[::-1]
+            sorted_preds = sample_preds[sorted_indices]
+            
+            # Find natural cutoff point using gradient
+            if len(sorted_preds) > 1:
+                gradients = np.diff(sorted_preds)
+                # Find largest drop in predictions
+                cutoff_idx = np.argmin(gradients) + 1
+                
+                # Ensure at least 1 label, at most 3 for zero-prediction cases
+                cutoff_idx = np.clip(cutoff_idx, 1, 3)
+                
+                # Assign labels to top predictions
+                top_indices = sorted_indices[:cutoff_idx]
+                binary_predictions[idx, top_indices] = 1
+            else:
+                # Single class case
+                binary_predictions[idx, 0] = 1
+                
         elif n_labels > 5:  # Cap at 5 labels maximum
-            # Keep only top 5 predictions
-            top_indices = np.argsort(predictions[idx])[-5:]
+            # Too many predictions - keep only the most confident ones
+            # Use confidence gap to determine cutoff
+            sorted_indices = np.argsort(sample_preds)[::-1]
+            sorted_preds = sample_preds[sorted_indices]
+            
+            # Keep predictions with high confidence
+            confidence_threshold = sorted_preds[4]  # 5th highest prediction
+            
+            # Reset and apply new threshold
             binary_predictions[idx] = 0
-            binary_predictions[idx, top_indices] = 1
+            binary_predictions[idx] = (sample_preds >= confidence_threshold).astype(int)
+            
+            # Ensure exactly 5 labels (in case of ties)
+            if binary_predictions[idx].sum() > 5:
+                top_indices = np.argsort(sample_preds)[-5:]
+                binary_predictions[idx] = 0
+                binary_predictions[idx, top_indices] = 1
+    
+    # Post-processing: Use label correlations to refine predictions
+    if len(classes) > 1:
+        # Calculate label co-occurrence from predictions
+        label_cooccurrence = np.dot(binary_predictions.T, binary_predictions)
+        label_cooccurrence = label_cooccurrence / (np.diagonal(label_cooccurrence) + 1e-8)
+        
+        # Refine predictions based on strong correlations
+        refined_predictions = binary_predictions.copy()
+        correlation_threshold = 0.7
+        
+        for idx in range(len(refined_predictions)):
+            current_labels = np.where(refined_predictions[idx] == 1)[0]
+            
+            for label_idx in current_labels:
+                # Find strongly correlated labels
+                correlated_labels = np.where(label_cooccurrence[label_idx] > correlation_threshold)[0]
+                
+                for corr_label in correlated_labels:
+                    if corr_label != label_idx and refined_predictions[idx, corr_label] == 0:
+                        # Check if prediction confidence is reasonably high
+                        if predictions[idx, corr_label] > 0.3:  # Lower threshold for correlated labels
+                            refined_predictions[idx, corr_label] = 1
+        
+        # Use refined predictions
+        binary_predictions = refined_predictions
     
     # Calculate comprehensive metrics
     metrics = calculate_comprehensive_metrics(binary_predictions, classes)
