@@ -512,6 +512,9 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
     with open(results_file, 'wb') as f:
         pickle.dump(results, f)
     
+    # Generate classification reports
+    classification_reports = {}
+    
     # Save labels in evaluation format
     if len(results['label_predictions']) > 0:
         # Check if we have unified predictions or separate structures
@@ -547,7 +550,15 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
             for log_type in results['log_type_counts'].keys():
                 if log_type in results['per_log_type_results']:
                     predictions = results['per_log_type_results'][log_type]
-                    probabilities = results['probabilities'][log_type]
+                    
+                    # Get probabilities for this log type from the detailed results
+                    log_type_probabilities = []
+                    for result in results['detailed_results']:
+                        if result['log_type'] == log_type:
+                            log_type_probabilities.append(result['probabilities'])
+                    
+                    if log_type_probabilities:
+                        log_type_probabilities = np.array(log_type_probabilities)
                     
                     # Get classes for this log type
                     log_type_classes = None
@@ -560,7 +571,7 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
                         label_data = {
                             'vectors': predictions.astype(np.int8),
                             'classes': log_type_classes,
-                            'probabilities': probabilities.astype(np.float32),
+                            'probabilities': log_type_probabilities.astype(np.float32) if len(log_type_probabilities) > 0 else np.array([]),
                             'log_type': log_type,
                             'metadata': {
                                 'timestamp': datetime.now().isoformat(),
@@ -577,6 +588,30 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
                             pickle.dump(label_data, f)
                         
                         print(f"Labels for {log_type} saved to: {label_file}")
+                        
+                        # Generate classification report for this log type
+                        try:
+                            from sklearn.metrics import classification_report
+                            # For multi-label, we'll create a simple report
+                            report_data = {
+                                'n_samples': len(predictions),
+                                'n_classes': len(log_type_classes),
+                                'classes': log_type_classes,
+                                'label_counts': predictions.sum(axis=0).tolist(),
+                                'avg_labels_per_sample': float(predictions.sum(axis=1).mean()),
+                                'max_labels_per_sample': int(predictions.sum(axis=1).max()),
+                                'min_labels_per_sample': int(predictions.sum(axis=1).min())
+                            }
+                            classification_reports[log_type] = report_data
+                        except Exception as e:
+                            print(f"Warning: Could not generate classification report for {log_type}: {e}")
+    
+    # Save classification reports
+    if classification_reports:
+        report_file = output_dir / f"classification_reports_{timestamp}.json"
+        with open(report_file, 'w') as f:
+            json.dump(classification_reports, f, indent=2)
+        print(f"Classification reports saved to: {report_file}")
     
     # Print summary
     print(f"\n{'='*60}")
@@ -607,6 +642,16 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
                     predictions = results['per_log_type_results'][log_type]
                     avg_labels = np.mean(predictions.sum(axis=1))
                     print(f"  {log_type}: {count} samples, {avg_labels:.2f} avg labels")
+    
+    # Print classification report summary
+    if classification_reports:
+        print(f"\nClassification Report Summary:")
+        for log_type, report in classification_reports.items():
+            print(f"  {log_type}:")
+            print(f"    Samples: {report['n_samples']}")
+            print(f"    Classes: {report['n_classes']}")
+            print(f"    Avg labels per sample: {report['avg_labels_per_sample']:.2f}")
+            print(f"    Label range: {report['min_labels_per_sample']}-{report['max_labels_per_sample']}")
     
     print(f"\nResults saved to: {results_file}")
     print(f"{'='*60}")
