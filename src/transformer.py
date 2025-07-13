@@ -13,6 +13,10 @@ Optimized for Research Alliance of Canada Nibi node:
 - Stable results with deterministic training
 - Proper label output format for evaluation
 - Separate models per log type (each log file has only one type)
+- Automatic adaptation to different embedding types:
+  * FastText: 300D embeddings
+  * BERT CLS: 768D embeddings
+  * Enhanced LogBERT: 2314D embeddings (CLS + mean + max + attention)
 """
 
 import os
@@ -180,7 +184,13 @@ class OptimizedTransformerBlock(nn.Module):
 # Log type classifier removed - each log file can only be one type
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
-    """Ultra-powerful transformer for unsupervised multi-label learning optimized for H100 GPU"""
+    """Ultra-powerful transformer for unsupervised multi-label learning optimized for H100 GPU
+    
+    Automatically adapts to different embedding dimensions:
+    - 300D: FastText embeddings
+    - 768D: BERT CLS token embeddings
+    - 2314D: Enhanced LogBERT embeddings (CLS + mean + max + attention)
+    """
     
     def __init__(self, input_dim: int, latent_dim: int, n_labels: int, 
                  n_clusters: int, dropout: float = 0.1):
@@ -511,8 +521,16 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             "note": "All logs treated as normal/benign"
         })
     
-    # Aggressive subsampling for memory efficiency
-    max_samples = min(50000, int(config.gpu_memory_gb * 500))  # Much smaller for memory safety
+    # Aggressive subsampling for memory efficiency - adaptive based on embedding size
+    embedding_dim = embeddings.shape[1]
+    if embedding_dim <= 300:  # FastText
+        samples_per_gb = 500
+    elif embedding_dim <= 768:  # Standard BERT
+        samples_per_gb = 200
+    else:  # Enhanced LogBERT (2314D)
+        samples_per_gb = 70  # Much fewer samples due to larger embeddings
+    
+    max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))
     if len(embeddings) > max_samples:
         indices = np.random.choice(len(embeddings), max_samples, replace=False)
         embeddings = embeddings[indices]
@@ -521,7 +539,9 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
         tracker.log_step("Data Subsampling", {
             "original_size": len(embeddings),
             "subsampled_size": max_samples,
-            "memory_gb": embeddings.nbytes / (1024**3)
+            "memory_gb": embeddings.nbytes / (1024**3),
+            "embedding_dim": embedding_dim,
+            "samples_per_gb": samples_per_gb
         })
     
     # Normalize with robust scaling to handle outliers better
@@ -848,15 +868,37 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     device = torch.device(config.device)
     n_labels = len(classes) if classes else 1
     n_clusters = C.shape[1] if C is not None else 1
-    latent_dim = min(256, embeddings.shape[1])  # Reduced latent dimension
     
-    # Model setup
+    # Adaptive latent dimension based on embedding size
+    if embeddings.shape[1] <= 300:  # FastText
+        latent_dim = min(256, embeddings.shape[1])
+    elif embeddings.shape[1] <= 768:  # Standard BERT
+        latent_dim = 384  # Half of BERT dimension
+    else:  # Enhanced LogBERT (2314D)
+        latent_dim = 512  # Larger latent space for richer embeddings
+    
+    # Model setup - automatically adapts to embedding dimension (300D FastText or 2314D LogBERT)
     model = UnsupervisedMultiLabelTransformer(
         input_dim=embeddings.shape[1],
         latent_dim=latent_dim,
         n_labels=n_labels,
         n_clusters=n_clusters
     ).to(device)
+    
+    # Log embedding type based on dimension
+    embedding_type = "Unknown"
+    if embeddings.shape[1] == 300:
+        embedding_type = "FastText (300D)"
+    elif embeddings.shape[1] == 768:
+        embedding_type = "BERT CLS only (768D)"
+    elif embeddings.shape[1] == 2314:
+        embedding_type = "Enhanced LogBERT (2314D)"
+    
+    tracker.log_step("Embedding Type Detected", {
+        "embedding_dim": embeddings.shape[1],
+        "embedding_type": embedding_type,
+        "note": "Model automatically adapts to input dimension"
+    })
     
     # Multi-GPU setup
     if config.is_distributed:
@@ -878,7 +920,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     )
     
     sampler = DistributedSampler(dataset) if config.is_distributed else None
-    batch_size = min(128, max(16, int(config.gpu_memory_gb * 2)))  # Much smaller batch size
+    
+    # Adaptive batch size based on embedding dimension and GPU memory
+    if embeddings.shape[1] <= 300:  # FastText
+        batch_size = min(128, max(16, int(config.gpu_memory_gb * 2)))
+    elif embeddings.shape[1] <= 768:  # Standard BERT
+        batch_size = min(64, max(8, int(config.gpu_memory_gb * 1.5)))
+    else:  # Enhanced LogBERT (2314D)
+        batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.8)))
     
     dataloader = DataLoader(
         dataset, 
@@ -908,9 +957,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
+        "input_dim": embeddings.shape[1],
+        "latent_dim": latent_dim,
+        "n_labels": n_labels,
+        "n_clusters": n_clusters,
         "batch_size": batch_size,
         "device": str(device),
-        "mixed_precision": scaler is not None
+        "mixed_precision": scaler is not None,
+        "embedding_type": embedding_type
     })
     
     # Training loop with progress tracking and early stopping
