@@ -292,6 +292,64 @@ class TwoStagePredictor:
         
         print(f"Loaded {len(self.label_models)} label prediction models")
     
+    def predict_single_log_type(self, embeddings: np.ndarray, log_type: str) -> Dict[str, Any]:
+        """Direct prediction for a specific log type (more efficient and accurate)"""
+        if log_type not in self.label_models:
+            raise ValueError(f"No model found for log type '{log_type}'")
+        
+        print(f"Direct prediction for log type: {log_type}")
+        
+        # Get model and classes
+        model_info = self.label_models[log_type]
+        model = model_info['model']
+        classes = model_info['classes']
+        scaler = model_info['scaler']
+        
+        # Normalize embeddings
+        if scaler is not None:
+            embeddings_norm = scaler.transform(embeddings).astype(np.float32)
+        else:
+            embeddings_norm = embeddings.astype(np.float32)
+        
+        # Predict
+        predictions = []
+        batch_size = 256
+        
+        with torch.no_grad():
+            for i in range(0, len(embeddings_norm), batch_size):
+                batch = torch.from_numpy(embeddings_norm[i:i+batch_size]).to(self.device)
+                outputs = model(batch)
+                logits = outputs['labels']
+                probs = torch.sigmoid(logits)
+                predictions.append(probs.cpu().numpy())
+        
+        predictions = np.vstack(predictions)
+        binary_predictions = (predictions > 0.5).astype(int)
+        
+        # Create results
+        results = {
+            'log_types': np.full(len(embeddings), log_type),
+            'log_type_probabilities': np.ones((len(embeddings), 1)),  # 100% confidence
+            'label_predictions': binary_predictions,
+            'label_probabilities': predictions,
+            'label_classes': [classes] * len(embeddings),
+            'log_type_counts': {log_type: len(embeddings)},
+            'per_log_type_results': {log_type: binary_predictions},
+            'detailed_results': []
+        }
+        
+        # Create detailed results
+        for i in range(len(embeddings)):
+            results['detailed_results'].append({
+                'index': i,
+                'log_type': log_type,
+                'predictions': binary_predictions[i],
+                'probabilities': predictions[i],
+                'classes': classes
+            })
+        
+        return results
+    
     def predict_log_type(self, embeddings: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Stage 1: Predict log type for each embedding"""
         if self.log_type_classifier is None:
@@ -396,51 +454,59 @@ class TwoStagePredictor:
         
         return results
     
-    def predict(self, embeddings: np.ndarray) -> Dict[str, Any]:
-        """Complete two-stage prediction pipeline"""
-        print("Stage 1: Predicting log types...")
-        log_types, log_type_probs = self.predict_log_type(embeddings)
+    def predict(self, embeddings: np.ndarray, target_log_type: str = None) -> Dict[str, Any]:
+        """Complete prediction pipeline - direct or two-stage based on target_log_type"""
         
-        print("Stage 2: Predicting labels...")
-        label_results = self.predict_labels(embeddings, log_types)
-        
-        # Create unified results format
-        n_samples = len(embeddings)
-        
-        # Initialize unified arrays
-        unified_predictions = []
-        unified_probabilities = []
-        unified_classes = []
-        
-        # Sort results by original index to maintain order
-        sorted_results = sorted(label_results['all_predictions'], key=lambda x: x['index'])
-        
-        for result in sorted_results:
-            unified_predictions.append(result['predictions'])
-            unified_probabilities.append(result['probabilities'])
-            unified_classes.append(result['classes'])
-        
-        # Convert to arrays if all have same shape
-        try:
-            unified_predictions = np.array(unified_predictions)
-            unified_probabilities = np.array(unified_probabilities)
-        except ValueError:
-            # If shapes are different, keep as list
-            print("Warning: Different log types have different numbers of classes. Keeping predictions as separate structures.")
-        
-        # Combine results
-        results = {
-            'log_types': log_types,
-            'log_type_probabilities': log_type_probs,
-            'label_predictions': unified_predictions,
-            'label_probabilities': unified_probabilities,
-            'label_classes': unified_classes,
-            'log_type_counts': label_results['log_type_counts'],
-            'per_log_type_results': label_results['predictions'],
-            'detailed_results': label_results['all_predictions']
-        }
-        
-        return results
+        if target_log_type and target_log_type in self.label_models:
+            # Direct prediction for specific log type (more efficient and accurate)
+            print(f"Using direct prediction for log type: {target_log_type}")
+            return self.predict_single_log_type(embeddings, target_log_type)
+        else:
+            # Two-stage prediction for unknown or mixed log types
+            print("Using two-stage prediction (log type -> labels)")
+            print("Stage 1: Predicting log types...")
+            log_types, log_type_probs = self.predict_log_type(embeddings)
+            
+            print("Stage 2: Predicting labels...")
+            label_results = self.predict_labels(embeddings, log_types)
+            
+            # Create unified results format
+            n_samples = len(embeddings)
+            
+            # Initialize unified arrays
+            unified_predictions = []
+            unified_probabilities = []
+            unified_classes = []
+            
+            # Sort results by original index to maintain order
+            sorted_results = sorted(label_results['all_predictions'], key=lambda x: x['index'])
+            
+            for result in sorted_results:
+                unified_predictions.append(result['predictions'])
+                unified_probabilities.append(result['probabilities'])
+                unified_classes.append(result['classes'])
+            
+            # Convert to arrays if all have same shape
+            try:
+                unified_predictions = np.array(unified_predictions)
+                unified_probabilities = np.array(unified_probabilities)
+            except ValueError:
+                # If shapes are different, keep as list
+                print("Warning: Different log types have different numbers of classes. Keeping predictions as separate structures.")
+            
+            # Combine results
+            results = {
+                'log_types': log_types,
+                'log_type_probabilities': log_type_probs,
+                'label_predictions': unified_predictions,
+                'label_probabilities': unified_probabilities,
+                'label_classes': unified_classes,
+                'log_type_counts': label_results['log_type_counts'],
+                'per_log_type_results': label_results['predictions'],
+                'detailed_results': label_results['all_predictions']
+            }
+            
+            return results
 
 # =============================================================================
 # Main Prediction Function
@@ -486,9 +552,22 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
     if not models_dir.exists():
         raise FileNotFoundError("Models directory not found. Please train models first.")
     
-    # Find the actual embedding file
+    # Find the actual embedding file and determine target log type
     actual_embeddings_path = find_embedding_file(embeddings_path)
     print(f"Loading embeddings from: {actual_embeddings_path}")
+    
+    # Extract target log type from the path
+    target_log_type = None
+    if "/" in actual_embeddings_path:
+        # Extract log type from path like "embeddings/wp-error/log_wp-error.pkl"
+        path_parts = actual_embeddings_path.split("/")
+        for part in path_parts:
+            if part in ["wp-error", "wp-access", "all_combined"]:
+                target_log_type = part
+                break
+    
+    if target_log_type:
+        print(f"Detected target log type: {target_log_type}")
     
     # Load embeddings
     with open(actual_embeddings_path, 'rb') as f:
@@ -501,7 +580,7 @@ def predict_on_embeddings(embeddings_path: str, output_dir: str = "predictions")
     
     # Run prediction
     start_time = time.time()
-    results = predictor.predict(embeddings)
+    results = predictor.predict(embeddings, target_log_type)
     prediction_time = time.time() - start_time
     
     # Save results
