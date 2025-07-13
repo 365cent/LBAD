@@ -12,7 +12,7 @@ Optimized for Research Alliance of Canada Nibi node:
 - Performance profiling and optimization
 - Stable results with deterministic training
 - Proper label output format for evaluation
-- Separate models per log type with log type classifier
+- Separate models per log type (each log file has only one type)
 """
 
 import os
@@ -177,33 +177,7 @@ class OptimizedTransformerBlock(nn.Module):
         
         return x
 
-class LogTypeClassifier(nn.Module):
-    """Simple classifier to predict log type from embeddings"""
-    
-    def __init__(self, input_dim: int, n_log_types: int, dropout: float = 0.1):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim // 2, input_dim // 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim // 4, n_log_types)
-        )
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        """Initialize weights for stable training"""
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-    
-    def forward(self, x):
-        return self.classifier(x)
+# Log type classifier removed - each log file can only be one type
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
     """Optimized transformer for unsupervised multi-label learning on Nibi"""
@@ -693,6 +667,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     true_labels = getattr(tracker, 'true_labels', None)
     pseudo_labels = generate_pseudo_labels(embeddings, classes, true_labels=true_labels)
     
+    # Store initial pseudo-labels for refinement
+    current_pseudo_labels = pseudo_labels.copy()
+    
     # Data setup
     dataset = TensorDataset(
         torch.from_numpy(embeddings),
@@ -725,11 +702,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Training loop with progress tracking
     model.train()
-    total_epochs = 100  # Increased epochs for better convergence with contrastive learning
+    total_epochs = 50  # Balanced epochs for good convergence without taking too long
     tracker.start_training(total_epochs)
     
-    # Store initial pseudo-labels for refinement
-    current_pseudo_labels = pseudo_labels.copy()
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
     
     for epoch in range(total_epochs):
@@ -888,107 +863,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     return model, None  # Return None for scaler placeholder
 
-def train_log_type_classifier(all_log_types: List[str], config: SystemConfig, tracker: ProgressTracker) -> LogTypeClassifier:
-    """Train a classifier to predict log type from embeddings"""
-    
-    device = torch.device(config.device)
-    
-    # Load a small sample from each log type to train the classifier
-    embeddings_list = []
-    labels_list = []
-    
-    embeddings_dir = Path("embeddings")
-    
-    for log_type in all_log_types:
-        log_file = embeddings_dir / log_type / f"log_{log_type}.pkl"
-        if log_file.exists():
-            with open(log_file, 'rb') as f:
-                embeddings = pickle.load(f)
-            
-            # Sample a small amount from each type
-            sample_size = min(1000, len(embeddings))
-            if len(embeddings) > sample_size:
-                indices = np.random.choice(len(embeddings), sample_size, replace=False)
-                embeddings = embeddings[indices]
-            
-            embeddings_list.append(embeddings)
-            labels_list.extend([log_type] * len(embeddings))
-    
-    if not embeddings_list:
-        raise ValueError("No valid embedding files found for log type classifier")
-    
-    # Combine all embeddings
-    all_embeddings = np.vstack(embeddings_list)
-    
-    # Create label mapping
-    unique_log_types = list(set(labels_list))
-    log_type_to_idx = {log_type: idx for idx, log_type in enumerate(unique_log_types)}
-    labels = np.array([log_type_to_idx[label] for label in labels_list])
-    
-    # Normalize embeddings
-    scaler = StandardScaler()
-    all_embeddings = scaler.fit_transform(all_embeddings).astype(np.float32)
-    
-    # Create dataset
-    dataset = TensorDataset(
-        torch.from_numpy(all_embeddings),
-        torch.from_numpy(labels)
-    )
-    
-    batch_size = min(64, len(dataset))
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    
-    # Create and train classifier
-    classifier = LogTypeClassifier(
-        input_dim=all_embeddings.shape[1],
-        n_log_types=len(unique_log_types)
-    ).to(device)
-    
-    optimizer = optim.AdamW(classifier.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    
-    tracker.log_step("Log Type Classifier Training", {
-        "n_log_types": len(unique_log_types),
-        "total_samples": len(all_embeddings),
-        "log_types": unique_log_types
-    })
-    
-    # Train for a few epochs
-    classifier.train()
-    for epoch in range(10):
-        epoch_loss = 0
-        for x_batch, y_batch in dataloader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            
-            optimizer.zero_grad()
-            outputs = classifier(x_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-        
-        if epoch % 5 == 0:
-            print(f"Log Type Classifier Epoch {epoch+1}/10 - Loss: {epoch_loss/len(dataloader):.4f}")
-    
-    # Save classifier and mapping
-    classifier_path = Path("models") / f"log_type_classifier_{config.node_name}_{config.job_id}.pth"
-    classifier_path.parent.mkdir(exist_ok=True)
-    
-    torch.save({
-        'model_state_dict': classifier.state_dict(),
-        'log_type_to_idx': log_type_to_idx,
-        'idx_to_log_type': unique_log_types,
-        'scaler': scaler
-    }, classifier_path)
-    
-    tracker.log_step("Log Type Classifier Saved", {
-        "classifier_path": str(classifier_path),
-        "n_log_types": len(unique_log_types)
-    })
-    
-    return classifier
+# Log type classifier function removed - each log file can only be one type
 
 def create_classification_summary(model: UnsupervisedMultiLabelTransformer, 
                                  embeddings: np.ndarray, classes: List[str],
@@ -1475,15 +1350,11 @@ def main():
             print(f"  Job ID: {config.job_id}")
             print(f"Available types: {available_types}")
         
-        # Train log type classifier first
+        # Skip log type classifier since each log file can only be one type
         if config.rank == 0:
             print(f"\n{'='*60}")
-            print("Training Log Type Classifier")
+            print("Processing individual log types")
             print(f"{'='*60}")
-            
-            tracker = ProgressTracker(Path("results"), "log_type_classifier", config)
-            log_type_classifier = train_log_type_classifier(available_types, config, tracker)
-            print("Log type classifier training completed!")
         
         # Process each log type
         total_types = len(available_types)
@@ -1515,7 +1386,6 @@ def main():
             print(f"Results saved to: results/")
             print(f"Models saved to: models/")
             print(f"Labels saved in evaluation format to: results/*/label_*.pkl")
-            print(f"Log type classifier saved to: models/log_type_classifier_*.pth")
             print(f"{'='*60}")
     
     except Exception as e:
