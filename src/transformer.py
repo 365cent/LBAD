@@ -670,10 +670,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Store initial pseudo-labels for refinement
     current_pseudo_labels = pseudo_labels.copy()
     
-    # Data setup
+    # Data setup - ensure consistent float32 dtype
     dataset = TensorDataset(
-        torch.from_numpy(embeddings),
-        torch.from_numpy(current_pseudo_labels)
+        torch.from_numpy(embeddings).float(),
+        torch.from_numpy(current_pseudo_labels).float()
     )
     
     sampler = DistributedSampler(dataset) if config.is_distributed else None
@@ -720,7 +720,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             with torch.no_grad():
                 all_predictions = []
                 for i in range(0, len(embeddings), batch_size):
-                    batch = torch.from_numpy(embeddings[i:i+batch_size]).to(device)
+                    batch = torch.from_numpy(embeddings[i:i+batch_size]).float().to(device)
                     outputs = model(batch)
                     predictions = torch.sigmoid(outputs['labels']).cpu().numpy()
                     all_predictions.append(predictions)
@@ -735,8 +735,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 # Update dataset with refined pseudo-labels
                 dataset = TensorDataset(
-                    torch.from_numpy(embeddings),
-                    torch.from_numpy(current_pseudo_labels)
+                    torch.from_numpy(embeddings).float(),
+                    torch.from_numpy(current_pseudo_labels).float()
                 )
                 
                 dataloader = DataLoader(
@@ -774,7 +774,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         
                         if C is not None:
                             C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
-                            cluster_targets = torch.matmul(y_batch, C_tensor)
+                            # Ensure same dtype for matrix multiplication in mixed precision
+                            cluster_targets = torch.matmul(y_batch.float(), C_tensor)
                             cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
                         else:
                             cluster_loss = torch.tensor(0.0, device=device)
@@ -804,7 +805,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     if C is not None:
                         C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
-                        cluster_targets = torch.matmul(y_batch, C_tensor)
+                        # Ensure same dtype for matrix multiplication
+                        cluster_targets = torch.matmul(y_batch.float(), C_tensor)
                         cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
                     else:
                         cluster_loss = torch.tensor(0.0, device=device)
@@ -880,7 +882,7 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
     
     with torch.no_grad():
         for i in range(0, len(embeddings), batch_size):
-            batch = torch.from_numpy(embeddings[i:i+batch_size]).to(device)
+            batch = torch.from_numpy(embeddings[i:i+batch_size]).float().to(device)
             outputs = model(batch)
             logits = outputs['labels']
             probs = torch.sigmoid(logits)
