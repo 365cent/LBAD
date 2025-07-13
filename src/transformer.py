@@ -240,6 +240,13 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         # Cluster matcher
         self.cluster_head = nn.Linear(latent_dim, n_clusters)
         
+        # Contrastive projection head for better representation learning
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.GELU(),
+            nn.Linear(latent_dim // 2, 128)  # Project to 128-dim for contrastive learning
+        )
+        
         # Initialize weights for stable training
         self.apply(self._init_weights)
     
@@ -270,11 +277,16 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         labels = self.label_head(z_flat)
         clusters = self.cluster_head(z_flat)
         
+        # Contrastive projection
+        z_contrastive = self.contrastive_head(z_flat)
+        z_contrastive = F.normalize(z_contrastive, dim=1)  # L2 normalize
+        
         return {
             'latent': z_flat,
             'reconstructed': x_recon,
             'labels': labels,
-            'clusters': clusters
+            'clusters': clusters,
+            'contrastive': z_contrastive
         }
 
 # =============================================================================
@@ -291,6 +303,7 @@ class ProgressTracker:
         self.metrics = []
         self.start_time = None
         self.epoch_times = []
+        self.true_labels = None # Added for storing true labels
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -396,39 +409,61 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     with open(log_file, 'rb') as f:
         embeddings = pickle.load(f)
     
-    # Load labels
+    # Load labels and actual label vectors if available
     classes = []
+    true_labels = None
     if label_file.exists():
         with open(label_file, 'rb') as f:
             label_data = pickle.load(f)
-            if isinstance(label_data, dict) and 'classes' in label_data:
-                classes = label_data['classes']
-            elif isinstance(label_data, dict) and 'vectors' in label_data:
-                classes = label_data.get('classes', [])
+            if isinstance(label_data, dict):
+                if 'classes' in label_data:
+                    classes = label_data['classes']
+                if 'vectors' in label_data:
+                    true_labels = label_data['vectors']
+                    # Use true labels to guide pseudo-label generation
+                    tracker.log_step("True Labels Found", {
+                        "n_samples": len(true_labels),
+                        "n_classes": len(classes),
+                        "label_density": np.mean(true_labels.sum(axis=1))
+                    })
     
     # Aggressive subsampling for memory efficiency
     max_samples = min(50000, int(config.gpu_memory_gb * 500))  # Much smaller for memory safety
     if len(embeddings) > max_samples:
         indices = np.random.choice(len(embeddings), max_samples, replace=False)
         embeddings = embeddings[indices]
+        if true_labels is not None:
+            true_labels = true_labels[indices]
         tracker.log_step("Data Subsampling", {
             "original_size": len(embeddings),
             "subsampled_size": max_samples,
             "memory_gb": embeddings.nbytes / (1024**3)
         })
     
-    # Normalize
-    scaler = StandardScaler()
+    # Normalize with robust scaling to handle outliers better
+    from sklearn.preprocessing import RobustScaler
+    scaler = RobustScaler()
     embeddings = scaler.fit_transform(embeddings).astype(np.float32)
+    
+    # Additional L2 normalization for better contrastive learning
+    from sklearn.preprocessing import normalize
+    embeddings = normalize(embeddings, norm='l2', axis=1)
     
     # Create label clusters
     n_clusters = min(8, len(classes), len(embeddings) // 1000)
     C = create_label_clusters(classes, n_clusters)
     
+    # Store true labels in tracker for later use
+    if true_labels is not None:
+        tracker.true_labels = true_labels
+    else:
+        tracker.true_labels = None
+    
     tracker.log_step("Data Preprocessing", {
         "embeddings_shape": embeddings.shape,
         "n_classes": len(classes),
-        "n_clusters": C.shape[1] if C is not None else 0
+        "n_clusters": C.shape[1] if C is not None else 0,
+        "has_true_labels": true_labels is not None
     })
     
     return embeddings, classes, C, scaler
@@ -448,24 +483,188 @@ def create_label_clusters(classes: List[str], n_clusters: int) -> Optional[np.nd
     
     return C
 
-def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 3) -> np.ndarray:
-    """Generate initial pseudo-labels using clustering"""
+def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 3, true_labels: np.ndarray = None) -> np.ndarray:
+    """Generate pseudo-labels using self-supervised mutual learning approach with optional true labels"""
     if not classes:
         return np.random.rand(len(embeddings), 1).astype(np.float32)
     
-    # K-means clustering
-    n_clusters = min(len(classes), len(embeddings) // 100, 20)  # Reduced clusters
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(embeddings)
+    n_samples = len(embeddings)
+    n_classes = len(classes)
     
-    # Generate pseudo-labels
-    pseudo_labels = np.zeros((len(embeddings), len(classes)), dtype=np.float32)
-    for i, cluster_id in enumerate(cluster_labels):
-        # Assign top-k labels per cluster
-        label_indices = np.random.choice(len(classes), min(k, len(classes)), replace=False)
-        pseudo_labels[i, label_indices] = 1.0
+    # Initialize pseudo-labels
+    if true_labels is not None:
+        # If we have true labels, use them as initialization with some noise
+        pseudo_labels = true_labels.astype(np.float32)
+        # Add small noise to prevent overfitting
+        noise = np.random.rand(n_samples, n_classes) * 0.1
+        pseudo_labels = pseudo_labels * 0.8 + noise * 0.2
+        
+        # For unlabeled samples (all zeros), initialize with random values
+        unlabeled_mask = (true_labels.sum(axis=1) == 0)
+        if np.any(unlabeled_mask):
+            pseudo_labels[unlabeled_mask] = np.random.rand(np.sum(unlabeled_mask), n_classes) * 0.3
+    else:
+        # Initialize with small random values to break symmetry
+        pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32) * 0.1
+    
+    # 1. Compute pairwise similarities between embeddings
+    # Normalize embeddings for cosine similarity
+    embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+    
+    # Compute similarity matrix in chunks to manage memory
+    chunk_size = min(1000, n_samples)
+    similarity_threshold = 0.7  # High similarity threshold
+    
+    # 2. Propagate labels based on embedding similarity
+    for i in range(0, n_samples, chunk_size):
+        end_i = min(i + chunk_size, n_samples)
+        chunk_i = embeddings_norm[i:end_i]
+        
+        # Compute similarities with all other embeddings
+        similarities = np.dot(chunk_i, embeddings_norm.T)
+        
+        # For each sample in chunk, find highly similar samples
+        for j in range(len(chunk_i)):
+            global_idx = i + j
+            
+            # Find samples with high similarity
+            similar_indices = np.where(similarities[j] > similarity_threshold)[0]
+            
+            if len(similar_indices) > 1:  # Exclude self
+                # If we have true labels, give more weight to labeled samples
+                if true_labels is not None:
+                    # Check if any similar samples have true labels
+                    labeled_similar = similar_indices[true_labels[similar_indices].sum(axis=1) > 0]
+                    if len(labeled_similar) > 0:
+                        # Use labeled samples with higher weight
+                        similar_labels = pseudo_labels[labeled_similar].mean(axis=0)
+                        momentum = 0.7  # Lower momentum for labeled data
+                    else:
+                        # Use all similar samples
+                        similar_labels = pseudo_labels[similar_indices].mean(axis=0)
+                        momentum = 0.9
+                else:
+                    # Average pseudo-labels of similar samples
+                    similar_labels = pseudo_labels[similar_indices].mean(axis=0)
+                    momentum = 0.9
+                
+                # Update current sample's pseudo-labels with momentum
+                pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * similar_labels
+    
+    # 3. Apply diversity regularization to prevent collapse
+    # Ensure each class has reasonable representation
+    class_assignments = pseudo_labels.sum(axis=0)
+    min_samples_per_class = max(10, n_samples // (n_classes * 2))
+    
+    for class_idx in range(n_classes):
+        if class_assignments[class_idx] < min_samples_per_class:
+            # Find samples with low total assignment and assign to this class
+            total_assignments = pseudo_labels.sum(axis=1)
+            low_assignment_indices = np.argsort(total_assignments)[:min_samples_per_class]
+            pseudo_labels[low_assignment_indices, class_idx] += 0.5
+    
+    # 4. Apply sparsity constraint - each sample should have limited labels
+    for i in range(n_samples):
+        # Keep only top-k labels per sample
+        top_k_indices = np.argsort(pseudo_labels[i])[-k:]
+        mask = np.zeros(n_classes, dtype=bool)
+        mask[top_k_indices] = True
+        
+        # Soft assignment with temperature
+        pseudo_labels[i][~mask] *= 0.1  # Reduce but don't zero out
+        
+    # 5. Normalize to probability distribution
+    pseudo_labels = pseudo_labels / (pseudo_labels.sum(axis=1, keepdims=True) + 1e-8)
+    
+    # 6. Add confidence based on local density
+    # Samples in dense regions get higher confidence
+    for i in range(n_samples):
+        # Count neighbors within similarity threshold
+        similarities = np.dot(embeddings_norm[i], embeddings_norm.T)
+        n_neighbors = np.sum(similarities > similarity_threshold) - 1  # Exclude self
+        
+        # Confidence based on local density
+        density_confidence = np.tanh(n_neighbors / 20.0)  # Normalize to [0, 1]
+        pseudo_labels[i] *= (0.5 + 0.5 * density_confidence)
     
     return pseudo_labels
+
+def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    """
+    Mutual learning loss between two views of the data
+    
+    Args:
+        z1, z2: Two different views/representations of the same batch
+        pseudo_labels: Pseudo-labels for the batch
+        temperature: Temperature for scaling
+    
+    Returns:
+        Mutual learning loss value
+    """
+    batch_size = z1.shape[0]
+    
+    # Normalize representations
+    z1_norm = F.normalize(z1, dim=1)
+    z2_norm = F.normalize(z2, dim=1)
+    
+    # Compute cross-view similarity
+    cross_sim = torch.matmul(z1_norm, z2_norm.T) / temperature
+    
+    # Create pseudo-label similarity matrix
+    label_sim = torch.matmul(pseudo_labels, pseudo_labels.T)
+    label_sim = (label_sim > 0.5).float()  # Binary similarity based on shared labels
+    
+    # Mutual learning loss: encourage similar pseudo-labels to have similar representations
+    # Use a soft version of the loss to handle uncertainty in pseudo-labels
+    pos_mask = label_sim
+    neg_mask = 1 - label_sim
+    
+    # Positive pairs should have high similarity
+    pos_loss = -torch.log(torch.sigmoid(cross_sim) + 1e-8) * pos_mask
+    pos_loss = pos_loss.sum() / (pos_mask.sum() + 1e-8)
+    
+    # Negative pairs should have low similarity
+    neg_loss = -torch.log(1 - torch.sigmoid(cross_sim) + 1e-8) * neg_mask
+    neg_loss = neg_loss.sum() / (neg_mask.sum() + 1e-8)
+    
+    return pos_loss + neg_loss
+
+def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
+    """
+    Compute NT-Xent loss (InfoNCE) for contrastive learning
+    
+    Args:
+        z_i: First set of normalized embeddings (batch_size, embedding_dim)
+        z_j: Second set of normalized embeddings (batch_size, embedding_dim)
+        temperature: Temperature parameter for scaling
+    
+    Returns:
+        Contrastive loss value
+    """
+    batch_size = z_i.shape[0]
+    
+    # Concatenate representations
+    representations = torch.cat([z_i, z_j], dim=0)  # 2*batch_size x embedding_dim
+    
+    # Compute similarity matrix
+    similarity_matrix = torch.matmul(representations, representations.T)
+    
+    # Create mask for positive pairs
+    mask = torch.eye(batch_size, dtype=torch.bool, device=z_i.device)
+    mask = torch.cat([torch.cat([mask, mask], dim=1), 
+                     torch.cat([mask, mask], dim=1)], dim=0)
+    
+    # Extract positive and negative pairs
+    positives = similarity_matrix[mask].view(2 * batch_size, 1)
+    negatives = similarity_matrix[~mask].view(2 * batch_size, -1)
+    
+    # Compute loss
+    logits = torch.cat([positives, negatives], dim=1) / temperature
+    labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z_i.device)
+    
+    loss = F.cross_entropy(logits, labels)
+    
+    return loss
 
 def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray, 
                 config: SystemConfig, tracker: ProgressTracker) -> Tuple[UnsupervisedMultiLabelTransformer, StandardScaler]:
@@ -490,13 +689,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     elif config.n_gpus > 1:
         model = nn.DataParallel(model)
     
-    # Generate pseudo-labels
-    pseudo_labels = generate_pseudo_labels(embeddings, classes)
+    # Generate pseudo-labels (use true labels if available from tracker)
+    true_labels = getattr(tracker, 'true_labels', None)
+    pseudo_labels = generate_pseudo_labels(embeddings, classes, true_labels=true_labels)
     
     # Data setup
     dataset = TensorDataset(
         torch.from_numpy(embeddings),
-        torch.from_numpy(pseudo_labels)
+        torch.from_numpy(current_pseudo_labels)
     )
     
     sampler = DistributedSampler(dataset) if config.is_distributed else None
@@ -511,10 +711,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         pin_memory=True
     )
     
-    # Training setup
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # Training setup with improved hyperparameters
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)  # Lower learning rate
     scaler = GradScaler() if config.device == "cuda" else None
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)  # Reduced epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)  # Better schedule
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
@@ -525,8 +725,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Training loop with progress tracking
     model.train()
-    total_epochs = 50  # Reduced epochs for faster iteration
+    total_epochs = 100  # Increased epochs for better convergence with contrastive learning
     tracker.start_training(total_epochs)
+    
+    # Store initial pseudo-labels for refinement
+    current_pseudo_labels = pseudo_labels.copy()
+    refinement_interval = 10  # Refine pseudo-labels every 10 epochs
     
     for epoch in range(total_epochs):
         epoch_start = time.time()
@@ -534,6 +738,48 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         if config.is_distributed:
             sampler.set_epoch(epoch)
+        
+        # Refine pseudo-labels periodically based on model predictions
+        if epoch > 0 and epoch % refinement_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                all_predictions = []
+                for i in range(0, len(embeddings), batch_size):
+                    batch = torch.from_numpy(embeddings[i:i+batch_size]).to(device)
+                    outputs = model(batch)
+                    predictions = torch.sigmoid(outputs['labels']).cpu().numpy()
+                    all_predictions.append(predictions)
+                
+                all_predictions = np.vstack(all_predictions)
+                
+                # Combine predictions with original pseudo-labels
+                # Use momentum to prevent drastic changes
+                refinement_momentum = 0.7
+                current_pseudo_labels = (refinement_momentum * current_pseudo_labels + 
+                                       (1 - refinement_momentum) * all_predictions)
+                
+                # Update dataset with refined pseudo-labels
+                dataset = TensorDataset(
+                    torch.from_numpy(embeddings),
+                    torch.from_numpy(current_pseudo_labels)
+                )
+                
+                dataloader = DataLoader(
+                    dataset, 
+                    batch_size=batch_size, 
+                    sampler=sampler,
+                    shuffle=(sampler is None),
+                    num_workers=min(4, config.n_cpus // 4),
+                    pin_memory=True
+                )
+                
+                tracker.log_step("Pseudo-label Refinement", {
+                    "epoch": epoch,
+                    "avg_confidence": float(np.mean(all_predictions.max(axis=1))),
+                    "label_density": float(np.mean(all_predictions.sum(axis=1)))
+                })
+            
+            model.train()
         
         # Progress spinner for batches
         with Halo(text=f"Epoch {epoch+1}/{total_epochs}", spinner='dots') as spinner:
@@ -558,7 +804,19 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         else:
                             cluster_loss = torch.tensor(0.0, device=device)
                         
-                        total_loss = recon_loss + 0.5 * label_loss + 0.3 * cluster_loss
+                        # Contrastive loss - create augmented batch
+                        # Simple augmentation: add small noise
+                        x_augmented = x_batch + torch.randn_like(x_batch) * 0.1
+                        outputs_aug = model(x_augmented)
+                        
+                        # Compute contrastive loss between original and augmented
+                        contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'], temperature=0.1)
+                        
+                        # Mutual learning loss
+                        mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
+                        
+                        # Weighted combination of losses
+                        total_loss = recon_loss + 0.3 * label_loss + 0.2 * cluster_loss + 0.5 * contrast_loss + 0.1 * mutual_loss
                     
                     scaler.scale(total_loss).backward()
                     scaler.step(optimizer)
@@ -576,7 +834,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     else:
                         cluster_loss = torch.tensor(0.0, device=device)
                     
-                    total_loss = recon_loss + 0.5 * label_loss + 0.3 * cluster_loss
+                    # Contrastive loss - create augmented batch
+                    x_augmented = x_batch + torch.randn_like(x_batch) * 0.1
+                    outputs_aug = model(x_augmented)
+                    
+                    # Compute contrastive loss between original and augmented
+                    contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'], temperature=0.1)
+                    
+                    # Mutual learning loss
+                    mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
+                    
+                    # Weighted combination of losses
+                    total_loss = recon_loss + 0.3 * label_loss + 0.2 * cluster_loss + 0.5 * contrast_loss + 0.1 * mutual_loss
                     total_loss.backward()
                     optimizer.step()
                 
@@ -601,6 +870,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 "recon_loss": recon_loss.item(),
                 "label_loss": label_loss.item(),
                 "cluster_loss": cluster_loss.item(),
+                "contrastive_loss": contrast_loss.item() if 'contrast_loss' in locals() else 0.0,
+                "mutual_loss": mutual_loss.item() if 'mutual_loss' in locals() else 0.0,
                 "lr": scheduler.get_last_lr()[0],
                 "epoch_time": epoch_time
             })
