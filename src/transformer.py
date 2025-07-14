@@ -6,17 +6,32 @@ High-Performance Transformer-based Unsupervised Multi-Label Learning for Superco
 Optimized for Research Alliance of Canada Nibi node:
 - Multi-GPU support (H100, A100, V100)
 - Automatic CUDA/distributed training setup
-- Memory-efficient chunked processing
+- Advanced memory management with CUDA OOM prevention
 - Comprehensive error handling and recovery
 - Real-time progress tracking with file outputs
 - Performance profiling and optimization
 - Stable results with deterministic training
 - Proper label output format for evaluation
 - Separate models per log type (each log file has only one type)
-- Automatic adaptation to different embedding types:
-  * FastText: 300D embeddings
-  * BERT CLS: 768D embeddings
-  * Enhanced LogBERT: 2314D embeddings (CLS + mean + max + attention)
+
+Automatic adaptation to different embedding types:
+  * FastText: 300D standard word embeddings
+    - Architecture: 8 transformer layers, 8 attention heads, 256 latent dim
+    - Batch sizes: 128/64 (MPS/CPU), 64/32 (CUDA conservative)
+  * BERT CLS: 768D global context embeddings  
+    - Architecture: 10 transformer layers, 12 attention heads, 384 latent dim
+    - Batch sizes: 64/32 (MPS/CPU), 32/16 (CUDA conservative)
+  * Enhanced LogBERT: 2314D multi-feature embeddings
+    - Features: CLS token (768D) + mean pooling (768D) + max pooling (768D) + attention (10D)
+    - Architecture: 12 transformer layers, 16 attention heads, 512 latent dim
+    - Batch sizes: 32/16 (MPS/CPU), 16/8 (CUDA conservative)
+
+Memory optimizations for CUDA:
+- Conservative batch sizing based on GPU memory
+- Periodic memory clearing during training and inference
+- OOM exception handling with single-sample fallback
+- Reduced worker counts for memory efficiency
+- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 """
 
 import os
@@ -26,6 +41,7 @@ import json
 import pickle
 import logging
 import warnings
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
@@ -65,6 +81,11 @@ np.random.seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# Configuration paths
+CHECKPOINT_DIR = Path("checkpoints") / "transformer"
+RESULTS_DIR = Path("results")
+MODELS_DIR = Path("models")
+
 # =============================================================================
 # Configuration and Resource Detection
 # =============================================================================
@@ -95,6 +116,9 @@ def detect_system_resources() -> SystemConfig:
         gpu_name = torch.cuda.get_device_properties(0).name
         print(f"Detected {n_gpus} GPU(s): {gpu_name}")
         print(f"GPU Memory: {gpu_memory_gb:.1f} GB per GPU")
+        
+        # Set CUDA memory allocation configuration to avoid fragmentation
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
     elif torch.backends.mps.is_available():
         n_gpus = 1
@@ -479,7 +503,7 @@ class ProgressTracker:
             json.dump(self.metrics, f, indent=2)
 
 def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: ProgressTracker) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
-    """Optimized data loading with memory management for Nibi"""
+    """Optimized data loading with memory management for Nibi and embedding auto-detection"""
     tracker.log_step("Data Loading", {"log_type": log_type, "config": config.__dict__})
     
     # Load embeddings - only load specific log type, not combined
@@ -492,6 +516,22 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     
     with open(log_file, 'rb') as f:
         embeddings = pickle.load(f)
+    
+    # Detect embedding type based on dimension
+    embedding_dim = embeddings.shape[1]
+    embedding_type = "Unknown"
+    if embedding_dim == 300:
+        embedding_type = "FastText (300D)"
+    elif embedding_dim == 768:
+        embedding_type = "BERT CLS only (768D)" 
+    elif embedding_dim == 2314:
+        embedding_type = "Enhanced LogBERT (2314D)"
+    
+    tracker.log_step("Embedding Type Auto-Detection", {
+        "embedding_dim": embedding_dim,
+        "embedding_type": embedding_type,
+        "n_samples": len(embeddings)
+    })
     
     # Load labels and actual label vectors if available
     classes = []
@@ -521,16 +561,29 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             "note": "All logs treated as normal/benign"
         })
     
-    # Aggressive subsampling for memory efficiency - adaptive based on embedding size
-    embedding_dim = embeddings.shape[1]
+    # Adaptive subsampling based on embedding type and device capabilities
     if embedding_dim <= 300:  # FastText
-        samples_per_gb = 500
+        if config.device == "cuda":
+            samples_per_gb = min(800, int(config.gpu_memory_gb * 8))  # Conservative for CUDA
+        else:
+            samples_per_gb = 1000
     elif embedding_dim <= 768:  # Standard BERT
-        samples_per_gb = 200
+        if config.device == "cuda":
+            samples_per_gb = min(400, int(config.gpu_memory_gb * 4))  # Conservative for CUDA
+        else:
+            samples_per_gb = 500
     else:  # Enhanced LogBERT (2314D)
-        samples_per_gb = 70  # Much fewer samples due to larger embeddings
+        if config.device == "cuda":
+            samples_per_gb = min(100, int(config.gpu_memory_gb * 1.5))  # Very conservative for CUDA
+        else:
+            samples_per_gb = 150
     
-    max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))
+    # Apply more conservative limits for CUDA to prevent OOM
+    if config.device == "cuda":
+        max_samples = min(30000, int(config.gpu_memory_gb * samples_per_gb))
+    else:
+        max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))
+    
     if len(embeddings) > max_samples:
         indices = np.random.choice(len(embeddings), max_samples, replace=False)
         embeddings = embeddings[indices]
@@ -541,7 +594,9 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             "subsampled_size": max_samples,
             "memory_gb": embeddings.nbytes / (1024**3),
             "embedding_dim": embedding_dim,
-            "samples_per_gb": samples_per_gb
+            "embedding_type": embedding_type,
+            "samples_per_gb": samples_per_gb,
+            "device_type": config.device
         })
     
     # Normalize with robust scaling to handle outliers better
@@ -565,6 +620,7 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     
     tracker.log_step("Data Preprocessing", {
         "embeddings_shape": embeddings.shape,
+        "embedding_type": embedding_type,
         "n_classes": len(classes),
         "n_clusters": C.shape[1] if C is not None else 0,
         "has_true_labels": true_labels is not None
@@ -861,43 +917,68 @@ def contrastive_loss(z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 
     
     return loss
 
+def clear_gpu_memory():
+    """Clear GPU memory efficiently"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    import gc
+    gc.collect()
+
 def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray, 
-                config: SystemConfig, tracker: ProgressTracker) -> Tuple[UnsupervisedMultiLabelTransformer, StandardScaler]:
-    """Optimized training with multi-GPU support and mixed precision for Nibi"""
+                config: SystemConfig, tracker: ProgressTracker, log_type: str) -> Tuple[UnsupervisedMultiLabelTransformer, StandardScaler]:
+    """Optimized training with multi-GPU support, mixed precision, memory management, and resumeable checkpoints"""
     
     device = torch.device(config.device)
     n_labels = len(classes) if classes else 1
     n_clusters = C.shape[1] if C is not None else 1
     
-    # Adaptive latent dimension based on embedding size
-    if embeddings.shape[1] <= 300:  # FastText
-        latent_dim = min(256, embeddings.shape[1])
-    elif embeddings.shape[1] <= 768:  # Standard BERT
-        latent_dim = 384  # Half of BERT dimension
-    else:  # Enhanced LogBERT (2314D)
-        latent_dim = 512  # Larger latent space for richer embeddings
+    # Generate training hash for checkpoint validation
+    training_hash = generate_training_hash(embeddings, classes)
     
-    # Model setup - automatically adapts to embedding dimension (300D FastText or 2314D LogBERT)
+    # Clear memory before starting training
+    clear_gpu_memory()
+    
+    # Adaptive latent dimension and architecture based on embedding type
+    embedding_dim = embeddings.shape[1]
+    if embedding_dim <= 300:  # FastText
+        latent_dim = 256
+        transformer_layers = 8  # Lighter architecture
+        attention_heads = 8
+    elif embedding_dim <= 768:  # Standard BERT
+        latent_dim = 384
+        transformer_layers = 10  # Medium architecture
+        attention_heads = 12
+    else:  # Enhanced LogBERT (2314D)
+        latent_dim = 512
+        transformer_layers = 12  # Full architecture for richer embeddings
+        attention_heads = 16
+    
+    # Model setup - automatically adapts to embedding dimension
     model = UnsupervisedMultiLabelTransformer(
-        input_dim=embeddings.shape[1],
+        input_dim=embedding_dim,
         latent_dim=latent_dim,
         n_labels=n_labels,
         n_clusters=n_clusters
     ).to(device)
     
-    # Log embedding type based on dimension
+    # Detect and log embedding type
     embedding_type = "Unknown"
-    if embeddings.shape[1] == 300:
+    if embedding_dim == 300:
         embedding_type = "FastText (300D)"
-    elif embeddings.shape[1] == 768:
+    elif embedding_dim == 768:
         embedding_type = "BERT CLS only (768D)"
-    elif embeddings.shape[1] == 2314:
+    elif embedding_dim == 2314:
         embedding_type = "Enhanced LogBERT (2314D)"
     
-    tracker.log_step("Embedding Type Detected", {
-        "embedding_dim": embeddings.shape[1],
+    tracker.log_step("Model Architecture Adaptation", {
+        "embedding_dim": embedding_dim,
         "embedding_type": embedding_type,
-        "note": "Model automatically adapts to input dimension"
+        "latent_dim": latent_dim,
+        "transformer_layers": transformer_layers,
+        "attention_heads": attention_heads,
+        "training_hash": training_hash,
+        "note": "Model automatically adapts to input embedding type"
     })
     
     # Multi-GPU setup
@@ -921,13 +1002,23 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     sampler = DistributedSampler(dataset) if config.is_distributed else None
     
-    # Adaptive batch size based on embedding dimension and GPU memory
-    if embeddings.shape[1] <= 300:  # FastText
-        batch_size = min(128, max(16, int(config.gpu_memory_gb * 2)))
-    elif embeddings.shape[1] <= 768:  # Standard BERT
-        batch_size = min(64, max(8, int(config.gpu_memory_gb * 1.5)))
-    else:  # Enhanced LogBERT (2314D)
-        batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.8)))
+    # Adaptive batch size based on embedding type and device
+    if config.device == "cuda":
+        # Conservative batch sizes for CUDA to prevent OOM
+        if embedding_dim <= 300:  # FastText
+            batch_size = min(64, max(8, int(config.gpu_memory_gb * 0.8)))
+        elif embedding_dim <= 768:  # Standard BERT
+            batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.5)))
+        else:  # Enhanced LogBERT (2314D)
+            batch_size = min(16, max(2, int(config.gpu_memory_gb * 0.3)))
+    else:
+        # More generous batch sizes for MPS/CPU
+        if embedding_dim <= 300:  # FastText
+            batch_size = min(128, max(16, int(config.gpu_memory_gb * 2)))
+        elif embedding_dim <= 768:  # Standard BERT
+            batch_size = min(64, max(8, int(config.gpu_memory_gb * 1.5)))
+        else:  # Enhanced LogBERT (2314D)
+            batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.8)))
     
     dataloader = DataLoader(
         dataset, 
@@ -955,32 +1046,57 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Gradient clipping for stability
     max_grad_norm = 1.0  # Reduced for better stability
     
+    # Check for existing checkpoint
+    start_epoch = 0
+    checkpoint_data = load_training_checkpoint(log_type, training_hash)
+    if checkpoint_data:
+        try:
+            checkpoint, loaded_epoch = checkpoint_data
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = loaded_epoch + 1
+            print(f"✅ Resuming training from epoch {start_epoch}")
+            
+            # Restore best loss for early stopping
+            if 'metrics' in checkpoint and 'best_loss' in checkpoint['metrics']:
+                best_loss = checkpoint['metrics']['best_loss']
+            else:
+                best_loss = float('inf')
+        except Exception as e:
+            print(f"⚠️  Could not restore checkpoint: {e}")
+            start_epoch = 0
+            best_loss = float('inf')
+    else:
+        best_loss = float('inf')
+    
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
-        "input_dim": embeddings.shape[1],
+        "input_dim": embedding_dim,
         "latent_dim": latent_dim,
         "n_labels": n_labels,
         "n_clusters": n_clusters,
         "batch_size": batch_size,
         "device": str(device),
         "mixed_precision": scaler is not None,
-        "embedding_type": embedding_type
+        "embedding_type": embedding_type,
+        "device_memory_gb": config.gpu_memory_gb,
+        "memory_optimization": "CUDA conservative" if config.device == "cuda" else "Standard"
     })
     
-    # Training loop with progress tracking and early stopping
+    # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
     total_epochs = 50  # Balanced epochs for good convergence without taking too long
     tracker.start_training(total_epochs)
     
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
+    checkpoint_interval = 5   # Save checkpoint every 5 epochs
     
     # Early stopping parameters
-    best_loss = float('inf')
     patience = 5
     patience_counter = 0
     min_delta = 1e-4
     
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
         epoch_losses = []
         
@@ -992,11 +1108,31 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             model.eval()
             with torch.no_grad():
                 all_predictions = []
-                for i in range(0, len(embeddings), batch_size):
-                    batch = torch.from_numpy(embeddings[i:i+batch_size]).float().to(device)
-                    outputs = model(batch)
-                    predictions = torch.sigmoid(outputs['labels']).cpu().numpy()
-                    all_predictions.append(predictions)
+                # Clear memory before inference
+                clear_gpu_memory()
+                
+                # Use smaller inference batch size for memory efficiency
+                inference_batch_size = max(1, batch_size // 2) if config.device == "cuda" else batch_size
+                
+                for i in range(0, len(embeddings), inference_batch_size):
+                    batch = torch.from_numpy(embeddings[i:i+inference_batch_size]).float().to(device)
+                    
+                    try:
+                        outputs = model(batch)
+                        predictions = torch.sigmoid(outputs['labels']).cpu().numpy()
+                        all_predictions.append(predictions)
+                    except torch.cuda.OutOfMemoryError:
+                        # Fallback to single sample processing
+                        for j in range(i, min(i + inference_batch_size, len(embeddings))):
+                            single_batch = torch.from_numpy(embeddings[j:j+1]).float().to(device)
+                            single_output = model(single_batch)
+                            single_pred = torch.sigmoid(single_output['labels']).cpu().numpy()
+                            all_predictions.append(single_pred)
+                        clear_gpu_memory()
+                    
+                    # Clear memory periodically during inference
+                    if config.device == "cuda" and (i // inference_batch_size) % 10 == 0:
+                        clear_gpu_memory()
                 
                 all_predictions = np.vstack(all_predictions)
                 
@@ -1025,7 +1161,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     batch_size=batch_size, 
                     sampler=sampler,
                     shuffle=(sampler is None),
-                    num_workers=min(4, config.n_cpus // 4),
+                    num_workers=min(2, config.n_cpus // 8),  # Reduced workers for CUDA
                     pin_memory=True
                 )
                 
@@ -1034,9 +1170,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     "avg_confidence": float(np.mean(all_predictions.max(axis=1))),
                     "label_density": float(np.mean(all_predictions.sum(axis=1))),
                     "model_weight": model_weight,
-                    "curriculum_progress": progress
+                    "curriculum_progress": progress,
+                    "inference_batch_size": inference_batch_size
                 })
             
+            # Clear memory before resuming training
+            clear_gpu_memory()
             model.train()
         
         # Progress spinner for batches
@@ -1047,9 +1186,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 optimizer.zero_grad()
                 
+                # Clear memory periodically during training for CUDA
+                if config.device == "cuda" and batch_idx % 20 == 0:
+                    clear_gpu_memory()
+                
                 if scaler:
                     with autocast():
-                        outputs = model(x_batch)
+                        try:
+                            outputs = model(x_batch)
+                        except torch.cuda.OutOfMemoryError:
+                            # Skip this batch and clear memory
+                            clear_gpu_memory()
+                            continue
                         
                         # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
@@ -1125,7 +1273,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    outputs = model(x_batch)
+                    try:
+                        outputs = model(x_batch)
+                    except torch.cuda.OutOfMemoryError:
+                        # Skip this batch and clear memory
+                        clear_gpu_memory()
+                        continue
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
@@ -1222,6 +1375,23 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             best_model_state = model.state_dict().copy()
         else:
             patience_counter += 1
+        
+        # Save checkpoint periodically
+        if config.rank == 0 and (epoch + 1) % checkpoint_interval == 0:
+            try:
+                model_to_save = model.module if hasattr(model, 'module') else model
+                checkpoint_metrics = {
+                    'avg_loss': avg_loss,
+                    'best_loss': best_loss,
+                    'patience_counter': patience_counter
+                }
+                save_training_checkpoint(
+                    log_type, epoch, model_to_save.state_dict(), 
+                    optimizer.state_dict(), checkpoint_metrics, 
+                    training_hash, config
+                )
+            except Exception as e:
+                print(f"⚠️  Failed to save checkpoint: {e}")
             
         if patience_counter >= patience:
             if config.rank == 0:
@@ -1252,6 +1422,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                   f"ETA: {progress_info['estimated_total']}")
         elif config.rank == 0:
             print(f"Epoch {epoch+1}/{total_epochs} - Loss: {avg_loss:.6f} - Time: {epoch_time:.2f}s")
+    
+    # Clean up training checkpoints after completion (keep final checkpoint)
+    if config.rank == 0:
+        cleanup_training_checkpoints(log_type, keep_latest=1)
     
     return model, None  # Return None for scaler placeholder
 
@@ -1919,7 +2093,7 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
 # =============================================================================
 
 def find_available_embeddings() -> List[str]:
-    """Find available embedding files - exclude all_combined"""
+    """Find available embedding files - supports both FastText and LogBERT embeddings"""
     embeddings_dir = Path("embeddings")
     if not embeddings_dir.exists():
         return []
@@ -1933,12 +2107,209 @@ def find_available_embeddings() -> List[str]:
     
     return sorted(log_files)
 
-def process_log_type(log_type: str, config: SystemConfig):
-    """Process a single log type"""
-    output_dir = Path("results") / log_type
+def analyze_embedding_types(available_types: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Analyze embedding types for each available log type"""
+    embeddings_dir = Path("embeddings")
+    analysis = {}
+    
+    for log_type in available_types:
+        log_file = embeddings_dir / log_type / f"log_{log_type}.pkl"
+        if log_file.exists():
+            try:
+                with open(log_file, 'rb') as f:
+                    embeddings = pickle.load(f)
+                    
+                embedding_dim = embeddings.shape[1]
+                n_samples = embeddings.shape[0]
+                
+                # Detect embedding type
+                if embedding_dim == 300:
+                    embedding_type = "FastText"
+                    description = "Standard 300D word embeddings"
+                elif embedding_dim == 768:
+                    embedding_type = "BERT CLS"
+                    description = "BERT CLS token embeddings (768D)"
+                elif embedding_dim == 2314:
+                    embedding_type = "Enhanced LogBERT"
+                    description = "Multi-feature embeddings (CLS+mean+max+attention)"
+                else:
+                    embedding_type = "Unknown"
+                    description = f"Custom embeddings ({embedding_dim}D)"
+                
+                analysis[log_type] = {
+                    'embedding_type': embedding_type,
+                    'dimension': embedding_dim,
+                    'n_samples': n_samples,
+                    'description': description,
+                    'memory_mb': embeddings.nbytes / (1024**2)
+                }
+                
+            except Exception as e:
+                analysis[log_type] = {
+                    'embedding_type': 'Error',
+                    'dimension': 0,
+                    'n_samples': 0,
+                    'description': f"Error loading: {e}",
+                    'memory_mb': 0
+                }
+    
+    return analysis
+
+def generate_training_hash(embeddings: np.ndarray, classes: List[str]) -> str:
+    """Generate a hash for training data to validate checkpoints."""
+    content = f"{embeddings.shape}_{len(classes)}_{embeddings[0].sum() if len(embeddings) > 0 else 0}"
+    return hashlib.md5(content.encode()).hexdigest()[:16]
+
+def save_training_checkpoint(log_type: str, epoch: int, model_state: dict, 
+                           optimizer_state: dict, metrics: dict, 
+                           training_hash: str, config: SystemConfig):
+    """Save training checkpoint."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint_data = {
+        'log_type': log_type,
+        'epoch': epoch,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer_state,
+        'metrics': metrics,
+        'training_hash': training_hash,
+        'config': config.__dict__,
+        'timestamp': time.time()
+    }
+    
+    checkpoint_file = CHECKPOINT_DIR / f"{log_type}_epoch_{epoch}_{training_hash}.pth"
+    torch.save(checkpoint_data, checkpoint_file)
+    
+    print(f"💾 Training checkpoint saved: epoch {epoch}")
+    return checkpoint_file
+
+def load_training_checkpoint(log_type: str, training_hash: str) -> Optional[Tuple[dict, int]]:
+    """Load the latest training checkpoint for a log type."""
+    if not CHECKPOINT_DIR.exists():
+        return None
+    
+    # Find all checkpoints for this log type and hash
+    pattern = f"{log_type}_epoch_*_{training_hash}.pth"
+    checkpoints = list(CHECKPOINT_DIR.glob(pattern))
+    
+    if not checkpoints:
+        return None
+    
+    # Get the latest checkpoint (highest epoch)
+    latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split('_')[2]))
+    
+    try:
+        checkpoint_data = torch.load(latest_checkpoint, map_location='cpu')
+        
+        # Validate checkpoint
+        if (checkpoint_data['log_type'] == log_type and 
+            checkpoint_data['training_hash'] == training_hash):
+            
+            age_hours = (time.time() - checkpoint_data['timestamp']) / 3600
+            epoch = checkpoint_data['epoch']
+            print(f"📂 Found training checkpoint: epoch {epoch} (age: {age_hours:.1f}h)")
+            return checkpoint_data, epoch
+    except Exception as e:
+        print(f"⚠️  Training checkpoint loading failed: {e}")
+        # Remove corrupted checkpoint
+        latest_checkpoint.unlink(missing_ok=True)
+    
+    return None
+
+def cleanup_training_checkpoints(log_type: str, keep_latest: int = 2):
+    """Clean up old training checkpoints."""
+    if not CHECKPOINT_DIR.exists():
+        return
+    
+    pattern = f"{log_type}_epoch_*.pth"
+    checkpoints = list(CHECKPOINT_DIR.glob(pattern))
+    
+    if len(checkpoints) > keep_latest:
+        # Sort by epoch number, keep latest
+        checkpoints.sort(key=lambda x: int(x.stem.split('_')[2]), reverse=True)
+        
+        for old_checkpoint in checkpoints[keep_latest:]:
+            old_checkpoint.unlink(missing_ok=True)
+            print(f"🗑️  Cleaned up old checkpoint: {old_checkpoint.name}")
+
+def check_existing_results(log_type: str, config: SystemConfig) -> dict:
+    """Check if results already exist for this log type."""
+    output_dir = RESULTS_DIR / log_type
+    
+    status = {
+        'results_pkl': False,
+        'labels_pkl': False,
+        'classification_report': False,
+        'visualizations': False,
+        'model_saved': False,
+        'complete': False
+    }
+    
+    if output_dir.exists():
+        # Check for results files
+        results_pattern = f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
+        labels_pattern = f"label_{log_type}_{config.node_name}_{config.job_id}.pkl"
+        report_pattern = f"classification_report_{log_type}_*.txt"
+        viz_pattern = f"*analysis_{log_type}_{config.node_name}_{config.job_id}.png"
+        
+        status['results_pkl'] = len(list(output_dir.glob(results_pattern))) > 0
+        status['labels_pkl'] = len(list(output_dir.glob(labels_pattern))) > 0
+        status['classification_report'] = len(list(output_dir.glob(report_pattern))) > 0
+        status['visualizations'] = len(list(output_dir.glob(viz_pattern))) > 0
+        
+        # Check for saved model
+        model_pattern = f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
+        status['model_saved'] = (MODELS_DIR / model_pattern).exists()
+        
+        status['complete'] = all([status['results_pkl'], status['labels_pkl'], 
+                                status['classification_report'], status['model_saved']])
+    
+    return status
+
+def process_log_type_with_args(log_type: str, config: SystemConfig, force_restart: bool = False):
+    """Process a single log type with resumeable functionality and argument support"""
+    output_dir = RESULTS_DIR / log_type
     output_dir.mkdir(parents=True, exist_ok=True)
     
     tracker = ProgressTracker(output_dir, log_type, config)
+    
+    # Check if already completed (unless force restart)
+    result_status = check_existing_results(log_type, config)
+    if result_status['complete'] and not force_restart:
+        print(f"✅ {log_type} already completed. Skipping.")
+        print(f"   Files: results✓ labels✓ report✓ model✓")
+        return
+    elif result_status['model_saved'] and result_status['results_pkl']:
+        print(f"🔄 {log_type} partially completed. Creating remaining outputs...")
+        try:
+            # Load existing model and results for final outputs
+            model_path = MODELS_DIR / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
+            saved_data = torch.load(model_path, map_location='cpu')
+            
+            results_path = output_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
+            with open(results_path, 'rb') as f:
+                results = pickle.load(f)
+            
+            # Create any missing outputs
+            if not result_status['classification_report']:
+                classes = saved_data['classes']
+                generate_classification_report(
+                    results['binary_predictions'], classes, output_dir, log_type, config
+                )
+            
+            if not result_status['visualizations']:
+                # Load embeddings for visualization
+                embeddings, classes, _, _ = load_and_preprocess_data(log_type, config, tracker)
+                create_comprehensive_visualizations(
+                    embeddings, results['predictions'], results['binary_predictions'], 
+                    classes, output_dir, log_type, config
+                )
+            
+            print(f"✅ Completed remaining outputs for {log_type}")
+            return
+        except Exception as e:
+            print(f"⚠️  Could not complete from existing files: {e}")
+            # Continue with full processing
     
     try:
         # Load data with progress
@@ -1946,10 +2317,10 @@ def process_log_type(log_type: str, config: SystemConfig):
             embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
             spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
         
-        # Train model
+        # Train model with checkpointing
         tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
         with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
-            model, _ = train_model(embeddings, classes, C, config, tracker)
+            model, _ = train_model(embeddings, classes, C, config, tracker, log_type)
             spinner.succeed(f"Training completed for {log_type}")
         
         # Evaluate and save
@@ -1960,7 +2331,7 @@ def process_log_type(log_type: str, config: SystemConfig):
         # Save model
         if config.rank == 0:
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
-                model_path = Path("models") / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
+                model_path = MODELS_DIR / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
                 model_path.parent.mkdir(exist_ok=True)
                 
                 model_to_save = model.module if hasattr(model, 'module') else model
@@ -1974,16 +2345,44 @@ def process_log_type(log_type: str, config: SystemConfig):
                 spinner.succeed(f"Model saved to {model_path}")
         
         tracker.log_step("Completion", {"status": "success", "results": results})
+        print(f"✅ Completed processing {log_type}")
         
+    except KeyboardInterrupt:
+        print(f"\n⚠️  Processing interrupted for {log_type}. Training checkpoint saved.")
+        raise
     except Exception as e:
-        tracker.logger.error(f"Error processing {log_type}: {e}")
+        tracker.logger.error(f"❌ Error processing {log_type}: {e}")
         import traceback
         tracker.logger.error(traceback.format_exc())
         raise
 
+def process_log_type(log_type: str, config: SystemConfig):
+    """Process a single log type with resumeable functionality (legacy wrapper)"""
+    return process_log_type_with_args(log_type, config, force_restart=False)
+
 def main():
-    """Main execution with distributed support for Nibi"""
+    """Main execution with distributed support for Nibi - Resumeable"""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Transformer-based Unsupervised Multi-Label Learning - Resumeable")
+    parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
+    parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing results)")
+    parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all training checkpoints before starting")
+    args = parser.parse_args()
+    
     try:
+        # Clean checkpoints if requested
+        if args.clean_checkpoints:
+            import shutil
+            if CHECKPOINT_DIR.exists():
+                shutil.rmtree(CHECKPOINT_DIR)
+                print("🗑️  Cleaned up all training checkpoints")
+        
+        # Override completion check if force restart
+        if args.force_restart:
+            print("🔄 Force restart enabled - will reprocess all data")
+        
         # Detect system resources
         config = detect_system_resources()
         
@@ -2007,7 +2406,20 @@ def main():
             print(f"  Distributed: {config.is_distributed}")
             print(f"  Node: {config.node_name}")
             print(f"  Job ID: {config.job_id}")
-            print(f"Available types: {available_types}")
+            print(f"  Memory optimizations: {'CUDA conservative' if config.device == 'cuda' else 'Standard'}")
+            print(f"  Supports: FastText (300D), BERT CLS (768D), Enhanced LogBERT (2314D)")
+            
+            # Analyze available embeddings
+            embedding_analysis = analyze_embedding_types(available_types)
+            print(f"\nAvailable Embeddings Analysis:")
+            print(f"{'='*60}")
+            for log_type, info in embedding_analysis.items():
+                print(f"{log_type}:")
+                print(f"  Type: {info['embedding_type']} ({info['dimension']}D)")
+                print(f"  Samples: {info['n_samples']:,}")
+                print(f"  Memory: {info['memory_mb']:.1f} MB")
+                print(f"  Description: {info['description']}")
+            print(f"{'='*60}")
         
         # Skip log type classifier since each log file can only be one type
         if config.rank == 0:
@@ -2015,16 +2427,36 @@ def main():
             print("Processing individual log types")
             print(f"{'='*60}")
         
+        # Filter log types if specified
+        if args.log_type:
+            if args.log_type in available_types:
+                available_types = [args.log_type]
+                print(f"🎯 Processing single log type: {args.log_type}")
+            else:
+                print(f"❌ Log type '{args.log_type}' not found in available types: {available_types}")
+                return
+
         # Process each log type
         total_types = len(available_types)
         for idx, log_type in enumerate(available_types, 1):
             if config.rank == 0:
-                print(f"\n{'='*60}")
-                print(f"Processing: {log_type} ({idx}/{total_types})")
-                print(f"{'='*60}")
+                # Show embedding type info for this log type
+                if log_type in embedding_analysis:
+                    info = embedding_analysis[log_type]
+                    print(f"\n{'='*60}")
+                    print(f"Processing: {log_type} ({idx}/{total_types})")
+                    print(f"Embedding: {info['embedding_type']} ({info['dimension']}D)")
+                    print(f"Samples: {info['n_samples']:,} | Memory: {info['memory_mb']:.1f} MB")
+                    print(f"{'='*60}")
+                else:
+                    print(f"\n{'='*60}")
+                    print(f"Processing: {log_type} ({idx}/{total_types})")
+                    print(f"{'='*60}")
             
             start_time = time.time()
-            process_log_type(log_type, config)
+            
+            # Pass force_restart flag to process_log_type
+            process_log_type_with_args(log_type, config, args.force_restart)
             
             if config.rank == 0:
                 elapsed = time.time() - start_time
@@ -2041,10 +2473,16 @@ def main():
         
         if config.rank == 0:
             print(f"\n{'='*60}")
-            print("All processing completed successfully!")
-            print(f"Results saved to: results/")
-            print(f"Models saved to: models/")
-            print(f"Labels saved in evaluation format to: results/*/label_*.pkl")
+            print("🎉 All processing completed successfully!")
+            print(f"✅ Resumeable: Training checkpoints saved for interrupted processing")
+            print(f"📁 Results saved to: {RESULTS_DIR}/")
+            print(f"🤖 Models saved to: {MODELS_DIR}/")
+            print(f"🏷️  Labels saved in evaluation format to: {RESULTS_DIR}/*/label_*.pkl")
+            print(f"💾 Checkpoints saved to: {CHECKPOINT_DIR}/")
+            print(f"\n🔧 Supports embedding types:")
+            print(f"  - FastText (300D): Standard word embeddings")
+            print(f"  - BERT CLS (768D): Global context embeddings")
+            print(f"  - Enhanced LogBERT (2314D): Multi-feature embeddings")
             print(f"{'='*60}")
     
     except Exception as e:

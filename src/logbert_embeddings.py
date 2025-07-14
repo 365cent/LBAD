@@ -52,10 +52,12 @@ from halo import Halo
 from typing import List, Dict, Tuple, Optional
 import time
 import psutil
+import hashlib
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
 PROCESSED_DIR = Path("processed")
+CHECKPOINT_DIR = Path("checkpoints") / "logbert"
 VECTOR_SIZE = 2314  # Enhanced BERT: CLS(768) + Mean(768) + Max(768) + Attention(10)
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
@@ -418,6 +420,97 @@ def find_available_log_types():
     return sorted([path.name for path in PROCESSED_DIR.iterdir() 
                   if path.is_dir() and list(path.glob("*.tfrecord"))])
 
+def generate_data_hash(df):
+    """Generate a hash of the dataset for checkpoint validation."""
+    # Create a hash based on log content and labels
+    content = f"{len(df)}_{df['log'].iloc[0] if len(df) > 0 else ''}_{df['log'].iloc[-1] if len(df) > 0 else ''}"
+    return hashlib.md5(content.encode()).hexdigest()[:16]
+
+def save_checkpoint(log_type: str, stage: str, data: dict, data_hash: str):
+    """Save checkpoint for resumeable processing."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = CHECKPOINT_DIR / f"{log_type}_{stage}_{data_hash}.pkl"
+    
+    checkpoint_data = {
+        'log_type': log_type,
+        'stage': stage,
+        'data_hash': data_hash,
+        'timestamp': time.time(),
+        'data': data
+    }
+    
+    with open(checkpoint_file, 'wb') as f:
+        pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    print(f"💾 Checkpoint saved: {checkpoint_file.name}")
+    return checkpoint_file
+
+def load_checkpoint(log_type: str, stage: str, data_hash: str) -> Optional[dict]:
+    """Load checkpoint if it exists and matches the data hash."""
+    if not CHECKPOINT_DIR.exists():
+        return None
+    
+    checkpoint_file = CHECKPOINT_DIR / f"{log_type}_{stage}_{data_hash}.pkl"
+    
+    if checkpoint_file.exists():
+        try:
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            # Validate checkpoint
+            if (checkpoint_data['log_type'] == log_type and 
+                checkpoint_data['stage'] == stage and 
+                checkpoint_data['data_hash'] == data_hash):
+                
+                age_hours = (time.time() - checkpoint_data['timestamp']) / 3600
+                print(f"📂 Found checkpoint: {checkpoint_file.name} (age: {age_hours:.1f}h)")
+                return checkpoint_data['data']
+        except Exception as e:
+            print(f"⚠️  Checkpoint loading failed: {e}")
+            # Remove corrupted checkpoint
+            checkpoint_file.unlink(missing_ok=True)
+    
+    return None
+
+def cleanup_old_checkpoints(log_type: str, keep_latest: int = 3):
+    """Clean up old checkpoints, keeping only the latest ones."""
+    if not CHECKPOINT_DIR.exists():
+        return
+    
+    # Find all checkpoints for this log type
+    pattern = f"{log_type}_*.pkl"
+    checkpoints = list(CHECKPOINT_DIR.glob(pattern))
+    
+    if len(checkpoints) > keep_latest:
+        # Sort by modification time, keep latest
+        checkpoints.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        
+        for old_checkpoint in checkpoints[keep_latest:]:
+            old_checkpoint.unlink(missing_ok=True)
+            print(f"🗑️  Cleaned up old checkpoint: {old_checkpoint.name}")
+
+def check_existing_outputs(log_type: str) -> dict:
+    """Check if outputs already exist for this log type."""
+    output_dir = OUTPUT_DIR / log_type
+    
+    status = {
+        'log_embeddings': False,
+        'label_vectors': False,
+        'attack_types': False,
+        'visualization': False,
+        'complete': False
+    }
+    
+    if output_dir.exists():
+        status['log_embeddings'] = (output_dir / f"log_{log_type}.pkl").exists()
+        status['label_vectors'] = (output_dir / f"label_{log_type}.pkl").exists()
+        status['attack_types'] = (output_dir / f"attack_types_{log_type}.txt").exists()
+        status['visualization'] = (output_dir / "visualization.png").exists()
+        status['complete'] = all([status['log_embeddings'], status['label_vectors'], 
+                                status['attack_types'], status['visualization']])
+    
+    return status
+
 
 # ---------------------------------------------------------------------------
 # Dataset Class for BERT
@@ -659,8 +752,24 @@ def extract_bert_embeddings(df, device, performance_config=None):
     return combined_embeddings
 
 
-def process_embeddings(df, device, use_global_attack_list=False, performance_config=None):
-    """Process logs and create BERT embeddings with binary label vectors."""
+def process_embeddings(df, device, use_global_attack_list=False, performance_config=None, log_type=None):
+    """Process logs and create BERT embeddings with binary label vectors - resumeable."""
+    data_hash = generate_data_hash(df)
+    
+    # Check for checkpoint
+    if log_type:
+        checkpoint_data = load_checkpoint(log_type, "embeddings", data_hash)
+        if checkpoint_data:
+            print("✅ Resuming from embeddings checkpoint")
+            # Reconstruct dataframe from checkpoint
+            df['log_embedding'] = checkpoint_data['log_embeddings']
+            df['binary_labels'] = checkpoint_data['binary_labels']
+            if 'attack_types' in checkpoint_data:
+                df.attrs['attack_types'] = checkpoint_data['attack_types']
+            if 'log_type_to_attacks' in checkpoint_data:
+                df.attrs['log_type_to_attacks'] = checkpoint_data['log_type_to_attacks']
+            return df
+    
     # Extract BERT embeddings with performance optimization
     log_embeddings = extract_bert_embeddings(df, device, performance_config)
     df['log_embedding'] = list(log_embeddings)
@@ -680,24 +789,42 @@ def process_embeddings(df, device, use_global_attack_list=False, performance_con
         
         df['binary_labels'] = binary_labels
         df.attrs['attack_types'] = attack_types
+        
+        # Save checkpoint
+        if log_type:
+            checkpoint_data = {
+                'log_embeddings': list(log_embeddings),
+                'binary_labels': binary_labels,
+                'attack_types': attack_types
+            }
+            save_checkpoint(log_type, "embeddings", checkpoint_data, data_hash)
     else:
         # Process by log type
         log_type_to_attacks = {}
-        for log_type, group_df in df.groupby('log_type'):
-            spinner.text = f"Processing log type: {log_type}"
-            log_type_to_attacks[log_type] = collect_unique_labels_from_data(group_df)
+        for lt, group_df in df.groupby('log_type'):
+            spinner.text = f"Processing log type: {lt}"
+            log_type_to_attacks[lt] = collect_unique_labels_from_data(group_df)
         
         binary_labels = []
         for idx, row in df.iterrows():
-            log_type = row['log_type']
-            if log_type in log_type_to_attacks:
-                binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[log_type])
+            lt = row['log_type']
+            if lt in log_type_to_attacks:
+                binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[lt])
             else:
                 binary_vector = np.array([], dtype=np.int8)
             binary_labels.append(binary_vector)
         
         df['binary_labels'] = binary_labels
         df.attrs['log_type_to_attacks'] = log_type_to_attacks
+        
+        # Save checkpoint
+        if log_type:
+            checkpoint_data = {
+                'log_embeddings': list(log_embeddings),
+                'binary_labels': binary_labels,
+                'log_type_to_attacks': log_type_to_attacks
+            }
+            save_checkpoint(log_type, "embeddings", checkpoint_data, data_hash)
     
     spinner.succeed("Label processing complete")
     return df
@@ -946,10 +1073,23 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate LogBERT CLS embeddings for log data")
+    parser = argparse.ArgumentParser(description="Generate LogBERT CLS embeddings for log data - Resumeable")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--sample-size", type=int, default=None, help="Process only this many log entries (for testing)")
+    parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing outputs)")
+    parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all checkpoints before starting")
     args = parser.parse_args()
+    
+    # Clean checkpoints if requested
+    if args.clean_checkpoints:
+        import shutil
+        if CHECKPOINT_DIR.exists():
+            shutil.rmtree(CHECKPOINT_DIR)
+            print("🗑️  Cleaned up all checkpoints")
+    
+    # Override completion check if force restart
+    if args.force_restart:
+        print("🔄 Force restart enabled - will reprocess all data")
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1011,6 +1151,37 @@ def main():
     # Process individual log types
     for log_type in types_to_process:
         print(f"\n{'='*50}\nProcessing log type: {log_type}\n{'='*50}")
+        
+        # Check if already completed (unless force restart)
+        output_status = check_existing_outputs(log_type)
+        if output_status['complete'] and not args.sample_size and not args.force_restart:
+            print(f"✅ {log_type} already completed. Skipping.")
+            print(f"   Files: log✓ labels✓ attack_types✓ visualization✓")
+            continue
+        elif output_status['log_embeddings'] and output_status['label_vectors']:
+            print(f"🔄 {log_type} partially completed. Only creating visualization...")
+            try:
+                # Load existing data for visualization only
+                output_dir = OUTPUT_DIR / log_type
+                with open(output_dir / f"log_{log_type}.pkl", 'rb') as f:
+                    embeddings = pickle.load(f)
+                with open(output_dir / f"label_{log_type}.pkl", 'rb') as f:
+                    label_data = pickle.load(f)
+                
+                # Create a minimal df for visualization
+                df_viz = pd.DataFrame({
+                    'log_embedding': list(embeddings),
+                    'label_json': ['[]'] * len(embeddings),  # Dummy labels for viz
+                    'log_type': [log_type] * len(embeddings)
+                })
+                
+                visualize_embeddings(df_viz, output_file=output_dir / "visualization.png")
+                print(f"✅ Visualization completed for {log_type}")
+                continue
+            except Exception as e:
+                print(f"⚠️  Could not create visualization from existing data: {e}")
+                # Continue with full processing
+        
         try:
             # Load data for this log type
             df = load_tfrecord_files(log_type_filter=log_type)
@@ -1044,8 +1215,9 @@ def main():
             # Display data distribution
             display_data_distribution(df, log_type)
 
-            # Process embeddings with performance optimization
-            df = process_embeddings(df, device, use_global_attack_list=False, performance_config=perf_config)
+            # Process embeddings with performance optimization and checkpointing
+            df = process_embeddings(df, device, use_global_attack_list=False, 
+                                 performance_config=perf_config, log_type=log_type)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
@@ -1059,78 +1231,107 @@ def main():
                 output_file=output_dir / "visualization.png"
             )
             
+            # Clean up old checkpoints after successful completion
+            cleanup_old_checkpoints(log_type)
+            
             # Clear memory
             del df
             clear_memory(device)
             
+            print(f"✅ Completed processing {log_type}")
+            
+        except KeyboardInterrupt:
+            print(f"\n⚠️  Processing interrupted for {log_type}. Checkpoint saved.")
+            break
         except Exception as e:
-            print(f"Error processing log type {log_type}: {e}")
+            print(f"❌ Error processing log type {log_type}: {e}")
             import traceback
             traceback.print_exc()
 
     # Process combined model if requested
     if run_combined:
         print(f"\n{'='*50}\nProcessing all log types combined\n{'='*50}")
-        try:
-            # Load all data
-            df_all = load_tfrecord_files()
-            if df_all.empty:
-                print("No data found for combined log types")
-            else:
-                # Sample data if requested
-                if args.sample_size and len(df_all) > args.sample_size:
-                    print(f"Sampling {args.sample_size} entries from {len(df_all)} total entries")
-                    df_all = df_all.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
-                
-                # Get performance configuration
-                dataset_size = len(df_all)
-                if dataset_size < SMALL_DATASET_THRESHOLD:
-                    size_category = "small"
-                elif dataset_size < MEDIUM_DATASET_THRESHOLD:
-                    size_category = "medium"
-                elif dataset_size < LARGE_DATASET_THRESHOLD:
-                    size_category = "large"
-                else:
-                    size_category = "very_large"
-                
-                perf_config = get_performance_config(size_category, device.type)
-                time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
-                
-                print(f"Combined dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
-                print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
-                
-                display_data_distribution(df_all, "all combined")
-                df_all = process_embeddings(df_all, device, use_global_attack_list=True, performance_config=perf_config)
-                
-                # Save combined outputs
-                save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
-                
-                # Create visualization
-                visualize_embeddings(
-                    df_all,
-                    output_file=OUTPUT_DIR / "visualization_all_combined.png"
-                )
-                
-                # Clear memory
-                del df_all
-                clear_memory(device)
         
-        except Exception as e:
-            print(f"Error processing combined log types: {e}")
-            import traceback
-            traceback.print_exc()
+        # Check if combined already exists (unless force restart)
+        combined_status = check_existing_outputs("all_combined")
+        if combined_status['complete'] and not args.sample_size and not args.force_restart:
+            print(f"✅ Combined model already completed. Skipping.")
+            print(f"   Files: log✓ labels✓ attack_types✓ visualization✓")
+        else:
+            try:
+                # Load all data
+                df_all = load_tfrecord_files()
+                if df_all.empty:
+                    print("No data found for combined log types")
+                else:
+                    # Sample data if requested
+                    if args.sample_size and len(df_all) > args.sample_size:
+                        print(f"Sampling {args.sample_size} entries from {len(df_all)} total entries")
+                        df_all = df_all.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
+                    
+                    # Get performance configuration
+                    dataset_size = len(df_all)
+                    if dataset_size < SMALL_DATASET_THRESHOLD:
+                        size_category = "small"
+                    elif dataset_size < MEDIUM_DATASET_THRESHOLD:
+                        size_category = "medium"
+                    elif dataset_size < LARGE_DATASET_THRESHOLD:
+                        size_category = "large"
+                    else:
+                        size_category = "very_large"
+                    
+                    perf_config = get_performance_config(size_category, device.type)
+                    time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
+                    
+                    print(f"Combined dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
+                    print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
+                    
+                    display_data_distribution(df_all, "all combined")
+                    df_all = process_embeddings(df_all, device, use_global_attack_list=True, 
+                                             performance_config=perf_config, log_type="all_combined")
+                    
+                    # Save combined outputs
+                    save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
+                    
+                    # Create visualization
+                    visualize_embeddings(
+                        df_all,
+                        output_file=OUTPUT_DIR / "visualization_all_combined.png"
+                    )
+                    
+                    # Clean up old checkpoints
+                    cleanup_old_checkpoints("all_combined")
+                    
+                    # Clear memory
+                    del df_all
+                    clear_memory(device)
+                    
+                    print(f"✅ Completed processing combined model")
+            
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Combined processing interrupted. Checkpoint saved.")
+            except Exception as e:
+                print(f"❌ Error processing combined log types: {e}")
+                import traceback
+                traceback.print_exc()
     
     spinner = Halo(spinner='dots', text='Completing processing')
     spinner.start()
     spinner.succeed("Enhanced LogBERT embedding processing complete!")
-    print("\nNote: Output format is compatible with FastText embeddings for downstream tasks.")
-    print("The main difference is the embedding dimension: 2314D (Enhanced BERT) vs 300D (FastText)")
-    print("\nEnhanced embeddings capture:")
+    
+    print("\n🎉 Processing Summary:")
+    print("=" * 60)
+    print("✅ Resumeable: Checkpoints saved for interrupted processing")
+    print("✅ Output format: Compatible with FastText embeddings for downstream tasks")
+    print("✅ Embedding dimension: 2314D (Enhanced BERT) vs 300D (FastText)")
+    print("\n📊 Enhanced embeddings capture:")
     print("  1. Global context (CLS token) - what the log means overall")
     print("  2. Average representation (mean pooling) - typical patterns")
     print("  3. Key features (max pooling) - most important elements")
     print("  4. Attention patterns - which parts of the log are most significant")
-    print("\nThis richer representation should improve anomaly detection performance.")
+    print("\n💡 This richer representation should improve anomaly detection performance.")
+    print("💾 Checkpoints saved in: checkpoints/logbert/")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
