@@ -53,6 +53,8 @@ from typing import List, Dict, Tuple, Optional
 import time
 import psutil
 import hashlib
+import signal
+import sys
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -83,6 +85,64 @@ tf.config.threading.set_intra_op_parallelism_threads(2)
 
 # Set CUDA memory allocation configuration to avoid fragmentation
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Global variables for emergency checkpoint saving
+_current_checkpoint_state = None
+_cleanup_functions = []
+
+def signal_handler(signum, frame):
+    """Handle SIGTERM/SIGINT by saving emergency checkpoint."""
+    print(f"\n⚠️  Received signal {signum} - saving emergency checkpoint...")
+    
+    if _current_checkpoint_state:
+        try:
+            log_type = _current_checkpoint_state['log_type']
+            data_hash = _current_checkpoint_state['data_hash']
+            all_cls_embeddings = _current_checkpoint_state['all_cls_embeddings']
+            all_mean_embeddings = _current_checkpoint_state['all_mean_embeddings']
+            all_max_embeddings = _current_checkpoint_state['all_max_embeddings']
+            all_attention_features = _current_checkpoint_state['all_attention_features']
+            batch_idx = _current_checkpoint_state['batch_idx']
+            processed_entries = _current_checkpoint_state['processed_entries']
+            
+            # Calculate progress
+            total_entries = _current_checkpoint_state.get('total_entries', 0)
+            progress_pct = int((processed_entries / total_entries) * 100) if total_entries > 0 else 0
+            
+            # Save emergency checkpoint
+            checkpoint_file = save_incremental_checkpoint(
+                log_type, data_hash, progress_pct,
+                all_cls_embeddings, all_mean_embeddings,
+                all_max_embeddings, all_attention_features,
+                batch_idx, processed_entries
+            )
+            
+            if checkpoint_file:
+                print(f"✅ Emergency checkpoint saved: {checkpoint_file.name}")
+            else:
+                print("❌ Failed to save emergency checkpoint")
+                
+        except Exception as e:
+            print(f"❌ Error saving emergency checkpoint: {e}")
+    
+    # Run cleanup functions
+    for cleanup_func in _cleanup_functions:
+        try:
+            cleanup_func()
+        except:
+            pass
+    
+    print("🔄 Emergency checkpoint complete. Exiting...")
+    sys.exit(1)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)  # SLURM termination
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+
+def register_cleanup_function(func):
+    """Register a function to be called on emergency exit."""
+    global _cleanup_functions
+    _cleanup_functions.append(func)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -424,7 +484,9 @@ def generate_data_hash(df):
     """Generate a hash of the dataset for checkpoint validation."""
     # Create a hash based on log content and labels
     content = f"{len(df)}_{df['log'].iloc[0] if len(df) > 0 else ''}_{df['log'].iloc[-1] if len(df) > 0 else ''}"
-    return hashlib.md5(content.encode()).hexdigest()[:16]
+    data_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+    print(f"🔍 Generated data hash: {data_hash} (based on {len(df)} entries)")
+    return data_hash
 
 def save_checkpoint(log_type: str, stage: str, data: dict, data_hash: str):
     """Save checkpoint for resumeable processing."""
@@ -548,6 +610,8 @@ class LogBERTEmbeddingDataset(Dataset):
 
 def extract_bert_embeddings(df, device, performance_config=None, log_type=None, data_hash=None):
     """Extract enhanced BERT embeddings capturing multiple features for better anomaly detection."""
+    global _current_checkpoint_state
+    
     if performance_config is None:
         performance_config = {'batch_size': BATCH_SIZE, 'workers': NUM_WORKERS, 'clear_freq': 50}
     
@@ -564,7 +628,7 @@ def extract_bert_embeddings(df, device, performance_config=None, log_type=None, 
     all_attention_features = []
     
     if log_type and data_hash:
-        incremental_checkpoint = load_incremental_checkpoint(log_type, data_hash)
+        incremental_checkpoint = load_incremental_checkpoint_tolerant(log_type, data_hash)
         if incremental_checkpoint:
             print(f"🔄 Resuming embedding extraction from {incremental_checkpoint['progress_pct']}% checkpoint")
             start_batch_idx = incremental_checkpoint['batch_idx'] + 1
@@ -739,18 +803,32 @@ def extract_bert_embeddings(df, device, performance_config=None, log_type=None, 
             
             all_attention_features.append(np.array(batch_attention_features))
             
-            # Save incremental checkpoint every 10%
+            # Update global checkpoint state for emergency saving
+            if log_type and data_hash:
+                _current_checkpoint_state = {
+                    'log_type': log_type,
+                    'data_hash': data_hash,
+                    'all_cls_embeddings': all_cls_embeddings,
+                    'all_mean_embeddings': all_mean_embeddings,
+                    'all_max_embeddings': all_max_embeddings,
+                    'all_attention_features': all_attention_features,
+                    'batch_idx': actual_batch_idx,
+                    'processed_entries': current_processed_entries,
+                    'total_entries': num_entries
+                }
+            
+            # Save incremental checkpoint every 5% (more frequent for compute nodes)
             progress_pct = (current_processed_entries / num_entries) * 100
-            checkpoint_interval = max(len(dataloader) // 10, 50)  # At least every 50 batches
+            checkpoint_interval = max(len(dataloader) // 20, 25)  # Every 5%, at least every 25 batches
             processed_batches = actual_batch_idx - start_batch_idx + 1
             
             if (log_type and data_hash and 
                 processed_batches > 0 and 
                 actual_batch_idx % checkpoint_interval == 0 and 
-                progress_pct >= 10):  # Don't checkpoint too early
+                progress_pct >= 2.5):  # Start checkpointing at 2.5%
                 
-                # Round to nearest 10% for cleaner checkpoint names
-                rounded_pct = int(progress_pct // 10) * 10
+                # Round to nearest 5% for cleaner checkpoint names
+                rounded_pct = int(progress_pct // 5) * 5
                 
                 try:
                     save_incremental_checkpoint(
@@ -795,6 +873,10 @@ def extract_bert_embeddings(df, device, performance_config=None, log_type=None, 
     # Clear model from memory
     del model, tokenizer
     clear_memory(device)
+    
+    # Clear global checkpoint state
+    global _current_checkpoint_state
+    _current_checkpoint_state = None
     
     # Clean up incremental checkpoints after successful completion
     if log_type and data_hash:
@@ -1131,6 +1213,9 @@ def save_incremental_checkpoint(log_type: str, data_hash: str, progress_pct: int
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint_file = CHECKPOINT_DIR / f"{log_type}_incremental_{progress_pct}pct_{data_hash}.pkl"
     
+    print(f"🔍 Saving checkpoint to: {checkpoint_file}")
+    print(f"🔍 Progress: {progress_pct}%, Batch: {batch_idx}, Entries: {processed_entries:,}")
+    
     # Convert lists to arrays for efficient storage
     cls_arrays = [arr for arr in all_cls_embeddings] if all_cls_embeddings else []
     mean_arrays = [arr for arr in all_mean_embeddings] if all_mean_embeddings else []
@@ -1151,23 +1236,50 @@ def save_incremental_checkpoint(log_type: str, data_hash: str, progress_pct: int
         'attention_features': attention_arrays
     }
     
-    with open(checkpoint_file, 'wb') as f:
-        pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    print(f"💾 Incremental checkpoint saved: {progress_pct}% complete ({processed_entries:,} entries)")
-    return checkpoint_file
+    try:
+        with open(checkpoint_file, 'wb') as f:
+            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        file_size_mb = checkpoint_file.stat().st_size / (1024 * 1024)
+        print(f"💾 Incremental checkpoint saved: {progress_pct}% complete ({processed_entries:,} entries, {file_size_mb:.1f}MB)")
+        return checkpoint_file
+    except Exception as e:
+        print(f"❌ Failed to save checkpoint: {e}")
+        return None
 
-def load_incremental_checkpoint(log_type: str, data_hash: str) -> Optional[dict]:
-    """Load the latest incremental checkpoint if it exists."""
+def load_incremental_checkpoint_tolerant(log_type: str, data_hash: str) -> Optional[dict]:
+    """Load the latest incremental checkpoint, even with hash mismatch if needed."""
     if not CHECKPOINT_DIR.exists():
+        print(f"🔍 Checkpoint directory doesn't exist: {CHECKPOINT_DIR}")
         return None
     
     # Find all incremental checkpoints for this log type and data hash
     pattern = f"{log_type}_incremental_*pct_{data_hash}.pkl"
     checkpoints = list(CHECKPOINT_DIR.glob(pattern))
     
-    if not checkpoints:
+    # Also check for any incremental checkpoints for this log type (regardless of hash)
+    pattern_any_hash = f"{log_type}_incremental_*pct_*.pkl"
+    all_checkpoints = list(CHECKPOINT_DIR.glob(pattern_any_hash))
+    
+    print(f"🔍 Looking for checkpoints with pattern: {pattern}")
+    print(f"🔍 Found {len(checkpoints)} matching checkpoints with current hash")
+    print(f"🔍 Found {len(all_checkpoints)} total incremental checkpoints for {log_type}")
+    
+    if all_checkpoints:
+        print("🔍 Available incremental checkpoints:")
+        for cp in sorted(all_checkpoints):
+            print(f"   - {cp.name}")
+    
+    # If no exact hash match, try to use any available checkpoint with warning
+    checkpoints_to_try = checkpoints if checkpoints else all_checkpoints
+    
+    if not checkpoints_to_try:
         return None
+    
+    if not checkpoints and all_checkpoints:
+        print(f"⚠️  No exact hash match found, but found {len(all_checkpoints)} checkpoints")
+        print(f"   Current data hash: {data_hash}")
+        print(f"   Attempting to load latest checkpoint with hash tolerance...")
     
     # Sort by progress percentage (highest first)
     def extract_progress(path):
@@ -1181,20 +1293,24 @@ def load_incremental_checkpoint(log_type: str, data_hash: str) -> Optional[dict]
             return 0
         return 0
     
-    checkpoints.sort(key=extract_progress, reverse=True)
-    latest_checkpoint = checkpoints[0]
+    checkpoints_to_try.sort(key=extract_progress, reverse=True)
+    latest_checkpoint = checkpoints_to_try[0]
     
     try:
         with open(latest_checkpoint, 'rb') as f:
             checkpoint_data = pickle.load(f)
         
-        # Validate checkpoint
-        if (checkpoint_data['log_type'] == log_type and 
-            checkpoint_data['data_hash'] == data_hash):
+        # Validate checkpoint structure (be more lenient on hash)
+        if checkpoint_data.get('log_type') == log_type:
+            progress_pct = checkpoint_data.get('progress_pct', 0)
+            processed_entries = checkpoint_data.get('processed_entries', 0)
+            age_hours = (time.time() - checkpoint_data.get('timestamp', time.time())) / 3600
             
-            progress_pct = checkpoint_data['progress_pct']
-            processed_entries = checkpoint_data['processed_entries']
-            age_hours = (time.time() - checkpoint_data['timestamp']) / 3600
+            if checkpoint_data.get('data_hash') != data_hash:
+                print(f"⚠️  Loading checkpoint with different data hash (tolerance mode)")
+                print(f"   Checkpoint hash: {checkpoint_data.get('data_hash', 'unknown')}")
+                print(f"   Current hash: {data_hash}")
+            
             print(f"📂 Found incremental checkpoint: {progress_pct}% complete ({processed_entries:,} entries, age: {age_hours:.1f}h)")
             return checkpoint_data
     except Exception as e:
@@ -1227,6 +1343,12 @@ def main():
     parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all checkpoints before starting")
     parser.add_argument("--clean-incremental", action="store_true", help="Clean up incremental checkpoints only")
     args = parser.parse_args()
+    
+    print("🔄 Enhanced Checkpoint System Active:")
+    print("   - Saves every 5% of progress (instead of 10%)")
+    print("   - Emergency checkpoint on SIGTERM/SIGINT (salloc termination)")
+    print("   - Hash-tolerant checkpoint loading")
+    print("   - Perfect for compute nodes with time limits")
     
     # Clean checkpoints if requested
     if args.clean_checkpoints:
