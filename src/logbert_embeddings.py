@@ -1293,30 +1293,47 @@ def load_incremental_checkpoint_tolerant(log_type: str, data_hash: str) -> Optio
         return 0
     
     checkpoints_to_try.sort(key=extract_progress, reverse=True)
-    latest_checkpoint = checkpoints_to_try[0]
     
-    try:
-        with open(latest_checkpoint, 'rb') as f:
-            checkpoint_data = pickle.load(f)
-        
-        # Validate checkpoint structure (be more lenient on hash)
-        if checkpoint_data.get('log_type') == log_type:
-            progress_pct = checkpoint_data.get('progress_pct', 0)
-            processed_entries = checkpoint_data.get('processed_entries', 0)
-            age_hours = (time.time() - checkpoint_data.get('timestamp', time.time())) / 3600
+    # Try loading checkpoints in descending order until one works
+    for checkpoint_file in checkpoints_to_try:
+        try:
+            print(f"🔄 Attempting to load: {checkpoint_file.name}")
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
             
-            if checkpoint_data.get('data_hash') != data_hash:
-                print(f"⚠️  Loading checkpoint with different data hash (tolerance mode)")
-                print(f"   Checkpoint hash: {checkpoint_data.get('data_hash', 'unknown')}")
-                print(f"   Current hash: {data_hash}")
+            # Validate checkpoint structure (be more lenient on hash)
+            if checkpoint_data.get('log_type') == log_type:
+                progress_pct = checkpoint_data.get('progress_pct', 0)
+                processed_entries = checkpoint_data.get('processed_entries', 0)
+                age_hours = (time.time() - checkpoint_data.get('timestamp', time.time())) / 3600
+                
+                # Additional validation - check if embeddings exist and are valid
+                cls_embeddings = checkpoint_data.get('cls_embeddings', [])
+                if not cls_embeddings:
+                    print(f"⚠️  Checkpoint {checkpoint_file.name} has no embeddings data, trying next...")
+                    continue
+                
+                if checkpoint_data.get('data_hash') != data_hash:
+                    print(f"⚠️  Loading checkpoint with different data hash (tolerance mode)")
+                    print(f"   Checkpoint hash: {checkpoint_data.get('data_hash', 'unknown')}")
+                    print(f"   Current hash: {data_hash}")
+                
+                print(f"✅ Successfully loaded checkpoint: {progress_pct}% complete ({processed_entries:,} entries, age: {age_hours:.1f}h)")
+                return checkpoint_data
             
-            print(f"📂 Found incremental checkpoint: {progress_pct}% complete ({processed_entries:,} entries, age: {age_hours:.1f}h)")
-            return checkpoint_data
-    except Exception as e:
-        print(f"⚠️  Incremental checkpoint loading failed: {e}")
-        # Remove corrupted checkpoint
-        latest_checkpoint.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"⚠️  Failed to load {checkpoint_file.name}: {e}")
+            # Automatically remove corrupted checkpoints
+            if "Ran out of input" in str(e) or "corrupt" in str(e).lower() or "truncated" in str(e).lower():
+                print(f"🗑️  Removing corrupted checkpoint: {checkpoint_file.name}")
+                try:
+                    checkpoint_file.unlink(missing_ok=True)
+                    print(f"✅ Corrupted checkpoint removed")
+                except:
+                    print(f"⚠️  Could not remove corrupted checkpoint")
+            continue
     
+    print("❌ No valid checkpoints could be loaded")
     return None
 
 def cleanup_incremental_checkpoints(log_type: str, data_hash: str):
@@ -1343,11 +1360,7 @@ def main():
     parser.add_argument("--clean-incremental", action="store_true", help="Clean up incremental checkpoints only")
     args = parser.parse_args()
     
-    print("🔄 Enhanced Checkpoint System Active:")
-    print("   - Saves every 5% of progress (instead of 10%)")
-    print("   - Emergency checkpoint on SIGTERM/SIGINT (salloc termination)")
-    print("   - Hash-tolerant checkpoint loading")
-    print("   - Perfect for compute nodes with time limits")
+    print("🔄 Auto-Resume System: Saves every 5%, auto-recovers from crashes, perfect for compute nodes")
     
     # Clean checkpoints if requested
     if args.clean_checkpoints:
