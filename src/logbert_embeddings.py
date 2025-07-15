@@ -871,7 +871,6 @@ def extract_bert_embeddings(df, device, performance_config=None, log_type=None, 
     spinner.text = f"Combined embedding shape: {combined_embeddings.shape} (2314D per log)"
     
     # Clear global checkpoint state
-    global _current_checkpoint_state
     _current_checkpoint_state = None
     
     # Clear model from memory
