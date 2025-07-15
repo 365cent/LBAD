@@ -546,7 +546,7 @@ class LogBERTEmbeddingDataset(Dataset):
         }
 
 
-def extract_bert_embeddings(df, device, performance_config=None):
+def extract_bert_embeddings(df, device, performance_config=None, log_type=None, data_hash=None):
     """Extract enhanced BERT embeddings capturing multiple features for better anomaly detection."""
     if performance_config is None:
         performance_config = {'batch_size': BATCH_SIZE, 'workers': NUM_WORKERS, 'clear_freq': 50}
@@ -556,8 +556,27 @@ def extract_bert_embeddings(df, device, performance_config=None):
     num_workers = performance_config['workers']
     clear_freq = performance_config['clear_freq']
     
+    # Check for incremental checkpoint
+    start_batch_idx = 0
+    all_cls_embeddings = []
+    all_mean_embeddings = []
+    all_max_embeddings = []
+    all_attention_features = []
+    
+    if log_type and data_hash:
+        incremental_checkpoint = load_incremental_checkpoint(log_type, data_hash)
+        if incremental_checkpoint:
+            print(f"🔄 Resuming embedding extraction from {incremental_checkpoint['progress_pct']}% checkpoint")
+            start_batch_idx = incremental_checkpoint['batch_idx'] + 1
+            all_cls_embeddings = incremental_checkpoint['cls_embeddings']
+            all_mean_embeddings = incremental_checkpoint['mean_embeddings']
+            all_max_embeddings = incremental_checkpoint['max_embeddings']
+            all_attention_features = incremental_checkpoint['attention_features']
+            print(f"✅ Loaded {len(all_cls_embeddings)} existing embedding batches")
+    
     # Estimate processing time
-    time_estimate = estimate_processing_time(num_entries, batch_size, device.type)
+    remaining_entries = num_entries - (start_batch_idx * batch_size)
+    time_estimate = estimate_processing_time(remaining_entries, batch_size, device.type)
     
     spinner = Halo(text=f'Initializing BERT model (ETA: {time_estimate})', spinner='dots')
     spinner.start()
@@ -592,24 +611,29 @@ def extract_bert_embeddings(df, device, performance_config=None):
         persistent_workers=num_workers > 0
     )
     
-    # Extract multiple types of embeddings
-    all_cls_embeddings = []
-    all_mean_embeddings = []
-    all_max_embeddings = []
-    all_attention_features = []
+    # Initialize timing
     start_time = time.time()
     
     spinner = Halo(text=f'Extracting enhanced BERT embeddings (ETA: {time_estimate})', spinner='dots')
     spinner.start()
     
+    # Handle resumed processing by iterating through dataloader and skipping processed batches
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            actual_batch_idx = batch_idx
+            
+            # Skip batches if resuming from checkpoint
+            if actual_batch_idx < start_batch_idx:
+                continue
+            current_processed_entries = actual_batch_idx * batch_size
+            
             # Update progress with time estimation
-            if batch_idx % 10 == 0:
+            if actual_batch_idx % 10 == 0 and actual_batch_idx >= start_batch_idx:
                 elapsed = time.time() - start_time
-                if batch_idx > 0:
-                    rate = (batch_idx * batch_size) / elapsed
-                    remaining_entries = num_entries - (batch_idx * batch_size)
+                processed_batches = actual_batch_idx - start_batch_idx + 1
+                if processed_batches > 0:
+                    rate = (processed_batches * batch_size) / elapsed
+                    remaining_entries = num_entries - current_processed_entries
                     eta_seconds = remaining_entries / rate if rate > 0 else 0
                     
                     if eta_seconds < 60:
@@ -619,13 +643,13 @@ def extract_bert_embeddings(df, device, performance_config=None):
                     else:
                         eta_str = f"{eta_seconds/3600:.1f}h"
                     
-                    progress_pct = (batch_idx * batch_size) / num_entries * 100
+                    progress_pct = current_processed_entries / num_entries * 100
                     spinner.text = f'Extracting enhanced embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
                 else:
-                    spinner.text = f'Extracting embeddings: batch {batch_idx+1}/{len(dataloader)}'
+                    spinner.text = f'Extracting embeddings: batch {actual_batch_idx+1}/{len(dataloader)}'
             
             # Clear memory before processing each batch for CUDA
-            if device.type == "cuda" and batch_idx % 5 == 0:
+            if device.type == "cuda" and actual_batch_idx % 5 == 0:
                 clear_memory(device)
             
             try:
@@ -640,7 +664,7 @@ def extract_bert_embeddings(df, device, performance_config=None):
                 )
             except torch.cuda.OutOfMemoryError:
                 # If we run out of memory, clear everything and process samples one by one
-                spinner.text = f'Memory error at batch {batch_idx+1}, switching to single-sample processing'
+                spinner.text = f'Memory error at batch {actual_batch_idx+1}, switching to single-sample processing'
                 clear_memory(device)
                 
                 # Process each sample in the batch individually
@@ -715,8 +739,31 @@ def extract_bert_embeddings(df, device, performance_config=None):
             
             all_attention_features.append(np.array(batch_attention_features))
             
+            # Save incremental checkpoint every 10%
+            progress_pct = (current_processed_entries / num_entries) * 100
+            checkpoint_interval = max(len(dataloader) // 10, 50)  # At least every 50 batches
+            processed_batches = actual_batch_idx - start_batch_idx + 1
+            
+            if (log_type and data_hash and 
+                processed_batches > 0 and 
+                actual_batch_idx % checkpoint_interval == 0 and 
+                progress_pct >= 10):  # Don't checkpoint too early
+                
+                # Round to nearest 10% for cleaner checkpoint names
+                rounded_pct = int(progress_pct // 10) * 10
+                
+                try:
+                    save_incremental_checkpoint(
+                        log_type, data_hash, rounded_pct,
+                        all_cls_embeddings, all_mean_embeddings,
+                        all_max_embeddings, all_attention_features,
+                        actual_batch_idx, current_processed_entries
+                    )
+                except Exception as e:
+                    print(f"⚠️  Failed to save incremental checkpoint: {e}")
+            
             # Clear memory periodically based on performance config
-            if batch_idx % clear_freq == 0:
+            if actual_batch_idx % clear_freq == 0:
                 clear_memory(device)
             
             # Move tensors to CPU immediately after processing to free GPU memory
@@ -749,6 +796,10 @@ def extract_bert_embeddings(df, device, performance_config=None):
     del model, tokenizer
     clear_memory(device)
     
+    # Clean up incremental checkpoints after successful completion
+    if log_type and data_hash:
+        cleanup_incremental_checkpoints(log_type, data_hash)
+    
     return combined_embeddings
 
 
@@ -771,7 +822,7 @@ def process_embeddings(df, device, use_global_attack_list=False, performance_con
             return df
     
     # Extract BERT embeddings with performance optimization
-    log_embeddings = extract_bert_embeddings(df, device, performance_config)
+    log_embeddings = extract_bert_embeddings(df, device, performance_config, log_type, data_hash)
     df['log_embedding'] = list(log_embeddings)
     
     # Process labels
@@ -1072,12 +1123,109 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
         spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
 
+def save_incremental_checkpoint(log_type: str, data_hash: str, progress_pct: int, 
+                                all_cls_embeddings: list, all_mean_embeddings: list, 
+                                all_max_embeddings: list, all_attention_features: list, 
+                                batch_idx: int, processed_entries: int):
+    """Save incremental checkpoint during embedding extraction."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = CHECKPOINT_DIR / f"{log_type}_incremental_{progress_pct}pct_{data_hash}.pkl"
+    
+    # Convert lists to arrays for efficient storage
+    cls_arrays = [arr for arr in all_cls_embeddings] if all_cls_embeddings else []
+    mean_arrays = [arr for arr in all_mean_embeddings] if all_mean_embeddings else []
+    max_arrays = [arr for arr in all_max_embeddings] if all_max_embeddings else []
+    attention_arrays = [arr for arr in all_attention_features] if all_attention_features else []
+    
+    checkpoint_data = {
+        'log_type': log_type,
+        'stage': 'embedding_extraction',
+        'data_hash': data_hash,
+        'progress_pct': progress_pct,
+        'batch_idx': batch_idx,
+        'processed_entries': processed_entries,
+        'timestamp': time.time(),
+        'cls_embeddings': cls_arrays,
+        'mean_embeddings': mean_arrays,
+        'max_embeddings': max_arrays,
+        'attention_features': attention_arrays
+    }
+    
+    with open(checkpoint_file, 'wb') as f:
+        pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    print(f"💾 Incremental checkpoint saved: {progress_pct}% complete ({processed_entries:,} entries)")
+    return checkpoint_file
+
+def load_incremental_checkpoint(log_type: str, data_hash: str) -> Optional[dict]:
+    """Load the latest incremental checkpoint if it exists."""
+    if not CHECKPOINT_DIR.exists():
+        return None
+    
+    # Find all incremental checkpoints for this log type and data hash
+    pattern = f"{log_type}_incremental_*pct_{data_hash}.pkl"
+    checkpoints = list(CHECKPOINT_DIR.glob(pattern))
+    
+    if not checkpoints:
+        return None
+    
+    # Sort by progress percentage (highest first)
+    def extract_progress(path):
+        try:
+            # Extract percentage from filename like "wp-access_incremental_70pct_hash.pkl"
+            parts = path.stem.split('_')
+            for part in parts:
+                if part.endswith('pct'):
+                    return int(part[:-3])
+        except:
+            return 0
+        return 0
+    
+    checkpoints.sort(key=extract_progress, reverse=True)
+    latest_checkpoint = checkpoints[0]
+    
+    try:
+        with open(latest_checkpoint, 'rb') as f:
+            checkpoint_data = pickle.load(f)
+        
+        # Validate checkpoint
+        if (checkpoint_data['log_type'] == log_type and 
+            checkpoint_data['data_hash'] == data_hash):
+            
+            progress_pct = checkpoint_data['progress_pct']
+            processed_entries = checkpoint_data['processed_entries']
+            age_hours = (time.time() - checkpoint_data['timestamp']) / 3600
+            print(f"📂 Found incremental checkpoint: {progress_pct}% complete ({processed_entries:,} entries, age: {age_hours:.1f}h)")
+            return checkpoint_data
+    except Exception as e:
+        print(f"⚠️  Incremental checkpoint loading failed: {e}")
+        # Remove corrupted checkpoint
+        latest_checkpoint.unlink(missing_ok=True)
+    
+    return None
+
+def cleanup_incremental_checkpoints(log_type: str, data_hash: str):
+    """Clean up incremental checkpoints after successful completion."""
+    if not CHECKPOINT_DIR.exists():
+        return
+    
+    pattern = f"{log_type}_incremental_*pct_{data_hash}.pkl"
+    checkpoints = list(CHECKPOINT_DIR.glob(pattern))
+    
+    for checkpoint in checkpoints:
+        checkpoint.unlink(missing_ok=True)
+    
+    if checkpoints:
+        print(f"🗑️  Cleaned up {len(checkpoints)} incremental checkpoints")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate LogBERT CLS embeddings for log data - Resumeable")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--sample-size", type=int, default=None, help="Process only this many log entries (for testing)")
     parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing outputs)")
     parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all checkpoints before starting")
+    parser.add_argument("--clean-incremental", action="store_true", help="Clean up incremental checkpoints only")
     args = parser.parse_args()
     
     # Clean checkpoints if requested
@@ -1086,6 +1234,12 @@ def main():
         if CHECKPOINT_DIR.exists():
             shutil.rmtree(CHECKPOINT_DIR)
             print("🗑️  Cleaned up all checkpoints")
+    elif args.clean_incremental:
+        if CHECKPOINT_DIR.exists():
+            incremental_files = list(CHECKPOINT_DIR.glob("*_incremental_*pct_*.pkl"))
+            for f in incremental_files:
+                f.unlink(missing_ok=True)
+            print(f"🗑️  Cleaned up {len(incremental_files)} incremental checkpoints")
     
     # Override completion check if force restart
     if args.force_restart:
