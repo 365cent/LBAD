@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Optimized Traditional ML for Log Analysis
------------------------------------------
-High-performance traditional ML methods (XGBoost, Random Forest, etc.)
-for log-based anomaly detection. Ultra-optimized for Apple Silicon.
+Multi-Label ML Baseline for Log Analysis
+----------------------------------------
+Traditional ML methods adapted for multi-label classification 
+to provide baseline comparison with transformer models.
 """
 
 import os
@@ -20,19 +20,28 @@ from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-from xgboost import XGBClassifier
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
+from sklearn.metrics import (
+    classification_report, f1_score, precision_score, recall_score,
+    hamming_loss, jaccard_score, accuracy_score, multilabel_confusion_matrix
+)
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
 import multiprocessing
-from functools import partial
 from tqdm import tqdm
-import tensorflow as tf
-import platform
-import subprocess
+import warnings
+warnings.filterwarnings('ignore')
+
+# Try XGBoost with fallback
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+    print("XGBoost not available, skipping XGB model")
 
 # Project paths
 ROOT = Path(__file__).resolve().parent.parent
@@ -45,421 +54,496 @@ RESULTS_DIR = ROOT / 'results'
 for dir_path in [MODELS_DIR, RESULTS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
-# For Apple Silicon optimization: tune thread counts
+# Optimization for multiple cores
 CPU_COUNT = os.cpu_count()
 if CPU_COUNT:
-    N_JOBS = max(1, CPU_COUNT - 1)  # Leave one core free
+    N_JOBS = max(1, CPU_COUNT - 1)
 else:
-    N_JOBS = -1  # Use all cores
+    N_JOBS = -1
 
-# Start timing
-start_time = time.time()
-
-# Define models with optimized parameters
-def create_models(random_state=42):
-    """Create ML models optimized for Apple Silicon."""
-    return {
-        'rf': RandomForestClassifier(
-            n_estimators=150,  # Increased from 100
-            max_depth=20,
-            min_samples_split=10,
-            min_samples_leaf=4,
+def create_multilabel_models(n_labels, random_state=42):
+    """Create multi-label ML models."""
+    models = {}
+    
+    # Random Forest - naturally handles multi-output
+    models['rf'] = MultiOutputClassifier(
+        RandomForestClassifier(
+            n_estimators=100,
+            max_depth=15,
+            min_samples_split=5,
+            min_samples_leaf=2,
             max_features='sqrt',
             bootstrap=True,
             random_state=random_state,
             n_jobs=N_JOBS,
-            verbose=0,
-            class_weight='balanced',  # Handle imbalanced classes
-            warm_start=True  # Enable warm start for better performance
-        ),
-        'xgb': XGBClassifier(
-            n_estimators=150,  # Increased from 100
-            max_depth=8,
-            learning_rate=0.1,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=1,
+            class_weight='balanced'
+        )
+    )
+    
+    # Logistic Regression - with MultiOutput wrapper
+    models['lr'] = MultiOutputClassifier(
+        LogisticRegression(
+            penalty='l2',
+            C=1.0,
+            solver='liblinear',  # Works well with small datasets
+            max_iter=1000,
             random_state=random_state,
-            n_jobs=N_JOBS,
-            tree_method='hist',  # Much faster on Apple Silicon
-            predictor='cpu_predictor',  # Optimized for Apple Silicon
-            enable_categorical=False,
-            use_label_encoder=False,
-            verbosity=0
-        ),
-        'knn': KNeighborsClassifier(
+            class_weight='balanced'
+        )
+    )
+    
+    # K-Nearest Neighbors - with MultiOutput wrapper
+    models['knn'] = MultiOutputClassifier(
+        KNeighborsClassifier(
             n_neighbors=5,
             weights='distance',
             algorithm='auto',
-            leaf_size=30,
             n_jobs=N_JOBS
-        ),
-        'lr': LogisticRegression(
-            penalty='l2',
-            C=1.0,
-            solver='saga',  # Fast solver that handles all penalties
-            max_iter=200,
-            random_state=random_state,
-            n_jobs=N_JOBS,
-            class_weight='balanced',  # Handle imbalanced classes
-            verbose=0
         )
-    }
-
-def parse_example(example):
-    """Parse a TensorFlow Example protocol buffer."""
-    feature_description = {
-        'l': tf.io.FixedLenFeature([], tf.string),  # log
-        'y': tf.io.FixedLenFeature([], tf.string),  # label
-    }
-    return tf.io.parse_single_example(example, feature_description)
-
-def load_embedding_data(embedding_type='fasttext'):
-    """Load embeddings and labels from pickle files."""
-    print(f"Loading {embedding_type} embeddings...")
+    )
     
-    # Map embedding type to directory name
-    if embedding_type == 'fasttext':
-        dir_name = 'all_combined'
-    else:
-        dir_name = embedding_type
+    # XGBoost if available
+    if HAS_XGBOOST:
+        models['xgb'] = MultiOutputClassifier(
+            XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=random_state,
+                n_jobs=N_JOBS,
+                tree_method='hist',
+                verbosity=0,
+                use_label_encoder=False,
+                eval_metric='logloss'
+            )
+        )
     
-    try:
-        # Load embeddings
-        embeddings_file = EMBEDDINGS_DIR / f'log_{dir_name}.pkl'
-        with open(embeddings_file, 'rb') as f:
-            embeddings = pickle.load(f)
+    return models
+
+def find_available_log_types():
+    """Find available log types from embeddings directory."""
+    log_types = []
+    
+    if EMBEDDINGS_DIR.exists():
+        for log_dir in EMBEDDINGS_DIR.iterdir():
+            if log_dir.is_dir():
+                log_file = log_dir / f"log_{log_dir.name}.pkl"
+                label_file = log_dir / f"label_{log_dir.name}.pkl"
+                
+                if log_file.exists() and label_file.exists():
+                    log_types.append(log_dir.name)
+    
+    return sorted(log_types)
+
+def load_multilabel_data(log_type):
+    """Load embeddings and multi-label data."""
+    print(f"Loading {log_type} data...")
+    
+    # Load embeddings
+    embeddings_file = EMBEDDINGS_DIR / log_type / f'log_{log_type}.pkl'
+    with open(embeddings_file, 'rb') as f:
+        embeddings = pickle.load(f)
+    
+    # Load labels
+    labels_file = EMBEDDINGS_DIR / log_type / f'label_{log_type}.pkl'
+    with open(labels_file, 'rb') as f:
+        label_data = pickle.load(f)
+    
+    # Try to load attack types description file
+    attack_types_file = EMBEDDINGS_DIR / log_type / f'attack_types_{log_type}.txt'
+    description_from_file = None
+    if attack_types_file.exists():
+        try:
+            with open(attack_types_file, 'r') as f:
+                description_from_file = f.read()
+                print(f"✅ Found attack types description file")
+        except Exception as e:
+            print(f"⚠️  Could not read attack types file: {e}")
+    
+    # Extract binary vectors and class names
+    if isinstance(label_data, dict) and 'vectors' in label_data:
+        binary_vectors = label_data['vectors']
+        class_names = label_data.get('classes', [])
         
-        # Load labels (now contains dictionary with 'vectors' key)
-        labels_file = EMBEDDINGS_DIR / f'label_{dir_name}.pkl' 
-        with open(labels_file, 'rb') as f:
-            label_data = pickle.load(f)
-        
-        # Extract binary vectors and class names
-        if isinstance(label_data, dict) and 'vectors' in label_data:
-            binary_vectors = label_data['vectors']
-            attack_types = label_data.get('classes', [])
-        else:
-            # Fallback for old format
-            binary_vectors = label_data
-            attack_types = []
+        # Show description if available
+        if 'description' in label_data:
+            print(f"Description: {label_data['description']}")
+        elif description_from_file:
+            print(f"Description from file available")
             
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print(f"Make sure to run the embedding generation script first.")
-        sys.exit(1)
+    else:
+        # Fallback for old format
+        binary_vectors = label_data
+        class_names = [f'class_{i}' for i in range(binary_vectors.shape[1])]
     
-    # Convert to numpy arrays
+    # Convert to numpy arrays and ensure proper format for multi-label
     if not isinstance(embeddings, np.ndarray):
         embeddings = np.array(embeddings)
     if not isinstance(binary_vectors, np.ndarray):
         binary_vectors = np.array(binary_vectors)
     
-    # Convert multi-label binary vectors to single labels
-    # For traditional ML, we use the first detected attack or 'normal'
-    labels = []
-    for binary_vec in binary_vectors:
-        if np.sum(binary_vec) == 0:
-            labels.append('normal')
-        else:
-            # Find first active attack type
-            first_attack_idx = np.argmax(binary_vec)
-            if attack_types and first_attack_idx < len(attack_types):
-                labels.append(attack_types[first_attack_idx])
-            else:
-                labels.append(f'attack_{first_attack_idx}')
+    # Ensure binary vectors are in correct format (0s and 1s)
+    binary_vectors = binary_vectors.astype(int)
     
-    # Split into train/test (80/20 split) with stratification
-    try:
-        # Try stratified split first to ensure all classes are represented
-        X_train, X_test, y_train, y_test = train_test_split(
-            embeddings, labels, test_size=0.2, stratify=labels, random_state=42
-        )
-        print("Using stratified train/test split to ensure all classes are represented")
-    except ValueError as e:
-        # Fall back to regular split if stratification fails (e.g., class with only 1 sample)
-        print(f"Warning: Stratified split failed ({e}). Using random split instead.")
-        X_train, X_test, y_train, y_test = train_test_split(
-            embeddings, labels, test_size=0.2, random_state=42
-        )
+    print(f"Loaded {len(embeddings)} samples with {len(class_names)} classes")
+    print(f"Embedding dimension: {embeddings.shape[1]}")
+    print(f"Label matrix shape: {binary_vectors.shape}")
+    print(f"Data types: embeddings={embeddings.dtype}, labels={binary_vectors.dtype}")
     
-    print(f"Loaded {len(X_train)} training samples, {len(X_test)} test samples")
-    print(f"Data shape - X_train: {X_train.shape}, X_test: {X_test.shape}")
+    # Calculate comprehensive label statistics
+    labels_per_sample = binary_vectors.sum(axis=1)
+    print(f"\nMulti-label Statistics:")
+    print(f"  Average labels per sample: {labels_per_sample.mean():.2f}")
+    print(f"  Labels per sample range: {labels_per_sample.min()} - {labels_per_sample.max()}")
+    print(f"  Samples with no labels: {(labels_per_sample == 0).sum()}")
+    print(f"  Samples with multiple labels: {(labels_per_sample > 1).sum()}")
     
-    # Check class distribution in both sets
-    train_classes = pd.Series(y_train).value_counts()
-    test_classes = pd.Series(y_test).value_counts()
+    # Class frequency and distribution
+    class_freq = binary_vectors.sum(axis=0)
+    print(f"\nClass frequencies (each class is independent):")
+    for i, (cls, freq) in enumerate(zip(class_names, class_freq)):
+        percentage = freq/len(binary_vectors)*100
+        print(f"  Column {i}: {cls:<15} {freq:>6} samples ({percentage:>5.1f}%)")
     
-    print("\nClass distribution in train set:")
-    for class_name, count in train_classes.items():
-        print(f"  {class_name}: {count} ({count/len(y_train)*100:.2f}%)")
+    # Show some example combinations
+    print(f"\nExample label combinations:")
+    unique_combinations = []
+    for i in range(min(10, len(binary_vectors))):
+        combo = binary_vectors[i]
+        if not any((combo == uc).all() for uc in unique_combinations):
+            unique_combinations.append(combo)
+            active_classes = [class_names[j] for j, val in enumerate(combo) if val == 1]
+            if not active_classes:
+                active_classes = ['normal/no_attack']
+            print(f"  {combo} -> {', '.join(active_classes)}")
+        if len(unique_combinations) >= 5:
+            break
     
-    print("\nClass distribution in test set:")
-    for class_name, count in test_classes.items():
-        print(f"  {class_name}: {count} ({count/len(y_test)*100:.2f}%)")
-    
-    # Warn if any class is missing from test set
-    missing_classes = set(train_classes.index) - set(test_classes.index)
-    if missing_classes:
-        print(f"\nWarning: The following classes are not in test set: {missing_classes}")
-        print("Consider using a smaller test_size or collecting more data for these classes.")
-    
-    return X_train, y_train, X_test, y_test
+    return embeddings, binary_vectors, class_names
 
-def train_evaluate_model(model_name, model, X_train, y_train, X_test, y_test, label_encoder, results_dir, encoded=False):
-    """Train and evaluate a single model."""
-    model_path = MODELS_DIR / f'{model_name}.joblib'
-    model_start_time = time.time()
+def calculate_multilabel_metrics(y_true, y_pred, y_prob=None):
+    """Calculate comprehensive multi-label metrics."""
+    metrics = {}
+    
+    # Basic multi-label metrics
+    metrics['hamming_loss'] = hamming_loss(y_true, y_pred)
+    metrics['subset_accuracy'] = accuracy_score(y_true, y_pred)
+    
+    # F1 scores
+    metrics['micro_f1'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['macro_f1'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['weighted_f1'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    metrics['samples_f1'] = f1_score(y_true, y_pred, average='samples', zero_division=0)
+    
+    # Precision and Recall
+    metrics['micro_precision'] = precision_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['macro_precision'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['micro_recall'] = recall_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['macro_recall'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # Jaccard similarity
+    metrics['jaccard_micro'] = jaccard_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['jaccard_macro'] = jaccard_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # Per-class metrics
+    per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+    per_class_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
+    per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
+    
+    metrics['per_class'] = {
+        'f1': per_class_f1.tolist(),
+        'precision': per_class_precision.tolist(),
+        'recall': per_class_recall.tolist()
+    }
+    
+    return metrics
+
+def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test, y_test, 
+                                   class_names, results_dir):
+    """Train and evaluate a multi-label model."""
+    print(f"Training {model_name.upper()} model...")
+    start_time = time.time()
     
     # Train the model
-    print(f"Training {model_name.upper()} model...")
     model.fit(X_train, y_train)
+    training_time = time.time() - start_time
     
     # Save the trained model
+    model_path = MODELS_DIR / f'multilabel_{model_name}.joblib'
     joblib.dump(model, model_path)
-    training_time = time.time() - model_start_time
     
     # Generate predictions
+    print(f"Generating predictions for {model_name.upper()}...")
     y_pred = model.predict(X_test)
     
-    # If using encoded labels, decode predictions for evaluation
-    if encoded:
-        y_pred = label_encoder.inverse_transform(y_pred.astype(int))
+    # Get prediction probabilities if available
+    y_prob = None
+    if hasattr(model, "predict_proba"):
+        try:
+            y_prob = model.predict_proba(X_test)
+        except:
+            pass
     
     # Calculate metrics
-    f1 = f1_score(y_test, y_pred, average='weighted')
-    report = classification_report(y_test, y_pred, zero_division=0)
+    metrics = calculate_multilabel_metrics(y_test, y_pred, y_prob)
     
-    # Save metrics
-    with open(results_dir / f'{model_name}_report.txt', 'w') as f:
-        f.write(f"{model_name.upper()} Classification Report\n")
+    # Create detailed report
+    report_path = results_dir / f'{model_name}_multilabel_report.txt'
+    with open(report_path, 'w') as f:
+        f.write(f"{model_name.upper()} Multi-Label Classification Report\n")
+        f.write("=" * 60 + "\n")
         f.write(f"Training time: {training_time:.2f} seconds\n")
-        f.write("-" * 50 + "\n")
-        f.write(report)
-    
-    # Create confusion matrix
-    labels = np.unique(np.concatenate([y_test, y_pred]))
-    
-    # Limit to top 15 classes by frequency for better visualization
-    label_counts = pd.Series(y_test).value_counts()
-    top_labels = label_counts.head(15).index.tolist()
-    
-    # Filter confusion matrix to include only top labels
-    mask_test = np.isin(y_test, top_labels)
-    mask_pred = np.isin(y_pred, top_labels)
-    
-    # Create boolean mask for rows that have both test and pred in top labels
-    combined_mask = mask_test & mask_pred
-    
-    # Check if there are any matching rows
-    if np.any(combined_mask):
-        # Apply mask to create filtered versions of y_test and y_pred
-        y_test_filtered = np.array(y_test)[combined_mask]
-        y_pred_filtered = np.array(y_pred)[combined_mask]
+        f.write(f"Test samples: {len(y_test)}\n")
+        f.write(f"Number of classes: {len(class_names)}\n\n")
         
-        # Generate confusion matrix
-        plt.figure(figsize=(12, 10))
-        cm = confusion_matrix(y_test_filtered, y_pred_filtered, labels=top_labels)
+        f.write("OVERALL METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
+        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
+        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
+        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
+        f.write(f"Weighted F1: {metrics['weighted_f1']:.4f}\n")
+        f.write(f"Samples F1: {metrics['samples_f1']:.4f}\n")
+        f.write(f"Jaccard (Micro): {metrics['jaccard_micro']:.4f}\n")
+        f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n\n")
         
-        # Normalize for better visualization
-        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        cm_norm = np.nan_to_num(cm_norm)  # Replace NaN with 0
+        f.write("PER-CLASS METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}\n")
+        f.write("-" * 60 + "\n")
         
-        sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues',
-                   xticklabels=top_labels, 
-                   yticklabels=top_labels)
-        plt.title(f'{model_name.upper()} - Confusion Matrix (Top 15 Classes)')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt.savefig(results_dir / f'{model_name}_cm.png', dpi=300)
-        plt.close()
-    else:
-        print(f"Warning: No matching rows found for confusion matrix. Skipping visualization.")
-    
-    # Calculate per-class metrics for detailed analysis
-    class_metrics = {}
-    
-    for label in np.unique(y_test):
-        # Create mask for this class
-        mask = (np.array(y_test) == label)
+        # Calculate support for each class
+        support = y_test.sum(axis=0)
         
-        # Calculate metrics
-        true_positives = np.sum((np.array(y_pred) == label) & mask)
-        support = np.sum(mask)
-        
-        if support > 0:
-            precision = true_positives / np.sum(np.array(y_pred) == label) if np.sum(np.array(y_pred) == label) > 0 else 0
-            recall = true_positives / support
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        for i, cls_name in enumerate(class_names):
+            f1 = metrics['per_class']['f1'][i]
+            precision = metrics['per_class']['precision'][i]
+            recall = metrics['per_class']['recall'][i]
+            sup = int(support[i])
             
-            class_metrics[label] = {
-                'precision': precision,
-                'recall': recall,
-                'f1-score': f1,
-                'support': int(support)
-            }
+            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}\n")
     
-    # Save metrics to CSV
-    metrics_df = pd.DataFrame.from_dict(class_metrics, orient='index')
-    metrics_df = metrics_df.sort_values('support', ascending=False)
-    metrics_df.to_csv(results_dir / f'{model_name}_class_metrics.csv')
+    # Create visualization
+    create_multilabel_visualization(y_test, y_pred, class_names, model_name, results_dir)
     
     return {
         'model_name': model_name,
-        'f1_score': f1,
-        'training_time': training_time
+        'training_time': training_time,
+        'metrics': metrics
     }
 
-def main():
-    """Main function for training and evaluating ML models."""    
-    parser = argparse.ArgumentParser(description='Optimized ML analysis for log data')
-    parser.add_argument('--model', choices=['rf', 'xgb', 'knn', 'lr', 'all'], 
-                        default='all', help='Model to train (default: all)')
-    parser.add_argument('--log-type', 
-                        default='all_combined', help='Log type to process (default: all_combined)')
-    parser.add_argument('--no-train', action='store_true',
-                        help='Skip training and only evaluate existing models')
-    args = parser.parse_args()
-
-    # Create results directory for this run
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = RESULTS_DIR / f"run_{timestamp}"
-    run_dir.mkdir(exist_ok=True)
+def create_multilabel_visualization(y_true, y_pred, class_names, model_name, results_dir):
+    """Create visualizations for multi-label results."""
     
-    # Load embedding data
-    X_train, y_train, X_test, y_test = load_embedding_data(args.log_type)
-    
-    # Ensure data is in proper format
-    if isinstance(X_train, list):
-        X_train = np.array(X_train)
-    if isinstance(X_test, list):
-        X_test = np.array(X_test)
-    
-    # Check and fix dimensions for TF-IDF and other sparse matrices
-    if hasattr(X_train, 'toarray') and len(X_train.shape) == 2:
-        X_train = X_train.toarray()
-    if hasattr(X_test, 'toarray') and len(X_test.shape) == 2:
-        X_test = X_test.toarray()
-    
-    # Create label encoder
-    le = LabelEncoder()
-    all_labels = np.unique(np.concatenate([y_train, y_test]))
-    le.fit(all_labels)
-    
-    # Save label encoder
-    joblib.dump(le, MODELS_DIR / 'label_encoder.joblib')
-    
-    # Convert labels for models that require numeric labels
-    y_train_enc = le.transform(y_train)
-    y_test_enc = le.transform(y_test)
-    
-    # Display dataset statistics
-    print(f"\nDataset Statistics:")
-    print(f"Training samples: {len(y_train)}")
-    print(f"Test samples: {len(y_test)}")
-    print(f"Total unique labels: {len(all_labels)}")
-    
-    # Display label distribution
-    label_counts = pd.Series(y_train).value_counts()
-    normal_count = label_counts.get('normal', 0)
-    abnormal_count = len(y_train) - normal_count
-    
-    print(f"\nTraining Set Label Distribution:")
-    print(f"Normal logs: {normal_count} ({normal_count/len(y_train)*100:.2f}%)")
-    print(f"Abnormal logs: {abnormal_count} ({abnormal_count/len(y_train)*100:.2f}%)")
-    print(f"Top 5 anomaly types:")
-    
-    for label, count in label_counts[label_counts.index != 'normal'].head(5).items():
-        print(f"  - {label}: {count} ({count/len(y_train)*100:.2f}%)")
-    
-    # Create and train models
-    models = create_models()
-    model_list = list(models.keys()) if args.model == 'all' else [args.model]
-    
-    results = []
-    
-    for model_name in model_list:
-        print(f"\n{'-'*50}")
-        print(f"Processing {model_name.upper()} model...")
-        model = models[model_name]
-        
-        # Check if we should skip training
-        model_path = MODELS_DIR / f'{model_name}.joblib'
-        if args.no_train and model_path.exists():
-            print(f"Loading existing model from {model_path}...")
-            model = joblib.load(model_path)
-        else:
-            # For XGBoost and other models that need numeric labels
-            if model_name in ['xgb']:
-                result = train_evaluate_model(
-                    model_name, model, X_train, y_train_enc, X_test, y_test, le, run_dir, encoded=True
-                )
-            else:
-                result = train_evaluate_model(
-                    model_name, model, X_train, y_train, X_test, y_test, le, run_dir
-                )
-            
-            results.append(result)
-    
-    # Summarize results
-    if results:
-        print("\nModel Performance Summary:")
-        print("-" * 70)
-        print(f"{'Model':<15} {'F1 Score':<10} {'Training Time (s)':<20}")
-        print("-" * 70)
-        
-        for result in sorted(results, key=lambda x: x['f1_score'], reverse=True):
-            print(f"{result['model_name'].upper():<15} {result['f1_score']:.4f}     {result['training_time']:.2f}s")
-    
-    # Save summary to file
-    with open(run_dir / 'summary.txt', 'w') as f:
-        f.write(f"Log Analysis Run Summary - {timestamp}\n")
-        f.write("-" * 50 + "\n")
-        f.write(f"Log type: {args.log_type}\n")
-        f.write(f"Training samples: {len(y_train)}\n")
-        f.write(f"Test samples: {len(y_test)}\n")
-        f.write(f"Total unique labels: {len(all_labels)}\n\n")
-        
-        if results:
-            f.write("Model Performance Summary:\n")
-            f.write("-" * 50 + "\n")
-            f.write(f"{'Model':<15} {'F1 Score':<10} {'Training Time (s)':<20}\n")
-            f.write("-" * 50 + "\n")
-            
-            for result in sorted(results, key=lambda x: x['f1_score'], reverse=True):
-                f.write(f"{result['model_name'].upper():<15} {result['f1_score']:.4f}     {result['training_time']:.2f}s\n")
-        
-        total_time = time.time() - start_time
-        f.write(f"\nTotal execution time: {total_time:.2f}s\n")
-    
-    # Generate label distribution visualization
+    # 1. Per-class performance heatmap
     plt.figure(figsize=(12, 8))
-    top_labels = label_counts.head(10)
     
-    # Add an "Other" category if there are more than 10 labels
-    if len(label_counts) > 10:
-        other_count = label_counts[10:].sum()
-        top_labels = pd.concat([top_labels, pd.Series({'Other': other_count})])
+    # Calculate per-class metrics
+    per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+    per_class_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
+    per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
+    support = y_true.sum(axis=0)
     
-    # Create pie chart
-    plt.pie(
-        top_labels, 
-        labels=top_labels.index, 
-        autopct='%1.1f%%',
-        explode=[0.1 if label == 'normal' else 0 for label in top_labels.index],
-        shadow=True, 
-        startangle=90
-    )
-    plt.title('Label Distribution')
-    plt.axis('equal')
+    # Create metrics matrix
+    metrics_matrix = np.array([per_class_precision, per_class_recall, per_class_f1]).T
+    
+    # Only show top 15 classes by support
+    if len(class_names) > 15:
+        top_indices = np.argsort(support)[-15:]
+        metrics_matrix = metrics_matrix[top_indices]
+        display_names = [class_names[i] for i in top_indices]
+    else:
+        display_names = class_names
+    
+    sns.heatmap(metrics_matrix, 
+                annot=True, 
+                fmt='.3f', 
+                cmap='RdYlBu_r',
+                xticklabels=['Precision', 'Recall', 'F1'],
+                yticklabels=display_names)
+    
+    plt.title(f'{model_name.upper()} - Per-Class Performance')
     plt.tight_layout()
-    plt.savefig(run_dir / 'label_distribution.png', dpi=300)
+    plt.savefig(results_dir / f'{model_name}_performance_heatmap.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"\nResults saved to {run_dir}")
-    print(f"Total execution time: {time.time() - start_time:.2f}s")
+    # 2. Label distribution comparison
+    plt.figure(figsize=(14, 6))
+    
+    # True vs Predicted label counts
+    true_counts = y_true.sum(axis=0)
+    pred_counts = y_pred.sum(axis=0)
+    
+    x = np.arange(len(class_names))
+    width = 0.35
+    
+    plt.bar(x - width/2, true_counts, width, label='True', alpha=0.8)
+    plt.bar(x + width/2, pred_counts, width, label='Predicted', alpha=0.8)
+    
+    plt.xlabel('Classes')
+    plt.ylabel('Frequency')
+    plt.title(f'{model_name.upper()} - True vs Predicted Label Distribution')
+    plt.xticks(x, class_names, rotation=45, ha='right')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(results_dir / f'{model_name}_label_distribution.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 3. Labels per sample distribution
+    plt.figure(figsize=(10, 6))
+    
+    true_labels_per_sample = y_true.sum(axis=1)
+    pred_labels_per_sample = y_pred.sum(axis=1)
+    
+    plt.hist(true_labels_per_sample, bins=range(0, max(true_labels_per_sample) + 2), 
+             alpha=0.7, label='True', density=True)
+    plt.hist(pred_labels_per_sample, bins=range(0, max(pred_labels_per_sample) + 2), 
+             alpha=0.7, label='Predicted', density=True)
+    
+    plt.xlabel('Number of Labels per Sample')
+    plt.ylabel('Density')
+    plt.title(f'{model_name.upper()} - Labels per Sample Distribution')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(results_dir / f'{model_name}_labels_per_sample.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def main():
+    """Main function for multi-label ML baseline."""
+    parser = argparse.ArgumentParser(description='Multi-Label ML Baseline for Log Analysis')
+    parser.add_argument('--log-type', type=str, help='Specific log type to process')
+    parser.add_argument('--model', choices=['rf', 'lr', 'knn', 'xgb', 'all'], 
+                        default='all', help='Model to train (default: all)')
+    parser.add_argument('--test-size', type=float, default=0.2, 
+                        help='Test set proportion (default: 0.2)')
+    args = parser.parse_args()
+    
+    # Find available log types
+    available_log_types = find_available_log_types()
+    
+    if not available_log_types:
+        print("No processed log types found. Please run embeddings generation first.")
+        return
+    
+    print(f"Available log types: {available_log_types}")
+    
+    # Select log types to process
+    if args.log_type:
+        if args.log_type in available_log_types:
+            log_types_to_process = [args.log_type]
+        else:
+            print(f"Log type '{args.log_type}' not found.")
+            return
+    else:
+        log_types_to_process = available_log_types
+    
+    # Process each log type
+    for log_type in log_types_to_process:
+        print(f"\n{'='*60}")
+        print(f"Processing log type: {log_type}")
+        print(f"{'='*60}")
+        
+        # Create results directory
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        results_dir = RESULTS_DIR / f"multilabel_{log_type}_{timestamp}"
+        results_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Load data
+            X, y, class_names = load_multilabel_data(log_type)
+            
+            # Skip if no positive labels
+            if y.sum() == 0:
+                print(f"No positive labels found for {log_type}, skipping...")
+                continue
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=args.test_size, random_state=42, stratify=None
+            )
+            
+            print(f"Train set: {len(X_train)} samples")
+            print(f"Test set: {len(X_test)} samples")
+            
+            # Standardize features
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # Save scaler
+            joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
+            
+            # Create models
+            models = create_multilabel_models(len(class_names))
+            
+            # Select models to train
+            if args.model == 'all':
+                model_names = list(models.keys())
+            else:
+                model_names = [args.model] if args.model in models else []
+            
+            results = []
+            
+            # Train and evaluate each model
+            for model_name in model_names:
+                if model_name not in models:
+                    print(f"Model {model_name} not available, skipping...")
+                    continue
+                
+                print(f"\n{'-'*40}")
+                print(f"Training {model_name.upper()} for {log_type}")
+                print(f"{'-'*40}")
+                
+                try:
+                    result = train_evaluate_multilabel_model(
+                        f"{model_name}_{log_type}",
+                        models[model_name],
+                        X_train_scaled, y_train,
+                        X_test_scaled, y_test,
+                        class_names, results_dir
+                    )
+                    results.append(result)
+                    
+                except Exception as e:
+                    print(f"Error training {model_name}: {e}")
+                    continue
+            
+            # Create summary
+            if results:
+                print(f"\n{'='*60}")
+                print(f"SUMMARY FOR {log_type.upper()}")
+                print(f"{'='*60}")
+                print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming Loss':<15} {'Time (s)':<10}")
+                print("-" * 70)
+                
+                for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
+                    model_name = result['model_name']
+                    metrics = result['metrics']
+                    time_taken = result['training_time']
+                    
+                    print(f"{model_name:<20} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} "
+                          f"{metrics['hamming_loss']:<15.4f} {time_taken:<10.2f}")
+                
+                # Save summary
+                summary_path = results_dir / 'summary.json'
+                with open(summary_path, 'w') as f:
+                    json.dump({
+                        'log_type': log_type,
+                        'results': results,
+                        'class_names': class_names,
+                        'test_size': args.test_size,
+                        'timestamp': timestamp
+                    }, f, indent=2)
+                
+                print(f"\nResults saved to: {results_dir}")
+            
+        except Exception as e:
+            print(f"Error processing {log_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print(f"\nMulti-label baseline evaluation completed!")
 
 if __name__ == '__main__':
     main()
