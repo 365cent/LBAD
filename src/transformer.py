@@ -2175,6 +2175,12 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
         classes, log_type, output_dir, config, training_time
     )
     
+    # Generate comprehensive per-class accuracy report
+    print(f"\n📊 Generating per-class accuracy report...")
+    per_class_report_path = generate_per_class_accuracy_report(
+        output_dir, log_type, config, predictions, binary_predictions, classes, true_labels
+    )
+    
     # Save comprehensive evaluation results
     save_evaluation_results(
         results, predictions, binary_predictions, log_type, output_dir, config
@@ -2229,6 +2235,7 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
         "evaluation_type": results['evaluation_type'],
         "training_time": training_time,
         "report_path": report_path,
+        "per_class_report_path": per_class_report_path,
         "has_true_labels": true_labels is not None,
         "macro_f1": results.get('macro_f1', 'N/A'),
         "micro_f1": results.get('micro_f1', 'N/A'),
@@ -3321,6 +3328,282 @@ def print_evaluation_summary(results: Dict[str, Any], log_type: str):
     
     print(f"{'='*80}")
 
+def generate_per_class_accuracy_report(results_dir: Path, log_type: str, 
+                                      config: SystemConfig, 
+                                      predictions: np.ndarray = None,
+                                      binary_predictions: np.ndarray = None,
+                                      classes: List[str] = None,
+                                      true_labels: np.ndarray = None) -> str:
+    """
+    Generate comprehensive per-class accuracy and metrics report from existing results
+    
+    Args:
+        results_dir: Directory containing results files
+        log_type: Log type being analyzed
+        config: System configuration
+    
+    Returns:
+        Path to the generated report
+    """
+    
+    # Use provided data or load from files
+    if predictions is None or binary_predictions is None or classes is None:
+        # Load existing results from files
+        results_file = results_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
+        if not results_file.exists():
+            print(f"❌ Results file not found: {results_file}")
+            return None
+        
+        with open(results_file, 'rb') as f:
+            data = pickle.load(f)
+        
+        predictions = data['predictions'] if predictions is None else predictions
+        binary_predictions = data['binary_predictions'] if binary_predictions is None else binary_predictions
+        classes = data['classes'] if classes is None else classes
+    
+    # Load true labels if not provided
+    if true_labels is None:
+        label_file = Path("embeddings") / log_type / f"label_{log_type}.pkl"
+        if label_file.exists():
+            try:
+                with open(label_file, 'rb') as f:
+                    label_data = pickle.load(f)
+                    if isinstance(label_data, dict) and 'vectors' in label_data:
+                        true_labels = label_data['vectors']
+                    else:
+                        true_labels = label_data if isinstance(label_data, np.ndarray) else None
+            except Exception as e:
+                print(f"⚠️  Could not load true labels: {e}")
+    
+    # Calculate per-class metrics
+    n_classes = len(classes)
+    n_samples = len(binary_predictions)
+    
+    # Create comprehensive report
+    report_lines = []
+    report_lines.append(f"COMPREHENSIVE PER-CLASS ACCURACY REPORT - {log_type.upper()}")
+    report_lines.append("=" * 80)
+    report_lines.append(f"Total samples: {n_samples}")
+    report_lines.append(f"Total classes: {n_classes}")
+    report_lines.append(f"Node: {config.node_name} | Job: {config.job_id}")
+    report_lines.append("")
+    
+    if true_labels is not None and len(true_labels) > 0:
+        # Use same validation split as training
+        val_size = int(len(true_labels) * 0.3)
+        test_labels = true_labels[val_size:]
+        test_predictions = binary_predictions
+        
+        # Adjust sizes if needed
+        min_size = min(len(test_labels), len(test_predictions))
+        test_labels = test_labels[:min_size]
+        test_predictions = test_predictions[:min_size]
+        
+        # Calculate comprehensive supervised metrics
+        from sklearn.metrics import confusion_matrix, balanced_accuracy_score
+        
+        try:
+            prec_c, rec_c, f1_c, support_c = precision_recall_fscore_support(
+                test_labels, test_predictions, average=None, zero_division=0
+            )
+            
+            # Overall metrics
+            subset_accuracy = accuracy_score(test_labels, test_predictions)
+            hamming_loss_val = hamming_loss(test_labels, test_predictions)
+            macro_f1 = f1_score(test_labels, test_predictions, average='macro', zero_division=0)
+            micro_f1 = f1_score(test_labels, test_predictions, average='micro', zero_division=0)
+            
+            report_lines.append("SUPERVISED EVALUATION (with true labels)")
+            report_lines.append("=" * 50)
+            report_lines.append(f"Subset Accuracy (exact match): {subset_accuracy:.4f}")
+            report_lines.append(f"Hamming Loss: {hamming_loss_val:.4f}")
+            report_lines.append(f"Macro F1: {macro_f1:.4f}")
+            report_lines.append(f"Micro F1: {micro_f1:.4f}")
+            report_lines.append("")
+            
+            # Per-class detailed metrics
+            report_lines.append("PER-CLASS DETAILED METRICS:")
+            report_lines.append("-" * 80)
+            report_lines.append(f"{'Class':<20} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'Support':<10}")
+            report_lines.append("-" * 80)
+            
+            for i, cls_name in enumerate(classes):
+                # Per-class accuracy (correct predictions for this class / total samples)
+                true_class = test_labels[:, i]
+                pred_class = test_predictions[:, i]
+                
+                # Calculate per-class accuracy
+                correct = (true_class == pred_class).sum()
+                class_accuracy = correct / len(true_class)
+                
+                precision = prec_c[i] if i < len(prec_c) else 0.0
+                recall = rec_c[i] if i < len(rec_c) else 0.0
+                f1 = f1_c[i] if i < len(f1_c) else 0.0
+                support = int(support_c[i]) if i < len(support_c) else 0
+                
+                report_lines.append(f"{cls_name:<20} {class_accuracy:<10.4f} {precision:<10.4f} {recall:<10.4f} {f1:<10.4f} {support:<10}")
+            
+            # Confusion matrix per class
+            report_lines.append("")
+            report_lines.append("PER-CLASS CONFUSION MATRICES:")
+            report_lines.append("-" * 50)
+            
+            for i, cls_name in enumerate(classes):
+                true_class = test_labels[:, i]
+                pred_class = test_predictions[:, i]
+                
+                cm = confusion_matrix(true_class, pred_class, labels=[0, 1])
+                tn, fp, fn, tp = cm.ravel()
+                
+                report_lines.append(f"\n{cls_name}:")
+                report_lines.append(f"  True Negatives:  {tn:>6}")
+                report_lines.append(f"  False Positives: {fp:>6}")
+                report_lines.append(f"  False Negatives: {fn:>6}")
+                report_lines.append(f"  True Positives:  {tp:>6}")
+                
+                # Additional per-class metrics
+                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                balanced_acc = (sensitivity + specificity) / 2
+                
+                report_lines.append(f"  Sensitivity (Recall): {sensitivity:.4f}")
+                report_lines.append(f"  Specificity:          {specificity:.4f}")
+                report_lines.append(f"  Balanced Accuracy:    {balanced_acc:.4f}")
+        
+        except Exception as e:
+            report_lines.append(f"ERROR calculating supervised metrics: {e}")
+            true_labels = None  # Fall back to unsupervised
+    
+    if true_labels is None:
+        # Unsupervised evaluation
+        report_lines.append("UNSUPERVISED EVALUATION (no true labels)")
+        report_lines.append("=" * 50)
+        
+        # Prediction statistics per class
+        class_counts = binary_predictions.sum(axis=0)
+        class_percentages = (class_counts / n_samples) * 100
+        
+        # Prediction confidence per class
+        class_avg_confidence = predictions.mean(axis=0)
+        class_std_confidence = predictions.std(axis=0)
+        
+        report_lines.append("PER-CLASS PREDICTION STATISTICS:")
+        report_lines.append("-" * 70)
+        report_lines.append(f"{'Class':<20} {'Predictions':<12} {'Percentage':<12} {'Avg Conf':<12} {'Std Conf':<10}")
+        report_lines.append("-" * 70)
+        
+        for i, cls_name in enumerate(classes):
+            count = int(class_counts[i])
+            percentage = class_percentages[i]
+            avg_conf = class_avg_confidence[i]
+            std_conf = class_std_confidence[i]
+            
+            report_lines.append(f"{cls_name:<20} {count:<12} {percentage:<12.2f} {avg_conf:<12.4f} {std_conf:<10.4f}")
+    
+    # Sample distribution analysis
+    labels_per_sample = binary_predictions.sum(axis=1)
+    report_lines.append("")
+    report_lines.append("SAMPLE DISTRIBUTION ANALYSIS:")
+    report_lines.append("-" * 40)
+    report_lines.append(f"Samples with 0 labels: {(labels_per_sample == 0).sum()} ({(labels_per_sample == 0).mean()*100:.1f}%)")
+    report_lines.append(f"Samples with 1 label:  {(labels_per_sample == 1).sum()} ({(labels_per_sample == 1).mean()*100:.1f}%)")
+    report_lines.append(f"Samples with 2 labels: {(labels_per_sample == 2).sum()} ({(labels_per_sample == 2).mean()*100:.1f}%)")
+    report_lines.append(f"Samples with 3+ labels: {(labels_per_sample >= 3).sum()} ({(labels_per_sample >= 3).mean()*100:.1f}%)")
+    report_lines.append(f"Average labels per sample: {labels_per_sample.mean():.3f}")
+    report_lines.append(f"Max labels per sample: {labels_per_sample.max()}")
+    
+    # Top label combinations
+    if len(classes) <= 10:  # Only for manageable number of classes
+        from collections import Counter
+        
+        # Convert binary predictions to tuples for counting
+        label_combinations = [tuple(row) for row in binary_predictions]
+        combo_counts = Counter(label_combinations)
+        
+        report_lines.append("")
+        report_lines.append("TOP 10 LABEL COMBINATIONS:")
+        report_lines.append("-" * 50)
+        
+        for i, (combo, count) in enumerate(combo_counts.most_common(10)):
+            active_classes = [classes[j] for j, val in enumerate(combo) if val == 1]
+            if not active_classes:
+                active_classes = ['normal/no_labels']
+            
+            percentage = (count / n_samples) * 100
+            report_lines.append(f"{i+1:2d}. {', '.join(active_classes):<35} {count:>6} ({percentage:>5.1f}%)")
+    
+    # Model information
+    report_lines.append("")
+    report_lines.append("MODEL INFORMATION:")
+    report_lines.append("-" * 30)
+    report_lines.append("Model: Unsupervised Multi-Label Transformer")
+    report_lines.append("Training: Fully unsupervised with curriculum learning")
+    report_lines.append("Features: Multi-label consistency, class balance regularization")
+    report_lines.append("         Contrastive learning, adaptive pseudo-labeling")
+    
+    # Save report
+    report_content = "\n".join(report_lines)
+    report_path = results_dir / f"per_class_accuracy_report_{log_type}_{config.node_name}_{config.job_id}.txt"
+    
+    with open(report_path, 'w') as f:
+        f.write(report_content)
+    
+    # Also print to console
+    print("\n" + "="*80)
+    print("📊 COMPREHENSIVE PER-CLASS ACCURACY REPORT GENERATED")
+    print("="*80)
+    print(report_content)
+    
+    return str(report_path)
+
+def generate_per_class_report_standalone(log_type: str = "wp-error", 
+                                        node_name: str = "gra6", 
+                                        job_id: str = "29386936"):
+    """
+    Standalone function to generate per-class accuracy report for existing results
+    
+    Args:
+        log_type: Log type to generate report for
+        node_name: Node name used in original training
+        job_id: Job ID used in original training
+    """
+    from dataclasses import dataclass
+    
+    # Create mock config
+    config = SystemConfig(
+        device="cpu", n_gpus=0, total_memory_gb=64.0, gpu_memory_gb=0.0,
+        n_cpus=8, is_distributed=False, rank=0, world_size=1,
+        node_name=node_name, job_id=job_id
+    )
+    
+    results_dir = Path("results") / log_type
+    
+    if not results_dir.exists():
+        print(f"❌ Results directory not found: {results_dir}")
+        print("Make sure you've run the transformer training first.")
+        return None
+    
+    print(f"🔍 Generating per-class accuracy report for {log_type}...")
+    print(f"📁 Looking in: {results_dir}")
+    print(f"🏷️  Node: {node_name}, Job: {job_id}")
+    
+    try:
+        report_path = generate_per_class_accuracy_report(results_dir, log_type, config)
+        
+        if report_path:
+            print(f"\n✅ Report generated successfully!")
+            print(f"📄 Saved to: {report_path}")
+            return report_path
+        else:
+            print(f"\n❌ Failed to generate report")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 # =============================================================================
 # Main Execution
 # =============================================================================
@@ -3432,7 +3715,15 @@ def load_training_checkpoint(log_type: str, training_hash: str) -> Optional[Tupl
     latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split('_')[2]))
     
     try:
-        checkpoint_data = torch.load(latest_checkpoint, map_location='cpu')
+        # First try with safe globals for numpy objects
+        try:
+            import torch.serialization
+            with torch.serialization.safe_globals(['numpy.core.multiarray.scalar', 'numpy.ndarray', 'numpy.dtype']):
+                checkpoint_data = torch.load(latest_checkpoint, map_location='cpu', weights_only=True)
+        except Exception:
+            # Fallback to weights_only=False for compatibility with existing checkpoints
+            print(f"   Falling back to weights_only=False for trusted checkpoint...")
+            checkpoint_data = torch.load(latest_checkpoint, map_location='cpu', weights_only=False)
         
         # Validate checkpoint
         if (checkpoint_data['log_type'] == log_type and 
@@ -3517,7 +3808,14 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         try:
             # Load existing model and results for final outputs
             model_path = MODELS_DIR / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
-            saved_data = torch.load(model_path, map_location='cpu')
+            try:
+                # First try with safe globals for numpy objects
+                import torch.serialization
+                with torch.serialization.safe_globals(['numpy.core.multiarray.scalar', 'numpy.ndarray', 'numpy.dtype']):
+                    saved_data = torch.load(model_path, map_location='cpu', weights_only=True)
+            except Exception:
+                # Fallback to weights_only=False for compatibility
+                saved_data = torch.load(model_path, map_location='cpu', weights_only=False)
             
             results_path = output_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
             with open(results_path, 'rb') as f:
@@ -3716,6 +4014,7 @@ def main():
             print(f"🤖 Models saved to: {MODELS_DIR}/")
             print(f"🏷️  Labels saved in evaluation format to: {RESULTS_DIR}/*/label_*.pkl")
             print(f"📊 Classification reports saved to: {RESULTS_DIR}/*/transformer_classification_report_*.txt")
+            print(f"📈 Per-class accuracy reports saved to: {RESULTS_DIR}/*/per_class_accuracy_report_*.txt")
             print(f"💾 Checkpoints saved to: {CHECKPOINT_DIR}/")
             print(f"\n🔧 Supports embedding types:")
             print(f"  - FastText (300D): Standard word embeddings")
@@ -3724,7 +4023,9 @@ def main():
             print(f"\n📈 NEW: Comprehensive evaluation with multi-label metrics!")
             print(f"  - Supervised metrics (when true labels available): F1, Precision, Recall, Hamming Loss, Jaccard")
             print(f"  - Per-class performance with optimized thresholds")
+            print(f"  - Per-class accuracy, confusion matrices, sensitivity/specificity")
             print(f"  - Classification reports similar to ml_models.py")
+            print(f"  - Label combination analysis and prediction confidence")
             print(f"  - Unsupervised metrics and confidence analysis")
             print(f"{'='*60}")
     
