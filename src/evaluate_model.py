@@ -40,7 +40,8 @@ def load_trained_model(model_path: Path, device: torch.device) -> Tuple[Unsuperv
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
-    saved_data = torch.load(model_path, map_location=device)
+    # Fix for PyTorch 2.6+ weights_only=True default - set to False for compatibility
+    saved_data = torch.load(model_path, map_location=device, weights_only=False)
     
     # Extract configuration from saved data
     config_dict = saved_data.get('config', {})
@@ -177,43 +178,204 @@ def evaluate_model_with_labels(model: UnsupervisedMultiLabelTransformer,
     # Apply optimized thresholds
     binary_predictions = (predictions_test >= optimal_thresholds).astype(int)
     
-    # Calculate metrics
+    # Calculate comprehensive metrics
     print("Calculating metrics...")
     
-    # Per-class metrics
-    prec_c, rec_c, f1_c, support_c = precision_recall_fscore_support(
-        labels_test, binary_predictions, average=None, zero_division=0
+    results = calculate_comprehensive_metrics(
+        binary_predictions, classes, y_true=labels_test, probs=predictions_test
     )
     
-    # Overall metrics
-    macro_f1 = f1_score(labels_test, binary_predictions, average='macro', zero_division=0)
-    micro_f1 = f1_score(labels_test, binary_predictions, average='micro', zero_division=0)
-    weighted_f1 = f1_score(labels_test, binary_predictions, average='weighted', zero_division=0)
-    
-    subset_accuracy = accuracy_score(labels_test, binary_predictions)
-    hamming = hamming_loss(labels_test, binary_predictions)
-    jaccard_macro = jaccard_score(labels_test, binary_predictions, average='macro', zero_division=0)
-    jaccard_micro = jaccard_score(labels_test, binary_predictions, average='micro', zero_division=0)
-    
-    results = {
-        'per_class_precision': prec_c.tolist(),
-        'per_class_recall': rec_c.tolist(),
-        'per_class_f1': f1_c.tolist(),
-        'per_class_support': support_c.tolist(),
-        'macro_f1': float(macro_f1),
-        'micro_f1': float(micro_f1),
-        'weighted_f1': float(weighted_f1),
-        'subset_accuracy': float(subset_accuracy),
-        'hamming_loss': float(hamming),
-        'jaccard_macro': float(jaccard_macro),
-        'jaccard_micro': float(jaccard_micro),
-        'optimal_thresholds': optimal_thresholds.tolist(),
-        'classes': classes,
-        'n_test_samples': len(labels_test),
-        'n_val_samples': len(labels_val)
-    }
+    # Add evaluation-specific info
+    results['optimal_thresholds'] = optimal_thresholds.tolist()
+    results['n_test_samples'] = len(labels_test)
+    results['n_val_samples'] = len(labels_val)
     
     return results, predictions_test, binary_predictions, labels_test
+
+def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str], 
+                                  y_true: np.ndarray = None, probs: np.ndarray = None) -> Dict[str, Any]:
+    """
+    Calculate comprehensive metrics for multi-label classification
+    
+    Args:
+        binary_predictions: Binary predictions (n_samples, n_classes)
+        classes: List of class names
+        y_true: True labels if available (n_samples, n_classes)
+        probs: Prediction probabilities if available (n_samples, n_classes)
+    
+    Returns:
+        Dictionary of metrics including real sklearn metrics when true labels are available
+    """
+    from sklearn.metrics import (
+        precision_recall_fscore_support, f1_score, accuracy_score, 
+        hamming_loss, jaccard_score, balanced_accuracy_score
+    )
+    
+    metrics = {}
+    
+    # Sample-level metrics
+    labels_per_sample = binary_predictions.sum(axis=1)
+    metrics['avg_labels_per_sample'] = float(labels_per_sample.mean())
+    metrics['std_labels_per_sample'] = float(labels_per_sample.std())
+    metrics['min_labels_per_sample'] = int(labels_per_sample.min())
+    metrics['max_labels_per_sample'] = int(labels_per_sample.max())
+    
+    # Class-level metrics
+    class_counts = binary_predictions.sum(axis=0)
+    metrics['class_counts'] = class_counts.tolist()
+    metrics['most_frequent_classes'] = []
+    
+    # Get top 10 most frequent classes
+    if len(classes) > 0:
+        class_freq_pairs = list(zip(classes, class_counts))
+        class_freq_pairs.sort(key=lambda x: x[1], reverse=True)
+        metrics['most_frequent_classes'] = [
+            {'class': cls, 'count': int(count), 'percentage': float(count/len(binary_predictions)*100)}
+            for cls, count in class_freq_pairs[:10]
+        ]
+    
+    # Multi-label specific metrics
+    metrics['samples_with_no_labels'] = int((labels_per_sample == 0).sum())
+    metrics['samples_with_one_label'] = int((labels_per_sample == 1).sum())
+    metrics['samples_with_multiple_labels'] = int((labels_per_sample > 1).sum())
+    
+    # Real metrics when true labels are available
+    if y_true is not None:
+        # Per-class metrics
+        prec_c, rec_c, f1_c, support_c = precision_recall_fscore_support(
+            y_true, binary_predictions, average=None, zero_division=0
+        )
+        
+        # Store per-class metrics
+        metrics['per_class'] = {}
+        for i, cls in enumerate(classes):
+            metrics['per_class'][cls] = {
+                'support': int(support_c[i]),
+                'precision': float(prec_c[i]),
+                'recall': float(rec_c[i]),
+                'f1-score': float(f1_c[i])
+            }
+        
+        # Store per-class arrays for evaluation results
+        metrics['per_class_precision'] = prec_c.tolist()
+        metrics['per_class_recall'] = rec_c.tolist()
+        metrics['per_class_f1'] = f1_c.tolist()
+        metrics['per_class_support'] = support_c.tolist()
+        
+        # Overall metrics
+        metrics['macro_f1'] = float(f1_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['micro_f1'] = float(f1_score(y_true, binary_predictions, average='micro', zero_division=0))
+        metrics['weighted_f1'] = float(f1_score(y_true, binary_predictions, average='weighted', zero_division=0))
+        metrics['samples_f1'] = float(f1_score(y_true, binary_predictions, average='samples', zero_division=0))
+        
+        # Subset accuracy (exact match)
+        metrics['subset_accuracy'] = float(accuracy_score(y_true, binary_predictions))
+        
+        # Hamming loss
+        metrics['hamming_loss'] = float(hamming_loss(y_true, binary_predictions))
+        
+        # Jaccard score (similarity)
+        metrics['jaccard_macro'] = float(jaccard_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['jaccard_micro'] = float(jaccard_score(y_true, binary_predictions, average='micro', zero_division=0))
+        
+        # Per-class balanced accuracy
+        balanced_acc_per_class = []
+        for c in range(y_true.shape[1]):
+            y_c = y_true[:, c]
+            yp_c = binary_predictions[:, c]
+            
+            # Skip if no samples for this class
+            if y_c.sum() == 0 and (1 - y_c).sum() == 0:
+                balanced_acc_per_class.append(0.0)
+                continue
+                
+            # Calculate balanced accuracy for this class
+            ba = balanced_accuracy_score(y_c, yp_c)
+            balanced_acc_per_class.append(float(ba))
+        
+        metrics['balanced_accuracy_per_class'] = balanced_acc_per_class
+        metrics['mean_balanced_accuracy'] = float(np.mean(balanced_acc_per_class))
+        
+        # Confusion matrix counts per class
+        confusion_per_class = {}
+        for i, cls in enumerate(classes):
+            y_c = y_true[:, i]
+            yp_c = binary_predictions[:, i]
+            
+            tp = int(np.sum((yp_c == 1) & (y_c == 1)))
+            fp = int(np.sum((yp_c == 1) & (y_c == 0)))
+            fn = int(np.sum((yp_c == 0) & (y_c == 1)))
+            tn = int(np.sum((yp_c == 0) & (y_c == 0)))
+            
+            confusion_per_class[cls] = {
+                'true_positives': tp,
+                'false_positives': fp,
+                'false_negatives': fn,
+                'true_negatives': tn
+            }
+        
+        metrics['confusion_per_class'] = confusion_per_class
+        
+        # Prediction confidence metrics (if probabilities available)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # Confidence of correct predictions
+            correct_mask = (binary_predictions == y_true)
+            correct_confidences = probs[correct_mask]
+            incorrect_confidences = probs[~correct_mask]
+            
+            metrics['correct_prediction_confidence_mean'] = float(correct_confidences.mean()) if len(correct_confidences) > 0 else 0.0
+            metrics['incorrect_prediction_confidence_mean'] = float(incorrect_confidences.mean()) if len(incorrect_confidences) > 0 else 0.0
+    else:
+        # No true labels available - unsupervised metrics only
+        # Set real metrics to None (these will be filtered out in printing)
+        metrics['per_class_precision'] = None
+        metrics['per_class_recall'] = None
+        metrics['per_class_f1'] = None
+        metrics['per_class_support'] = None
+        metrics['macro_f1'] = None
+        metrics['micro_f1'] = None
+        metrics['weighted_f1'] = None
+        metrics['samples_f1'] = None
+        metrics['subset_accuracy'] = None
+        metrics['hamming_loss'] = None
+        metrics['jaccard_macro'] = None
+        metrics['jaccard_micro'] = None
+        metrics['mean_balanced_accuracy'] = None
+        
+        # Prediction confidence metrics (unsupervised)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # High confidence predictions
+            high_conf_mask = probs > 0.7
+            metrics['high_confidence_predictions'] = int(high_conf_mask.sum())
+            metrics['high_confidence_percentage'] = float(high_conf_mask.sum() / probs.size * 100)
+            
+            # Per-class confidence statistics
+            class_confidences = []
+            for i, cls in enumerate(classes):
+                if i < probs.shape[1]:
+                    class_conf = float(probs[:, i].mean())
+                    class_confidences.append({
+                        'class': cls,
+                        'avg_confidence': class_conf,
+                        'predictions': int(class_counts[i])
+                    })
+            
+            # Sort by confidence and add to metrics
+            class_confidences.sort(key=lambda x: x['avg_confidence'], reverse=True)
+            metrics['class_confidence_ranking'] = class_confidences[:10]
+        else:
+            metrics['prediction_confidence_mean'] = 0.0
+            metrics['prediction_confidence_std'] = 0.0
+            metrics['high_confidence_predictions'] = 0
+            metrics['high_confidence_percentage'] = 0.0
+    
+    return metrics
 
 def print_evaluation_results(results: Dict[str, Any]):
     """Print detailed evaluation results"""
@@ -226,31 +388,54 @@ def print_evaluation_results(results: Dict[str, Any]):
     print(f"Validation samples: {results['n_val_samples']}")
     print(f"Classes: {len(results['classes'])}")
     
-    print(f"\nOVERALL METRICS:")
-    print(f"  Macro F1:       {results['macro_f1']:.4f}")
-    print(f"  Micro F1:       {results['micro_f1']:.4f}")
-    print(f"  Weighted F1:    {results['weighted_f1']:.4f}")
-    print(f"  Subset Accuracy: {results['subset_accuracy']:.4f}")
-    print(f"  Hamming Loss:   {results['hamming_loss']:.4f}")
-    print(f"  Jaccard (macro): {results['jaccard_macro']:.4f}")
-    print(f"  Jaccard (micro): {results['jaccard_micro']:.4f}")
+    # Check if we have real metrics (non-null values)
+    has_real_metrics = results.get('macro_f1') is not None
+    
+    if has_real_metrics:
+        print(f"\nOVERALL METRICS (with true labels):")
+        print(f"  Macro F1:       {results['macro_f1']:.4f}")
+        print(f"  Micro F1:       {results['micro_f1']:.4f}")
+        print(f"  Weighted F1:    {results['weighted_f1']:.4f}")
+        print(f"  Subset Accuracy: {results['subset_accuracy']:.4f}")
+        print(f"  Hamming Loss:   {results['hamming_loss']:.4f}")
+        print(f"  Jaccard (macro): {results['jaccard_macro']:.4f}")
+        print(f"  Jaccard (micro): {results['jaccard_micro']:.4f}")
+    else:
+        print(f"\nGENERATIVE MODEL METRICS (unsupervised):")
+        print(f"  Prediction Confidence: {results['prediction_confidence_mean']:.4f}")
+        print(f"  Confidence Std:        {results['prediction_confidence_std']:.4f}")
+        print(f"  High Conf Predictions: {results['high_confidence_predictions']}")
+        print(f"  High Conf Percentage:  {results['high_confidence_percentage']:.2f}%")
+        print(f"  Note: Real F1/precision/recall metrics require true labels")
     
     print(f"\nPER-CLASS METRICS (Top 10 by F1):")
     
-    # Sort classes by F1 score
-    class_f1_pairs = list(zip(results['classes'], results['per_class_f1'], 
-                             results['per_class_precision'], results['per_class_recall'],
-                             results['per_class_support']))
-    class_f1_pairs.sort(key=lambda x: x[1], reverse=True)
-    
-    print(f"{'Class':<30} {'F1':<8} {'Prec':<8} {'Recall':<8} {'Support'}")
-    print("-" * 70)
-    
-    for i, (cls, f1, prec, rec, support) in enumerate(class_f1_pairs[:10]):
-        print(f"{cls:<30} {f1:<8.4f} {prec:<8.4f} {rec:<8.4f} {support}")
-    
-    if len(class_f1_pairs) > 10:
-        print(f"... and {len(class_f1_pairs) - 10} more classes")
+    if has_real_metrics:
+        # Sort classes by F1 score
+        class_f1_pairs = list(zip(results['classes'], results['per_class_f1'], 
+                                 results['per_class_precision'], results['per_class_recall'],
+                                 results['per_class_support']))
+        class_f1_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        print(f"{'Class':<30} {'F1':<8} {'Prec':<8} {'Recall':<8} {'Support'}")
+        print("-" * 70)
+        
+        for i, (cls, f1, prec, rec, support) in enumerate(class_f1_pairs[:10]):
+            print(f"{cls:<30} {f1:<8.4f} {prec:<8.4f} {rec:<8.4f} {support}")
+        
+        if len(class_f1_pairs) > 10:
+            print(f"... and {len(class_f1_pairs) - 10} more classes")
+    else:
+        # Show prediction frequency for unsupervised case
+        print(f"{'Class':<30} {'Predictions':<12} {'Percentage'}")
+        print("-" * 55)
+        
+        total_samples = results['n_test_samples']
+        for cls_info in results.get('most_frequent_classes', [])[:10]:
+            cls = cls_info['class']
+            count = cls_info['count'] 
+            percentage = cls_info['percentage']
+            print(f"{cls:<30} {count:<12} {percentage:.2f}%")
     
     print("="*80)
 
@@ -335,7 +520,7 @@ Available log types (based on preprocessing.py):
     parser.add_argument("--model-path", type=str, help="Path to saved model (auto-detected if not provided)")
     parser.add_argument("--test-split", type=float, default=0.2, help="Fraction of data to use for testing (default: 0.2)")
     parser.add_argument("--val-split", type=float, default=0.3, help="Fraction of test data to use for validation (default: 0.3)")
-    parser.add_argument("--output-dir", type=str, default="evaluation_results", help="Output directory (default: evaluation_results)")
+    parser.add_argument("--output-dir", type=str, default="results", help="Output directory (default: results)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     
     args = parser.parse_args()
@@ -395,16 +580,57 @@ Available log types (based on preprocessing.py):
         # Print results
         print_evaluation_results(results)
         
-        # Save results
-        output_dir = Path(args.output_dir)
+        # Save results (match training output structure)
+        output_dir = Path(args.output_dir) / args.log_type  # Create log_type subdirectory
         output_path = output_dir / f"evaluation_{args.log_type}.pkl"
         save_evaluation_results(results, predictions, binary_predictions, true_labels, output_path)
         
+        # Also save in training-compatible format
+        training_format_path = output_dir / f"results_{args.log_type}_evaluation.pkl"
+        with open(training_format_path, 'wb') as f:
+            pickle.dump({
+                'predictions': predictions.astype(np.float32),
+                'binary_predictions': binary_predictions.astype(np.int8), 
+                'classes': results['classes'],
+                'metrics': results,
+                'model_type': 'evaluation_results',
+                'evaluation_mode': 'with_true_labels' if results['macro_f1'] is not None else 'unsupervised'
+            }, f)
+        
+        # Save labels in evaluation format (match training label output)
+        label_output_path = output_dir / f"label_{args.log_type}_evaluation.pkl"
+        label_data = {
+            'vectors': binary_predictions.astype(np.int8),
+            'classes': results['classes'],
+            'probabilities': predictions.astype(np.float32),
+            'metadata': {
+                'evaluation_type': 'real_evaluation_with_test_split',
+                'test_split': args.test_split,
+                'val_split': args.val_split,
+                'optimal_thresholds': results['optimal_thresholds'],
+                'n_test_samples': results['n_test_samples'],
+                'n_val_samples': results['n_val_samples']
+            }
+        }
+        
+        with open(label_output_path, 'wb') as f:
+            pickle.dump(label_data, f)
+        
         print(f"\n✅ Evaluation completed successfully!")
+        print(f"📁 Results saved to:")
+        print(f"   • Detailed evaluation: {output_path}")
+        print(f"   • Training-compatible: {training_format_path}")
+        print(f"   • Label predictions: {label_output_path}")
+        print(f"   • Classification report: {output_path.with_suffix('.txt')}")
         print(f"Key metrics:")
-        print(f"  - Macro F1: {results['macro_f1']:.4f}")
-        print(f"  - Micro F1: {results['micro_f1']:.4f}")
-        print(f"  - Subset Accuracy: {results['subset_accuracy']:.4f}")
+        if results['macro_f1'] is not None:
+            print(f"  - Macro F1: {results['macro_f1']:.4f}")
+            print(f"  - Micro F1: {results['micro_f1']:.4f}")
+            print(f"  - Subset Accuracy: {results['subset_accuracy']:.4f}")
+        else:
+            print(f"  - Prediction Confidence: {results['prediction_confidence_mean']:.4f}")
+            print(f"  - High Confidence Predictions: {results['high_confidence_percentage']:.2f}%")
+            print(f"  - Avg Labels per Sample: {results['avg_labels_per_sample']:.2f}")
         
     except Exception as e:
         print(f"❌ Evaluation failed: {e}")
