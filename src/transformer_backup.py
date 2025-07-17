@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Transformer-based Unsupervised Multi-Label Learning for Supercomputing
-Enhanced with UMTL (Unsupervised Mutual Transformer Learning) techniques
 
 Optimized for Research Alliance of Canada Nibi node:
 - Multi-GPU support (H100, A100, V100)
@@ -14,15 +13,6 @@ Optimized for Research Alliance of Canada Nibi node:
 - Stable results with deterministic training
 - Proper label output format for evaluation
 - Separate models per log type (each log file has only one type)
-
-UMTL Enhancements:
-- Teacher/EMA Network for cleaner pseudo-labels
-- Reconstruction-error seeded pseudo-labels (TPLG)
-- Confidence-gated self-training (FixMatch-style)
-- Multi-view augmentation (weak/strong)
-- Enhanced adaptive thresholding for better F1
-- Distribution-balanced focal loss
-- Prototype/margin loss for discriminative learning
 
 Automatic adaptation to different embedding types:
   * FastText: 300D standard word embeddings
@@ -52,9 +42,8 @@ import pickle
 import logging
 import warnings
 import hashlib
-import copy  # Added for teacher network
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -80,7 +69,6 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.manifold import TSNE
 from sklearn.metrics import adjusted_rand_score, classification_report
-from sklearn.neighbors import NearestNeighbors
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -189,140 +177,6 @@ def cleanup_distributed():
     """Cleanup distributed training"""
     if dist.is_initialized():
         dist.destroy_process_group()
-
-# =============================================================================
-# UMTL Enhancement Functions
-# =============================================================================
-
-def weak_augment(x: torch.Tensor, noise_factor: float = 0.01) -> torch.Tensor:
-    """
-    Weak augmentation for teacher network predictions (FixMatch-style)
-    
-    Args:
-        x: Input embeddings
-        noise_factor: Gaussian noise standard deviation
-    
-    Returns:
-        Weakly augmented embeddings
-    """
-    return x + noise_factor * torch.randn_like(x)
-
-def strong_augment(x: torch.Tensor, dropout_rate: float = 0.15, noise_factor: float = 0.05) -> torch.Tensor:
-    """
-    Strong augmentation for student network training (FixMatch-style)
-    
-    Args:
-        x: Input embeddings
-        dropout_rate: Feature dropout rate
-        noise_factor: Gaussian noise standard deviation
-    
-    Returns:
-        Strongly augmented embeddings
-    """
-    # Feature dropout (simulate missing features)
-    mask = (torch.rand_like(x) > dropout_rate).float()
-    x_augmented = x * mask
-    
-    # Add noise
-    x_augmented = x_augmented + noise_factor * torch.randn_like(x)
-    
-    return x_augmented
-
-def multi_crop_augment(x: torch.Tensor, n_crops: int = 2) -> List[torch.Tensor]:
-    """
-    Multi-crop augmentation for DINO-style training
-    
-    Args:
-        x: Input embeddings
-        n_crops: Number of crops to generate
-    
-    Returns:
-        List of augmented views
-    """
-    crops = []
-    feat_dim = x.shape[-1]
-    
-    for _ in range(n_crops):
-        # Randomly mask some features (simulate local crops)
-        mask_size = int(feat_dim * 0.8)  # Keep 80% of features
-        indices = torch.randperm(feat_dim)[:mask_size]
-        
-        crop = torch.zeros_like(x)
-        crop[..., indices] = x[..., indices]
-        
-        # Add slight noise
-        crop = crop + 0.01 * torch.randn_like(crop)
-        crops.append(crop)
-    
-    return crops
-
-def update_teacher_ema(student: nn.Module, teacher: nn.Module, momentum: float = 0.996):
-    """
-    Update teacher network using exponential moving average (EMA) of student weights
-    
-    Args:
-        student: Student model
-        teacher: Teacher model (updated in-place)
-        momentum: EMA momentum parameter
-    """
-    with torch.no_grad():
-        for param_s, param_t in zip(student.parameters(), teacher.parameters()):
-            param_t.data.mul_(momentum).add_(param_s.data, alpha=1 - momentum)
-
-def compute_class_weights(targets: torch.Tensor, beta: float = 0.999) -> torch.Tensor:
-    """
-    Compute class-balanced weights for Distribution-Balanced Loss
-    
-    Args:
-        targets: Binary target labels (batch_size, n_classes)
-        beta: Smoothing parameter for effective number calculation
-    
-    Returns:
-        Class weights tensor
-    """
-    # Calculate positive counts per class
-    pos_counts = targets.sum(dim=0).clamp(min=1.0)
-    total_samples = targets.shape[0]
-    
-    # Effective number of samples (1 - β^n) / (1 - β)
-    effective_num = (1.0 - torch.pow(beta, pos_counts)) / (1.0 - beta)
-    
-    # Class weights inversely proportional to effective number
-    weights = effective_num.sum() / (len(effective_num) * effective_num)
-    
-    # Normalize weights
-    weights = weights / weights.mean()
-    
-    return weights.clamp(min=0.1, max=10.0)
-
-def generate_reconstruction_anomaly_scores(model: nn.Module, embeddings: torch.Tensor, 
-                                         batch_size: int = 256, device: torch.device = torch.device('cpu')) -> np.ndarray:
-    """
-    Generate anomaly scores based on reconstruction error (TPLG component)
-    
-    Args:
-        model: Trained model with reconstruction capability
-        embeddings: Input embeddings
-        batch_size: Batch size for processing
-        device: Device to use
-    
-    Returns:
-        Per-sample reconstruction errors
-    """
-    model.eval()
-    recon_errors = []
-    
-    with torch.no_grad():
-        for i in range(0, len(embeddings), batch_size):
-            batch = embeddings[i:i+batch_size].to(device)
-            outputs = model(batch)
-            
-            # Calculate reconstruction error
-            recon_error = F.mse_loss(outputs['reconstructed'], batch, reduction='none')
-            recon_error = recon_error.mean(dim=1)  # Per-sample error
-            recon_errors.append(recon_error.cpu().numpy())
-    
-    return np.concatenate(recon_errors)
 
 # =============================================================================
 # Optimized Model Architecture
@@ -456,22 +310,6 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         # Label relationship modeling
         self.label_correlation = nn.Parameter(torch.randn(n_labels, n_labels) * 0.1)
         
-        # UMTL Enhancement: Prototype/Margin components
-        # Running prototypes for each class (not trainable, updated during training)
-        self.register_buffer('class_prototypes', torch.zeros(n_labels, latent_dim))
-        self.register_buffer('prototype_counts', torch.zeros(n_labels))
-        
-        # Prototype projection head for margin loss
-        self.prototype_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Margin for prototype loss
-        self.margin = 0.5
-        
         # Initialize weights for stable training
         self.apply(self._init_weights)
     
@@ -550,17 +388,12 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         z_contrastive = self.contrastive_head(z_fused)
         z_contrastive = F.normalize(z_contrastive, dim=1)
         
-        # UMTL Enhancement: Prototype features
-        z_prototype = self.prototype_head(z_fused)
-        z_prototype = F.normalize(z_prototype, dim=1)
-        
         return {
             'latent': z_fused,
             'reconstructed': x_recon,
             'labels': labels,
             'clusters': clusters,
             'contrastive': z_contrastive,
-            'prototype': z_prototype,  # Added for margin loss
             'branch_predictions': branch_predictions  # For additional loss
         }
 
@@ -858,120 +691,6 @@ def focal_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = None,
     
     return focal_loss.mean()
 
-def enhanced_focal_loss(logits: torch.Tensor, targets: torch.Tensor, class_weights: torch.Tensor = None, 
-                       gamma: float = 2.0, beta: float = 0.999) -> torch.Tensor:
-    """
-    Enhanced focal loss with distribution-balanced weights for better F1 scores
-    
-    Args:
-        logits: Model predictions (before sigmoid)
-        targets: Target labels
-        class_weights: Pre-computed class weights (if None, computed from targets)
-        gamma: Focusing parameter
-        beta: Smoothing parameter for effective number calculation
-    
-    Returns:
-        Enhanced focal loss value
-    """
-    # Apply sigmoid to get probabilities
-    probs = torch.sigmoid(logits)
-    
-    # Compute class-balanced weights if not provided
-    if class_weights is None:
-        class_weights = compute_class_weights(targets, beta)
-    
-    # Ensure class_weights is broadcastable
-    class_weights = class_weights.unsqueeze(0)  # Shape: (1, n_classes)
-    
-    # Calculate focal loss with class balancing
-    ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    p_t = probs * targets + (1 - probs) * (1 - targets)
-    
-    # Apply class weights and focal factor
-    focal_weight = class_weights * (1 - p_t) ** gamma
-    focal_loss = focal_weight * ce_loss
-    
-    return focal_loss.mean()
-
-def prototype_margin_loss(z_prototype: torch.Tensor, labels: torch.Tensor, 
-                         class_prototypes: torch.Tensor, margin: float = 0.5) -> torch.Tensor:
-    """
-    Prototype/margin loss for discriminative learning (UMTL component)
-    
-    Args:
-        z_prototype: Prototype features from model (batch_size, latent_dim)
-        labels: Binary labels (batch_size, n_classes)
-        class_prototypes: Running class prototypes (n_classes, latent_dim)
-        margin: Margin for separation
-    
-    Returns:
-        Prototype margin loss
-    """
-    batch_size = z_prototype.shape[0]
-    n_classes = labels.shape[1]
-    
-    # Compute distances to all prototypes
-    # z_prototype: (batch_size, latent_dim)
-    # class_prototypes: (n_classes, latent_dim)
-    # distances: (batch_size, n_classes)
-    distances = torch.cdist(z_prototype.unsqueeze(1), class_prototypes.unsqueeze(0)).squeeze(1)
-    
-    # Create positive and negative masks
-    pos_mask = labels > 0.5  # Active classes
-    neg_mask = ~pos_mask  # Inactive classes
-    
-    # Positive loss: minimize distance to assigned prototypes
-    pos_distances = distances * pos_mask.float()
-    pos_loss = pos_distances.sum() / (pos_mask.sum() + 1e-8)
-    
-    # Negative loss: maximize distance to non-assigned prototypes (with margin)
-    neg_distances = F.relu(margin - distances) * neg_mask.float()
-    neg_loss = neg_distances.sum() / (neg_mask.sum() + 1e-8)
-    
-    # Total loss
-    total_loss = pos_loss + neg_loss
-    
-    return total_loss
-
-def update_class_prototypes(model: nn.Module, z_prototype: torch.Tensor, labels: torch.Tensor, 
-                          momentum: float = 0.99):
-    """
-    Update running class prototypes using high-confidence predictions
-    
-    Args:
-        model: Model containing class_prototypes buffer
-        z_prototype: Current batch prototype features
-        labels: Current batch labels (probabilities)
-        momentum: Update momentum
-    """
-    with torch.no_grad():
-        # Only update with high-confidence predictions
-        confidence_threshold = 0.7
-        high_conf_mask = labels > confidence_threshold
-        
-        for class_idx in range(labels.shape[1]):
-            class_mask = high_conf_mask[:, class_idx]
-            
-            if class_mask.any():
-                # Get features for this class
-                class_features = z_prototype[class_mask]
-                
-                # Compute mean of class features
-                class_mean = class_features.mean(dim=0)
-                
-                # Update prototype with momentum
-                if model.prototype_counts[class_idx] == 0:
-                    # First update for this class
-                    model.class_prototypes[class_idx] = class_mean
-                    model.prototype_counts[class_idx] = 1
-                else:
-                    # Momentum update
-                    model.class_prototypes[class_idx] = (
-                        momentum * model.class_prototypes[class_idx] + 
-                        (1 - momentum) * class_mean
-                    )
-                    model.prototype_counts[class_idx] += class_mask.sum().item()
-
 def confidence_regularization_loss(predictions: torch.Tensor, confidence_target: float = 0.8) -> torch.Tensor:
     """
     Encourage higher confidence predictions
@@ -1243,23 +962,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         n_clusters=n_clusters
     ).to(device)
     
-    # UMTL Enhancement: Create teacher network (EMA of student)
-    teacher = copy.deepcopy(model)
-    teacher.eval()
-    for param in teacher.parameters():
-        param.requires_grad = False
-    teacher = teacher.to(device)
-    
-    # EMA momentum (start high, can be decreased during training)
-    ema_momentum = 0.996
-    
-    # Initialize reconstruction anomaly scores (will be computed after warmup)
-    reconstruction_anomaly_scores = None
-    anomaly_threshold = 0.9  # Top 10% highest reconstruction errors
-    
-    # Confidence threshold for FixMatch-style training
-    confidence_threshold = 0.8
-    
     # Detect and log embedding type
     embedding_type = "Unknown"
     if embedding_dim == 300:
@@ -1401,53 +1103,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         if config.is_distributed:
             sampler.set_epoch(epoch)
         
-        # UMTL Enhancement: Compute reconstruction anomaly scores after warmup (TPLG)
-        if epoch == 2 and reconstruction_anomaly_scores is None:
-            print("Computing reconstruction anomaly scores...")
-            embeddings_tensor = torch.from_numpy(embeddings).float()
-            reconstruction_anomaly_scores = generate_reconstruction_anomaly_scores(
-                model, embeddings_tensor, batch_size, device
-            )
-            
-            # Find anomaly threshold (top 10% highest errors)
-            anomaly_threshold_value = np.percentile(reconstruction_anomaly_scores, anomaly_threshold * 100)
-            anomaly_mask = reconstruction_anomaly_scores > anomaly_threshold_value
-            
-            # Update pseudo-labels for high-error samples (potential anomalies)
-            if np.any(anomaly_mask):
-                # Find attack/anomaly classes (anything not 'normal')
-                attack_indices = [i for i, cls in enumerate(classes) if cls != 'normal']
-                if attack_indices:
-                    # Boost confidence for attack classes in high-error samples
-                    for idx in np.where(anomaly_mask)[0]:
-                        for attack_idx in attack_indices:
-                            current_pseudo_labels[idx, attack_idx] = max(
-                                current_pseudo_labels[idx, attack_idx],
-                                0.7  # High confidence for anomaly
-                            )
-                    
-                    # Update dataset with anomaly-seeded labels
-                    dataset = TensorDataset(
-                        torch.from_numpy(embeddings).float(),
-                        torch.from_numpy(current_pseudo_labels).float()
-                    )
-                    
-                    dataloader = DataLoader(
-                        dataset, 
-                        batch_size=batch_size, 
-                        sampler=sampler,
-                        shuffle=(sampler is None),
-                        num_workers=min(2, config.n_cpus // 8),
-                        pin_memory=True
-                    )
-                    
-                    tracker.log_step("Reconstruction Anomaly Seeding (TPLG)", {
-                        "epoch": epoch,
-                        "anomaly_threshold": float(anomaly_threshold_value),
-                        "n_anomalies": int(np.sum(anomaly_mask)),
-                        "percentage_anomalies": float(np.mean(anomaly_mask) * 100)
-                    })
-        
         # Advanced pseudo-label refinement with curriculum learning
         if epoch > 0 and epoch % refinement_interval == 0:
             model.eval()
@@ -1535,29 +1190,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 if config.device == "cuda" and batch_idx % 20 == 0:
                     clear_gpu_memory()
                 
-                # UMTL Enhancement: Teacher predictions with weak augmentation
-                with torch.no_grad():
-                    # Weak augmentation for teacher
-                    x_weak = weak_augment(x_batch)
-                    teacher_outputs = teacher(x_weak)
-                    teacher_probs = torch.sigmoid(teacher_outputs['labels'])
-                    
-                    # Confidence mask for FixMatch-style training
-                    max_probs = teacher_probs.max(dim=1).values
-                    confidence_mask = (max_probs >= confidence_threshold).float()
-                    
-                    # Create pseudo-labels from confident teacher predictions
-                    teacher_pseudo_labels = (teacher_probs >= confidence_threshold).float()
-                
-                # Only train on confident samples (FixMatch-style)
-                n_confident = confidence_mask.sum().item()
-                
                 if scaler:
                     with autocast():
                         try:
-                            # Strong augmentation for student
-                            x_strong = strong_augment(x_batch)
-                            outputs = model(x_strong)
+                            outputs = model(x_batch)
                         except torch.cuda.OutOfMemoryError:
                             # Skip this batch and clear memory
                             clear_gpu_memory()
@@ -1566,20 +1202,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                         
-                        # Enhanced focal loss with distribution-balanced weights
-                        label_loss = enhanced_focal_loss(outputs['labels'], y_batch)
-                        
-                        # Supervised loss on confident teacher predictions (FixMatch)
-                        if n_confident > 0:
-                            confidence_mask_expanded = confidence_mask.unsqueeze(1)
-                            supervised_loss = F.binary_cross_entropy_with_logits(
-                                outputs['labels'], 
-                                teacher_pseudo_labels,
-                                reduction='none'
-                            )
-                            supervised_loss = (supervised_loss * confidence_mask_expanded).sum() / (confidence_mask_expanded.sum() + 1e-8)
-                        else:
-                            supervised_loss = torch.tensor(0.0, device=device)
+                        # Use focal loss with automatic class balancing
+                        label_loss = focal_loss(outputs['labels'], y_batch, alpha=None, gamma=2.0)
                         
                         # Add confidence regularization
                         predictions = torch.sigmoid(outputs['labels'])
@@ -1587,17 +1211,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         
                         # Ensemble consistency loss
                         ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
-                        
-                        # Prototype/margin loss
-                        if model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
-                            prototype_loss = prototype_margin_loss(
-                                outputs['prototype'], 
-                                predictions,  # Use predictions as soft labels
-                                model.class_prototypes,
-                                model.margin
-                            )
-                        else:
-                            prototype_loss = torch.tensor(0.0, device=device)
                         
                         if C is not None:
                             C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -1620,14 +1233,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         # Curriculum-based loss weighting
                         loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
                         
-                        # Add weights for UMTL losses
-                        loss_weights['supervised'] = min(0.3, 0.1 + 0.2 * (epoch / total_epochs))  # Gradually increase
-                        loss_weights['prototype'] = min(0.2, 0.05 + 0.15 * (epoch / total_epochs))  # Start small
-                        
                         total_loss = (loss_weights['recon'] * recon_loss + 
                                     loss_weights['label'] * label_loss + 
-                                    loss_weights['supervised'] * supervised_loss +  # Added
-                                    loss_weights['prototype'] * prototype_loss +     # Added
                                     loss_weights['cluster'] * cluster_loss + 
                                     loss_weights['contrastive'] * contrast_loss + 
                                     loss_weights['mutual'] * mutual_loss + 
@@ -1638,8 +1245,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         loss_dict = {
                             'recon': recon_loss,
                             'label': label_loss,
-                            'supervised': supervised_loss,  # Added
-                            'prototype': prototype_loss,    # Added
                             'cluster': cluster_loss,
                             'contrastive': contrast_loss,
                             'mutual': mutual_loss,
@@ -1667,18 +1272,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     scaler.step(optimizer)
                     scaler.update()
-                    
-                    # UMTL Enhancement: Update teacher network (EMA)
-                    update_teacher_ema(model, teacher, ema_momentum)
-                    
-                    # Update class prototypes
-                    update_class_prototypes(model, outputs['prototype'], predictions)
-                    
                 else:
                     try:
-                        # Strong augmentation for student (same as scaler branch)
-                        x_strong = strong_augment(x_batch)
-                        outputs = model(x_strong)
+                        outputs = model(x_batch)
                     except torch.cuda.OutOfMemoryError:
                         # Skip this batch and clear memory
                         clear_gpu_memory()
@@ -1686,20 +1282,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
-                    # Enhanced focal loss with distribution-balanced weights
-                    label_loss = enhanced_focal_loss(outputs['labels'], y_batch)
-                    
-                    # Supervised loss on confident teacher predictions (FixMatch)
-                    if n_confident > 0:
-                        confidence_mask_expanded = confidence_mask.unsqueeze(1)
-                        supervised_loss = F.binary_cross_entropy_with_logits(
-                            outputs['labels'], 
-                            teacher_pseudo_labels,
-                            reduction='none'
-                        )
-                        supervised_loss = (supervised_loss * confidence_mask_expanded).sum() / (confidence_mask_expanded.sum() + 1e-8)
-                    else:
-                        supervised_loss = torch.tensor(0.0, device=device)
+                    # Use focal loss with automatic class balancing
+                    label_loss = focal_loss(outputs['labels'], y_batch, alpha=None, gamma=2.0)
                     
                     # Add confidence regularization
                     predictions = torch.sigmoid(outputs['labels'])
@@ -1707,17 +1291,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     # Ensemble consistency loss
                     ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
-                    
-                    # Prototype/margin loss
-                    if model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
-                        prototype_loss = prototype_margin_loss(
-                            outputs['prototype'], 
-                            predictions,  # Use predictions as soft labels
-                            model.class_prototypes,
-                            model.margin
-                        )
-                    else:
-                        prototype_loss = torch.tensor(0.0, device=device)
                     
                     if C is not None:
                         C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
@@ -1740,14 +1313,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     # Curriculum-based loss weighting
                     loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
                     
-                    # Add weights for UMTL losses
-                    loss_weights['supervised'] = min(0.3, 0.1 + 0.2 * (epoch / total_epochs))  # Gradually increase
-                    loss_weights['prototype'] = min(0.2, 0.05 + 0.15 * (epoch / total_epochs))  # Start small
-                    
                     total_loss = (loss_weights['recon'] * recon_loss + 
                                 loss_weights['label'] * label_loss + 
-                                loss_weights['supervised'] * supervised_loss +  # Added
-                                loss_weights['prototype'] * prototype_loss +     # Added
                                 loss_weights['cluster'] * cluster_loss + 
                                 loss_weights['contrastive'] * contrast_loss + 
                                 loss_weights['mutual'] * mutual_loss + 
@@ -1758,8 +1325,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     loss_dict = {
                         'recon': recon_loss,
                         'label': label_loss,
-                        'supervised': supervised_loss,  # Added
-                        'prototype': prototype_loss,    # Added
                         'cluster': cluster_loss,
                         'contrastive': contrast_loss,
                         'mutual': mutual_loss,
@@ -1785,12 +1350,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     
                     optimizer.step()
-                    
-                    # UMTL Enhancement: Update teacher network (EMA)
-                    update_teacher_ema(model, teacher, ema_momentum)
-                    
-                    # Update class prototypes
-                    update_class_prototypes(model, outputs['prototype'], predictions)
                 
                 epoch_losses.append(total_loss.item())
                 
@@ -1895,22 +1454,49 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
     
     predictions = np.vstack(predictions)
     
-    # Use enhanced adaptive thresholding with global+local fusion
-    true_labels = getattr(tracker, 'true_labels', None)
-    adaptive_thresholds, binary_predictions = enhanced_adaptive_thresholding(
-        predictions, embeddings, classes, true_labels, k_neighbors=20
-    )
+    # Use F1-optimized adaptive thresholding
+    # Calculate per-class thresholds optimized for F1 score
+    adaptive_thresholds = []
     
-    # Log threshold information
-    tracker.log_step("Enhanced Adaptive Thresholding", {
-        "mean_threshold": float(np.mean(adaptive_thresholds)),
-        "std_threshold": float(np.std(adaptive_thresholds)),
-        "min_threshold": float(np.min(adaptive_thresholds)),
-        "max_threshold": float(np.max(adaptive_thresholds)),
-        "thresholds_per_class": {
-            cls: float(thresh) for cls, thresh in zip(classes[:10], adaptive_thresholds[:10])
-        }
-    })
+    # If we have true labels from tracker, use them to optimize thresholds
+    if hasattr(tracker, 'true_labels') and tracker.true_labels is not None:
+        # Use true labels to find optimal thresholds
+        from sklearn.metrics import f1_score
+        
+        for class_idx in range(predictions.shape[1]):
+            class_preds = predictions[:, class_idx]
+            true_class = tracker.true_labels[:, class_idx] if class_idx < tracker.true_labels.shape[1] else np.zeros(len(predictions))
+            
+            # Try different thresholds to find best F1
+            best_threshold = 0.5
+            best_f1 = 0.0
+            
+            for threshold in np.linspace(0.1, 0.9, 17):  # Test 17 thresholds
+                binary_preds = (class_preds > threshold).astype(int)
+                if true_class.sum() > 0:  # Only optimize if we have positive samples
+                    f1 = f1_score(true_class, binary_preds, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_threshold = threshold
+            
+            adaptive_thresholds.append(best_threshold)
+    else:
+        # Fallback: Use distribution-based thresholding with better heuristics
+        for class_idx in range(predictions.shape[1]):
+            class_preds = predictions[:, class_idx]
+            
+            # Use mean + std as threshold (often better for F1)
+            mean_pred = np.mean(class_preds)
+            std_pred = np.std(class_preds)
+            
+            # Threshold = mean + 0.5 * std, bounded between 0.2 and 0.8
+            threshold = min(max(0.2, mean_pred + 0.5 * std_pred), 0.8)
+            adaptive_thresholds.append(threshold)
+    
+    # Apply adaptive thresholds
+    binary_predictions = np.zeros_like(predictions, dtype=int)
+    for class_idx, threshold in enumerate(adaptive_thresholds):
+        binary_predictions[:, class_idx] = (predictions[:, class_idx] > threshold).astype(int)
     
     # Sophisticated multi-label assignment for better F1 scores
     for idx in range(len(binary_predictions)):
@@ -2501,103 +2087,6 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
     pseudo_labels = np.nan_to_num(pseudo_labels, nan=min_conf, posinf=max_conf, neginf=min_conf)
     
     return pseudo_labels
-
-def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarray, 
-                                  classes: List[str], true_labels: np.ndarray = None, 
-                                  k_neighbors: int = 20) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Enhanced adaptive thresholding combining global and local information for better F1
-    
-    Args:
-        predictions: Predicted probabilities (n_samples, n_classes)
-        embeddings: Original embeddings for local density calculation
-        classes: List of class names
-        true_labels: True labels if available for optimization
-        k_neighbors: Number of neighbors for local density
-    
-    Returns:
-        adaptive_thresholds: Per-class thresholds
-        binary_predictions: Binary predictions with sophisticated assignment
-    """
-    n_samples, n_classes = predictions.shape
-    adaptive_thresholds = np.zeros(n_classes)
-    
-    # Step 1: Calculate global information
-    global_priors = predictions.mean(axis=0)  # Average prediction per class
-    class_rarity = -np.log(global_priors + 1e-8)  # IDF-like rarity score
-    
-    # Step 2: Calculate local density information (if embeddings available)
-    if embeddings is not None and len(embeddings) > k_neighbors:
-        nn = NearestNeighbors(n_neighbors=k_neighbors, metric='cosine')
-        nn.fit(embeddings)
-        distances, indices = nn.kneighbors(embeddings)
-        
-        # Local density: inverse of average distance to k nearest neighbors
-        local_density = 1.0 / (distances.mean(axis=1) + 1e-8)
-        local_density = (local_density - local_density.min()) / (local_density.max() - local_density.min() + 1e-8)
-    else:
-        local_density = np.ones(n_samples) * 0.5
-    
-    # Step 3: Calculate per-class adaptive thresholds
-    for class_idx in range(n_classes):
-        class_preds = predictions[:, class_idx]
-        
-        if true_labels is not None and class_idx < true_labels.shape[1]:
-            # If we have true labels, optimize threshold for F1
-            from sklearn.metrics import f1_score
-            true_class = true_labels[:, class_idx]
-            
-            if true_class.sum() > 0:  # Only optimize if we have positive samples
-                best_threshold = 0.5
-                best_f1 = 0.0
-                
-                # Test multiple thresholds
-                for threshold in np.linspace(0.1, 0.9, 25):
-                    # Combine global and local information
-                    adjusted_threshold = threshold * (1 + 0.1 * class_rarity[class_idx])
-                    binary_preds = (class_preds > adjusted_threshold).astype(int)
-                    
-                    f1 = f1_score(true_class, binary_preds, zero_division=0)
-                    if f1 > best_f1:
-                        best_f1 = f1
-                        best_threshold = adjusted_threshold
-                
-                adaptive_thresholds[class_idx] = best_threshold
-            else:
-                # No positive samples, use heuristic
-                adaptive_thresholds[class_idx] = 0.5 + 0.1 * class_rarity[class_idx]
-        else:
-            # No true labels, use distribution-based adaptive threshold
-            mean_pred = np.mean(class_preds)
-            std_pred = np.std(class_preds)
-            
-            # Combine global rarity and local distribution
-            base_threshold = mean_pred + 0.5 * std_pred
-            
-            # Adjust based on class rarity (rare classes get lower thresholds)
-            rarity_adjustment = 0.1 * (1 - global_priors[class_idx])
-            
-            # Final threshold bounded between 0.15 and 0.85
-            adaptive_thresholds[class_idx] = np.clip(
-                base_threshold - rarity_adjustment,
-                0.15, 0.85
-            )
-    
-    # Step 4: Apply thresholds with local density adjustment
-    binary_predictions = np.zeros_like(predictions, dtype=int)
-    
-    for sample_idx in range(n_samples):
-        sample_preds = predictions[sample_idx]
-        sample_density = local_density[sample_idx]
-        
-        # Adjust thresholds based on local density (denser regions = higher confidence required)
-        density_factor = 1.0 + 0.2 * (sample_density - 0.5)
-        
-        for class_idx in range(n_classes):
-            adjusted_threshold = adaptive_thresholds[class_idx] * density_factor
-            binary_predictions[sample_idx, class_idx] = int(sample_preds[class_idx] > adjusted_threshold)
-    
-    return adaptive_thresholds, binary_predictions
 
 # =============================================================================
 # Main Execution
