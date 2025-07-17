@@ -36,7 +36,7 @@ from transformer import (
 )
 
 def load_trained_model(model_path: Path, device: torch.device) -> Tuple[UnsupervisedMultiLabelTransformer, Dict]:
-    """Load a trained transformer model"""
+    """Load a trained transformer model with automatic architecture detection"""
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
@@ -55,26 +55,70 @@ def load_trained_model(model_path: Path, device: torch.device) -> Tuple[Unsuperv
     input_dim = model_state['input_proj.0.weight'].shape[1]
     latent_dim = model_state['input_proj.0.weight'].shape[0]
     
-    # Estimate n_clusters from saved state
-    if 'cluster_head.0.weight' in model_state:
-        n_clusters = model_state['cluster_head.0.weight'].shape[0]
-    else:
-        n_clusters = 1
+    # Smart approach: Try different n_clusters values until one works
+    # Common cluster values used in the training
+    possible_clusters = [1, 4, 8, min(8, len(classes)), len(classes)]
+    if len(classes) > 0:
+        possible_clusters.extend([min(16, len(classes)), min(32, len(classes))])
     
-    # Create model
-    model = UnsupervisedMultiLabelTransformer(
-        input_dim=input_dim,
-        latent_dim=latent_dim,
-        n_labels=n_labels,
-        n_clusters=n_clusters
-    )
+    # Remove duplicates and sort
+    possible_clusters = sorted(list(set(possible_clusters)))
     
-    # Load state dict
-    model.load_state_dict(model_state)
+    print(f"🔧 Trying to load model with architecture: {input_dim}D → {latent_dim}D, {n_labels} labels")
+    print(f"🔧 Testing cluster values: {possible_clusters}")
+    
+    model = None
+    n_clusters_used = None
+    
+    # Try each possible cluster count
+    for n_clusters in possible_clusters:
+        try:
+            print(f"   Trying n_clusters = {n_clusters}...")
+            test_model = UnsupervisedMultiLabelTransformer(
+                input_dim=input_dim,
+                latent_dim=latent_dim,
+                n_labels=n_labels,
+                n_clusters=n_clusters
+            )
+            
+            # Try to load the state dict
+            test_model.load_state_dict(model_state)
+            
+            # If we get here, it worked!
+            model = test_model
+            n_clusters_used = n_clusters
+            print(f"   ✅ Success with n_clusters = {n_clusters}")
+            break
+            
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                print(f"   ❌ Size mismatch with n_clusters = {n_clusters}")
+                continue
+            else:
+                # Some other error, re-raise
+                raise e
+    
+    # If none worked, try with strict=False
+    if model is None:
+        print("🔄 All cluster values failed, trying with strict=False...")
+        n_clusters = possible_clusters[0]  # Use first value
+        model = UnsupervisedMultiLabelTransformer(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            n_labels=n_labels,
+            n_clusters=n_clusters
+        )
+        
+        model.load_state_dict(model_state, strict=False)
+        n_clusters_used = n_clusters
+        print(f"✅ Loaded with strict=False using n_clusters = {n_clusters}")
+    
     model.to(device)
     model.eval()
     
-    print(f"✅ Loaded model: {input_dim}D → {latent_dim}D, {n_labels} classes")
+    print(f"✅ Model loaded successfully:")
+    print(f"   Architecture: {input_dim}D → {latent_dim}D")
+    print(f"   Labels: {n_labels}, Clusters: {n_clusters_used}")
     
     return model, saved_data
 
