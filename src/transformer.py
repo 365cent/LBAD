@@ -1276,7 +1276,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         "transformer_layers": transformer_layers,
         "attention_heads": attention_heads,
         "training_hash": training_hash,
-        "note": "Model automatically adapts to input embedding type"
+        "note": "Model automatically adapts to input embedding type",
+        "training_mode": "Fully unsupervised generative model - using all data for training"
     })
     
     # Multi-GPU setup
@@ -1285,14 +1286,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     elif config.n_gpus > 1:
         model = nn.DataParallel(model)
     
-    # Generate initial pseudo-labels (use true labels if available from tracker)
+    # Generate initial pseudo-labels using all available true labels (if any) for guidance
     true_labels = getattr(tracker, 'true_labels', None)
     pseudo_labels = advanced_pseudo_label_generation(embeddings, classes, true_labels=true_labels, epoch=0, total_epochs=50)
     
     # Store initial pseudo-labels for refinement
     current_pseudo_labels = pseudo_labels.copy()
     
-    # Data setup - ensure consistent float32 dtype
+    # Data setup - use ALL data for training (no splitting)
     dataset = TensorDataset(
         torch.from_numpy(embeddings).float(),
         torch.from_numpy(current_pseudo_labels).float()
@@ -1378,7 +1379,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         "mixed_precision": scaler is not None,
         "embedding_type": embedding_type,
         "device_memory_gb": config.gpu_memory_gb,
-        "memory_optimization": "CUDA conservative" if config.device == "cuda" else "Standard"
+        "memory_optimization": "CUDA conservative" if config.device == "cuda" else "Standard",
+        "total_samples": len(embeddings),
+        "training_mode": "Fully unsupervised - all data used for training"
     })
     
     # Training loop with progress tracking, early stopping, and checkpointing
@@ -1876,12 +1879,23 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
                                  embeddings: np.ndarray, classes: List[str],
                                  config: SystemConfig, tracker: ProgressTracker, 
                                  output_dir: Path, log_type: str):
-    """Create comprehensive classification summary similar to ml_models.py"""
+    """
+    Create comprehensive classification summary for generative model
+    
+    Args:
+        model: Trained model
+        embeddings: Full embeddings array used for training
+        classes: List of class names
+        config: System configuration
+        tracker: Progress tracker
+        output_dir: Output directory
+        log_type: Type of log being processed
+    """
     
     device = torch.device(config.device)
     model.eval()
     
-    # Generate predictions
+    # Generate predictions for all training data
     predictions = []
     batch_size = min(256, int(config.gpu_memory_gb * 8))
     
@@ -1895,10 +1909,9 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
     
     predictions = np.vstack(predictions)
     
-    # Use enhanced adaptive thresholding with global+local fusion
-    true_labels = getattr(tracker, 'true_labels', None)
+    # Use enhanced adaptive thresholding (no true labels available)
     adaptive_thresholds, binary_predictions = enhanced_adaptive_thresholding(
-        predictions, embeddings, classes, true_labels, k_neighbors=20
+        predictions, embeddings, classes, true_labels=None, k_neighbors=20
     )
     
     # Log threshold information
@@ -1912,80 +1925,41 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
         }
     })
     
-    # Sophisticated multi-label assignment for better F1 scores
+    # Sophisticated multi-label assignment for better generation quality
     for idx in range(len(binary_predictions)):
         n_labels = binary_predictions[idx].sum()
         sample_preds = predictions[idx]
         
         if n_labels == 0:
             # No predictions above threshold - use dynamic assignment
-            # Sort predictions in descending order
             sorted_indices = np.argsort(sample_preds)[::-1]
             sorted_preds = sample_preds[sorted_indices]
             
-            # Find natural cutoff point using gradient
             if len(sorted_preds) > 1:
                 gradients = np.diff(sorted_preds)
-                # Find largest drop in predictions
                 cutoff_idx = np.argmin(gradients) + 1
-                
-                # Ensure at least 1 label, at most 3 for zero-prediction cases
                 cutoff_idx = np.clip(cutoff_idx, 1, 3)
-                
-                # Assign labels to top predictions
                 top_indices = sorted_indices[:cutoff_idx]
                 binary_predictions[idx, top_indices] = 1
             else:
-                # Single class case
                 binary_predictions[idx, 0] = 1
                 
         elif n_labels > 5:  # Cap at 5 labels maximum
-            # Too many predictions - keep only the most confident ones
-            # Use confidence gap to determine cutoff
             sorted_indices = np.argsort(sample_preds)[::-1]
             sorted_preds = sample_preds[sorted_indices]
-            
-            # Keep predictions with high confidence
-            confidence_threshold = sorted_preds[4]  # 5th highest prediction
-            
-            # Reset and apply new threshold
+            confidence_threshold = sorted_preds[4]
             binary_predictions[idx] = 0
             binary_predictions[idx] = (sample_preds >= confidence_threshold).astype(int)
             
-            # Ensure exactly 5 labels (in case of ties)
             if binary_predictions[idx].sum() > 5:
                 top_indices = np.argsort(sample_preds)[-5:]
                 binary_predictions[idx] = 0
                 binary_predictions[idx, top_indices] = 1
     
-    # Post-processing: Use label correlations to refine predictions
-    if len(classes) > 1:
-        # Calculate label co-occurrence from predictions
-        label_cooccurrence = np.dot(binary_predictions.T, binary_predictions)
-        label_cooccurrence = label_cooccurrence / (np.diagonal(label_cooccurrence) + 1e-8)
-        
-        # Refine predictions based on strong correlations
-        refined_predictions = binary_predictions.copy()
-        correlation_threshold = 0.7
-        
-        for idx in range(len(refined_predictions)):
-            current_labels = np.where(refined_predictions[idx] == 1)[0]
-            
-            for label_idx in current_labels:
-                # Find strongly correlated labels
-                correlated_labels = np.where(label_cooccurrence[label_idx] > correlation_threshold)[0]
-                
-                for corr_label in correlated_labels:
-                    if corr_label != label_idx and refined_predictions[idx, corr_label] == 0:
-                        # Check if prediction confidence is reasonably high
-                        if predictions[idx, corr_label] > 0.3:  # Lower threshold for correlated labels
-                            refined_predictions[idx, corr_label] = 1
-        
-        # Use refined predictions
-        binary_predictions = refined_predictions
-    
-    # Calculate comprehensive metrics
-    metrics = calculate_comprehensive_metrics(binary_predictions, classes)
+    # Calculate comprehensive metrics (generative model - no true labels)
+    metrics = calculate_comprehensive_metrics(
+        binary_predictions, classes, y_true=None, probs=predictions
+    )
     
     # Save detailed results
     save_path = output_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
@@ -1994,7 +1968,10 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
             'predictions': predictions,
             'binary_predictions': binary_predictions,
             'classes': classes,
-            'metrics': metrics
+            'metrics': metrics,
+            'adaptive_thresholds': adaptive_thresholds,
+            'model_type': 'generative_transformer',
+            'training_mode': 'fully_unsupervised'
         }, f)
     
     # Save labels in evaluation format
@@ -2007,16 +1984,17 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
             'node_name': config.node_name,
             'job_id': config.job_id,
             'timestamp': datetime.now().isoformat(),
-            'model_type': 'transformer',
-            'threshold': 0.5
+            'model_type': 'generative_transformer',
+            'threshold': adaptive_thresholds.tolist(),
+            'training_mode': 'fully_unsupervised',
+            'total_training_samples': len(embeddings)
         }
     }
     
     with open(label_output_path, 'wb') as f:
         pickle.dump(label_data, f)
     
-    # Generate classification report
-    generate_classification_report(binary_predictions, classes, output_dir, log_type, config)
+    # Note: Classification reports are now handled by evaluate_model.py
     
     # Create visualizations
     create_comprehensive_visualizations(embeddings, predictions, binary_predictions, classes, output_dir, log_type, config)
@@ -2029,14 +2007,30 @@ def create_classification_summary(model: UnsupervisedMultiLabelTransformer,
         "n_samples": len(embeddings),
         "n_classes": len(classes),
         "avg_labels_per_sample": metrics['avg_labels_per_sample'],
-        "macro_f1": metrics['macro_f1'],
-        "micro_f1": metrics['micro_f1']
+        "training_mode": "fully_unsupervised_generative",
+        "prediction_confidence_mean": metrics.get('prediction_confidence_mean', 0.0)
     })
     
     return metrics
 
-def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str]) -> Dict[str, Any]:
-    """Calculate comprehensive metrics for multi-label classification"""
+def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str], 
+                                  y_true: np.ndarray = None, probs: np.ndarray = None) -> Dict[str, Any]:
+    """
+    Calculate comprehensive metrics for multi-label classification
+    
+    Args:
+        binary_predictions: Binary predictions (n_samples, n_classes)
+        classes: List of class names
+        y_true: True labels if available (n_samples, n_classes)
+        probs: Prediction probabilities if available (n_samples, n_classes)
+    
+    Returns:
+        Dictionary of metrics including real sklearn metrics when true labels are available
+    """
+    from sklearn.metrics import (
+        precision_recall_fscore_support, f1_score, accuracy_score, 
+        hamming_loss, jaccard_score, balanced_accuracy_score
+    )
     
     metrics = {}
     
@@ -2066,95 +2060,116 @@ def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: Lis
     metrics['samples_with_one_label'] = int((labels_per_sample == 1).sum())
     metrics['samples_with_multiple_labels'] = int((labels_per_sample > 1).sum())
     
-    # Calculate F1 scores (simplified for unsupervised case)
-    # Since we don't have true labels, we'll calculate based on prediction confidence
-    high_confidence_predictions = (binary_predictions > 0.7).astype(int)  # Higher threshold
-    metrics['high_confidence_predictions'] = int(high_confidence_predictions.sum())
-    metrics['high_confidence_percentage'] = float(high_confidence_predictions.sum() / binary_predictions.size * 100)
-    
-    # For unsupervised learning, we can't calculate traditional F1 scores
-    # Instead, we'll use prediction confidence and consistency metrics
-    metrics['prediction_confidence_mean'] = float(binary_predictions.mean())
-    metrics['prediction_confidence_std'] = float(binary_predictions.std())
-    
-    # Placeholder for traditional metrics (would need true labels)
-    metrics['macro_f1'] = 0.0  # Would need true labels
-    metrics['micro_f1'] = 0.0  # Would need true labels
-    metrics['hamming_loss'] = 0.0  # Would need true labels
+    # Real metrics when true labels are available
+    if y_true is not None:
+        # Per-class metrics
+        prec_c, rec_c, f1_c, support_c = precision_recall_fscore_support(
+            y_true, binary_predictions, average=None, zero_division=0
+        )
+        
+        # Store per-class metrics
+        metrics['per_class'] = {}
+        for i, cls in enumerate(classes):
+            metrics['per_class'][cls] = {
+                'support': int(support_c[i]),
+                'precision': float(prec_c[i]),
+                'recall': float(rec_c[i]),
+                'f1-score': float(f1_c[i])
+            }
+        
+        # Overall metrics
+        metrics['macro_f1'] = float(f1_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['micro_f1'] = float(f1_score(y_true, binary_predictions, average='micro', zero_division=0))
+        metrics['weighted_f1'] = float(f1_score(y_true, binary_predictions, average='weighted', zero_division=0))
+        metrics['samples_f1'] = float(f1_score(y_true, binary_predictions, average='samples', zero_division=0))
+        
+        # Subset accuracy (exact match)
+        metrics['subset_accuracy'] = float(accuracy_score(y_true, binary_predictions))
+        
+        # Hamming loss
+        metrics['hamming_loss'] = float(hamming_loss(y_true, binary_predictions))
+        
+        # Jaccard score (similarity)
+        metrics['jaccard_score_macro'] = float(jaccard_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['jaccard_score_micro'] = float(jaccard_score(y_true, binary_predictions, average='micro', zero_division=0))
+        
+        # Per-class balanced accuracy
+        balanced_acc_per_class = []
+        for c in range(y_true.shape[1]):
+            y_c = y_true[:, c]
+            yp_c = binary_predictions[:, c]
+            
+            # Skip if no samples for this class
+            if y_c.sum() == 0 and (1 - y_c).sum() == 0:
+                balanced_acc_per_class.append(0.0)
+                continue
+                
+            # Calculate balanced accuracy for this class
+            ba = balanced_accuracy_score(y_c, yp_c)
+            balanced_acc_per_class.append(float(ba))
+        
+        metrics['balanced_accuracy_per_class'] = balanced_acc_per_class
+        metrics['mean_balanced_accuracy'] = float(np.mean(balanced_acc_per_class))
+        
+        # Confusion matrix counts per class
+        confusion_per_class = {}
+        for i, cls in enumerate(classes):
+            y_c = y_true[:, i]
+            yp_c = binary_predictions[:, i]
+            
+            tp = int(np.sum((yp_c == 1) & (y_c == 1)))
+            fp = int(np.sum((yp_c == 1) & (y_c == 0)))
+            fn = int(np.sum((yp_c == 0) & (y_c == 1)))
+            tn = int(np.sum((yp_c == 0) & (y_c == 0)))
+            
+            confusion_per_class[cls] = {
+                'true_positives': tp,
+                'false_positives': fp,
+                'false_negatives': fn,
+                'true_negatives': tn
+            }
+        
+        metrics['confusion_per_class'] = confusion_per_class
+        
+        # Prediction confidence metrics (if probabilities available)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # Confidence of correct predictions
+            correct_mask = (binary_predictions == y_true)
+            correct_confidences = probs[correct_mask]
+            incorrect_confidences = probs[~correct_mask]
+            
+            metrics['correct_prediction_confidence_mean'] = float(correct_confidences.mean()) if len(correct_confidences) > 0 else 0.0
+            metrics['incorrect_prediction_confidence_mean'] = float(incorrect_confidences.mean()) if len(incorrect_confidences) > 0 else 0.0
+    else:
+        # No true labels - use placeholder values
+        metrics['macro_f1'] = None
+        metrics['micro_f1'] = None
+        metrics['weighted_f1'] = None
+        metrics['samples_f1'] = None
+        metrics['subset_accuracy'] = None
+        metrics['hamming_loss'] = None
+        metrics['jaccard_score_macro'] = None
+        metrics['jaccard_score_micro'] = None
+        metrics['mean_balanced_accuracy'] = None
+        
+        # Prediction confidence metrics (unsupervised)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # High confidence predictions
+            high_conf_mask = probs > 0.7
+            metrics['high_confidence_predictions'] = int(high_conf_mask.sum())
+            metrics['high_confidence_percentage'] = float(high_conf_mask.sum() / probs.size * 100)
     
     return metrics
 
-def generate_classification_report(binary_predictions: np.ndarray, classes: List[str], 
-                                 output_dir: Path, log_type: str, config: SystemConfig):
-    """Generate detailed classification report"""
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_file = output_dir / f"classification_report_{log_type}_{timestamp}.txt"
-    
-    with open(report_file, 'w') as f:
-        f.write(f"TRANSFORMER CLASSIFICATION REPORT - {log_type.upper()}\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"Generated: {datetime.now().isoformat()}\n")
-        f.write(f"Node: {config.node_name}\n")
-        f.write(f"Job ID: {config.job_id}\n\n")
-        
-        # Dataset statistics
-        f.write("DATASET STATISTICS:\n")
-        f.write("-" * 30 + "\n")
-        f.write(f"Total samples: {len(binary_predictions)}\n")
-        f.write(f"Total classes: {len(classes)}\n")
-        f.write(f"Total predictions: {binary_predictions.size}\n\n")
-        
-        # Sample-level statistics
-        labels_per_sample = binary_predictions.sum(axis=1)
-        f.write("SAMPLE-LEVEL STATISTICS:\n")
-        f.write("-" * 30 + "\n")
-        f.write(f"Average labels per sample: {labels_per_sample.mean():.3f}\n")
-        f.write(f"Std labels per sample: {labels_per_sample.std():.3f}\n")
-        f.write(f"Min labels per sample: {labels_per_sample.min()}\n")
-        f.write(f"Max labels per sample: {labels_per_sample.max()}\n")
-        f.write(f"Samples with no labels: {(labels_per_sample == 0).sum()}\n")
-        f.write(f"Samples with one label: {(labels_per_sample == 1).sum()}\n")
-        f.write(f"Samples with multiple labels: {(labels_per_sample > 1).sum()}\n\n")
-        
-        # Class-level statistics
-        class_counts = binary_predictions.sum(axis=0)
-        f.write("CLASS-LEVEL STATISTICS:\n")
-        f.write("-" * 30 + "\n")
-        f.write(f"Most frequent classes:\n")
-        
-        class_freq_pairs = list(zip(classes, class_counts))
-        class_freq_pairs.sort(key=lambda x: x[1], reverse=True)
-        
-        for i, (cls, count) in enumerate(class_freq_pairs[:15]):  # Top 15
-            percentage = count / len(binary_predictions) * 100
-            f.write(f"  {i+1:2d}. {cls:<30} {count:6d} ({percentage:5.2f}%)\n")
-        
-        if len(class_freq_pairs) > 15:
-            f.write(f"  ... and {len(class_freq_pairs) - 15} more classes\n")
-        
-        f.write(f"\nClass frequency summary:\n")
-        f.write(f"  Classes with 0 predictions: {(class_counts == 0).sum()}\n")
-        f.write(f"  Classes with 1-10 predictions: {((class_counts >= 1) & (class_counts <= 10)).sum()}\n")
-        f.write(f"  Classes with 11-100 predictions: {((class_counts >= 11) & (class_counts <= 100)).sum()}\n")
-        f.write(f"  Classes with >100 predictions: {(class_counts > 100).sum()}\n\n")
-        
-        # Prediction confidence statistics
-        f.write("PREDICTION CONFIDENCE STATISTICS:\n")
-        f.write("-" * 30 + "\n")
-        f.write(f"Overall prediction confidence: {binary_predictions.mean():.4f}\n")
-        f.write(f"Confidence std deviation: {binary_predictions.std():.4f}\n")
-        f.write(f"High confidence predictions (>0.7): {binary_predictions.sum()}\n")
-        f.write(f"High confidence percentage: {binary_predictions.sum() / binary_predictions.size * 100:.2f}%\n\n")
-        
-        # Note about unsupervised nature
-        f.write("NOTE:\n")
-        f.write("-" * 30 + "\n")
-        f.write("This is an unsupervised learning model. Traditional metrics like F1-score,\n")
-        f.write("precision, and recall cannot be calculated without true labels.\n")
-        f.write("The metrics above show the model's prediction patterns and confidence levels.\n")
-    
-    print(f"Classification report saved to: {report_file}")
+
+
+
 
 def create_comprehensive_visualizations(embeddings: np.ndarray, predictions: np.ndarray, 
                                       binary_predictions: np.ndarray, classes: List[str],
@@ -2296,8 +2311,8 @@ def print_classification_summary(metrics: Dict[str, Any], log_type: str, n_sampl
     for i, class_info in enumerate(metrics['most_frequent_classes'][:10]):
         print(f"  {i+1:2d}. {class_info['class']:<30} {class_info['count']:6d} ({class_info['percentage']:5.2f}%)")
     
-    print(f"\nNote: This is an unsupervised model. Traditional metrics like F1-score")
-    print(f"      require true labels and cannot be calculated here.")
+    print(f"\nNote: This is a generative transformer model trained unsupervised.")
+    print(f"      For real F1/precision/recall metrics, use: python src/evaluate_model.py --log-type {log_type}")
     print(f"{'='*80}")
 
 def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer, 
@@ -2598,6 +2613,114 @@ def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarr
             binary_predictions[sample_idx, class_idx] = int(sample_preds[class_idx] > adjusted_threshold)
     
     return adaptive_thresholds, binary_predictions
+
+def split_for_unsupervised_eval(embeddings: np.ndarray, true_labels: Optional[np.ndarray], 
+                                val_frac: float = 0.1, test_frac: float = 0.1, 
+                                seed: int = 42) -> Dict[str, Any]:
+    """
+    Split data for unsupervised training with labeled validation/test sets
+    
+    Args:
+        embeddings: Input embeddings
+        true_labels: True labels (if available)
+        val_frac: Fraction for validation set
+        test_frac: Fraction for test set
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Dictionary with train/val/test splits
+    """
+    rng = np.random.default_rng(seed)
+    n = len(embeddings)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    
+    n_val = int(n * val_frac)
+    n_test = int(n * test_frac)
+    
+    val_idx = idx[:n_val]
+    test_idx = idx[n_val:n_val + n_test]
+    train_idx = idx[n_val + n_test:]
+    
+    # Split embeddings
+    emb_train = embeddings[train_idx]
+    emb_val = embeddings[val_idx]
+    emb_test = embeddings[test_idx]
+    
+    # Split labels if available
+    y_val = true_labels[val_idx] if true_labels is not None else None
+    y_test = true_labels[test_idx] if true_labels is not None else None
+    
+    return {
+        'embeddings_train': emb_train,
+        'embeddings_val': emb_val,
+        'embeddings_test': emb_test,
+        'labels_val': y_val,
+        'labels_test': y_test,
+        'indices': {
+            'train': train_idx,
+            'val': val_idx,
+            'test': test_idx
+        }
+    }
+
+def optimize_per_class_thresholds(y_true: np.ndarray, probs: np.ndarray, 
+                                 metric: str = 'f1', beta: float = 1.0,
+                                 grid: np.ndarray = None) -> np.ndarray:
+    """
+    Optimize per-class thresholds on validation set to maximize specified metric
+    
+    Args:
+        y_true: True binary labels (n_samples, n_classes)
+        probs: Predicted probabilities (n_samples, n_classes)
+        metric: Metric to optimize ('f1', 'balanced_accuracy', 'precision', 'recall')
+        beta: Beta parameter for F-beta score
+        grid: Threshold grid to search (default: 19 points from 0.05 to 0.95)
+    
+    Returns:
+        Optimal thresholds per class
+    """
+    from sklearn.metrics import fbeta_score, balanced_accuracy_score, precision_score, recall_score
+    
+    if grid is None:
+        grid = np.linspace(0.05, 0.95, 19)
+    
+    n_classes = y_true.shape[1]
+    best_thresholds = np.full(n_classes, 0.5, dtype=float)
+    
+    for c in range(n_classes):
+        y_c = y_true[:, c]
+        probs_c = probs[:, c]
+        
+        # Skip if no positive samples
+        if y_c.sum() == 0:
+            best_thresholds[c] = 0.5
+            continue
+        
+        best_score = -np.inf
+        best_t = 0.5
+        
+        for t in grid:
+            y_pred = (probs_c >= t).astype(int)
+            
+            if metric == 'f1':
+                score = fbeta_score(y_c, y_pred, beta=beta, zero_division=0)
+            elif metric == 'balanced_accuracy':
+                score = balanced_accuracy_score(y_c, y_pred)
+            elif metric == 'precision':
+                score = precision_score(y_c, y_pred, zero_division=0)
+            elif metric == 'recall':
+                score = recall_score(y_c, y_pred, zero_division=0)
+            else:
+                raise ValueError(f"Unknown metric: {metric}")
+            
+            if score > best_score:
+                best_score = score
+                best_t = t
+        
+        best_thresholds[c] = best_t
+    
+    return best_thresholds
 
 # =============================================================================
 # Main Execution
