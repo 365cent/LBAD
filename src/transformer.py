@@ -876,6 +876,15 @@ class ProgressTracker:
         self.epoch_times = []
         self.true_labels = None # Added for storing true labels
         
+        # Progress tracking enhancements
+        self.total_epochs = 0
+        self.total_batches_per_epoch = 0
+        self.current_epoch = 0
+        self.current_batch = 0
+        self.batch_times = []
+        self.last_progress_update = time.time()
+        self.progress_update_interval = 10  # Update every 10 batches
+        
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -894,11 +903,75 @@ class ProgressTracker:
         # Log system configuration
         self.logger.info(f"System Configuration: {config.__dict__}")
     
-    def start_training(self, total_epochs: int):
-        """Start training timer"""
+    def start_training(self, total_epochs: int, total_batches_per_epoch: int = 0):
+        """Start training timer with batch-level tracking"""
         self.start_time = time.time()
         self.total_epochs = total_epochs
+        self.total_batches_per_epoch = total_batches_per_epoch
         self.epoch_times = []
+        self.batch_times = []
+        self.current_epoch = 0
+        self.current_batch = 0
+        
+        print(f"🚀 Training started: {total_epochs} epochs, ~{total_batches_per_epoch} batches/epoch")
+    
+    def start_epoch(self, epoch: int):
+        """Start tracking a new epoch"""
+        self.current_epoch = epoch
+        self.current_batch = 0
+        self.epoch_start_time = time.time()
+        
+    def update_batch_progress(self, batch_idx: int, batch_time: float = None, loss_info: Dict[str, float] = None):
+        """Update batch-level progress with percentage and ETA"""
+        self.current_batch = batch_idx
+        
+        if batch_time:
+            self.batch_times.append(batch_time)
+        
+        # Update progress every N batches or at the end of epoch
+        current_time = time.time()
+        is_epoch_end = (batch_idx + 1) >= self.total_batches_per_epoch
+        should_update = (
+            (batch_idx % self.progress_update_interval == 0) or 
+            is_epoch_end or
+            (current_time - self.last_progress_update) > 30  # At least every 30 seconds
+        )
+        
+        if should_update and self.total_batches_per_epoch > 0:
+            self.last_progress_update = current_time
+            
+            # Calculate overall progress
+            completed_epochs = self.current_epoch
+            completed_batches_this_epoch = batch_idx + 1
+            total_completed_batches = completed_epochs * self.total_batches_per_epoch + completed_batches_this_epoch
+            total_batches = self.total_epochs * self.total_batches_per_epoch
+            
+            overall_progress_pct = (total_completed_batches / total_batches) * 100 if total_batches > 0 else 0
+            epoch_progress_pct = (completed_batches_this_epoch / self.total_batches_per_epoch) * 100
+            
+            # Calculate ETA
+            eta_str = "calculating..."
+            if len(self.batch_times) >= 5:  # Need some data for reliable estimates
+                # Use recent batch times for better accuracy
+                recent_batch_times = self.batch_times[-20:] if len(self.batch_times) >= 20 else self.batch_times
+                avg_batch_time = np.mean(recent_batch_times)
+                
+                remaining_batches = total_batches - total_completed_batches
+                eta_seconds = remaining_batches * avg_batch_time
+                eta_str = self._format_time(eta_seconds)
+            
+            # Format loss information
+            loss_str = ""
+            if loss_info:
+                loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in loss_info.items()])
+                loss_str = f" | {loss_str}"
+            
+            # Print progress update
+            print(f"📊 Progress: {overall_progress_pct:.1f}% | "
+                  f"Epoch {self.current_epoch + 1}/{self.total_epochs} "
+                  f"({epoch_progress_pct:.1f}%) | "
+                  f"Batch {batch_idx + 1}/{self.total_batches_per_epoch} | "
+                  f"ETA: {eta_str}{loss_str}")
     
     def update_epoch_progress(self, epoch: int, epoch_time: float):
         """Update epoch progress and estimate completion time"""
@@ -912,19 +985,36 @@ class ProgressTracker:
             elapsed = time.time() - self.start_time
             estimated_total = elapsed + estimated_remaining
             
+            # Calculate overall percentage
+            overall_progress_pct = ((epoch + 1) / self.total_epochs) * 100
+            
             # Format time strings
             elapsed_str = self._format_time(elapsed)
             remaining_str = self._format_time(estimated_remaining)
             total_str = self._format_time(estimated_total)
             
+            # Print epoch completion summary
+            print(f"✅ Epoch {epoch + 1}/{self.total_epochs} completed ({overall_progress_pct:.1f}%) | "
+                  f"Time: {self._format_time(epoch_time)} | "
+                  f"Avg: {self._format_time(avg_epoch_time)} | "
+                  f"ETA: {remaining_str}")
+            
             return {
                 'epoch': epoch + 1,
                 'total_epochs': self.total_epochs,
+                'overall_progress_pct': overall_progress_pct,
                 'elapsed': elapsed_str,
                 'remaining': remaining_str,
                 'estimated_total': total_str,
+                'epoch_time': f"{epoch_time:.2f}s",
                 'avg_epoch_time': f"{avg_epoch_time:.2f}s"
             }
+        else:
+            # First epoch(s) - just show basic info
+            overall_progress_pct = ((epoch + 1) / self.total_epochs) * 100
+            print(f"✅ Epoch {epoch + 1}/{self.total_epochs} completed ({overall_progress_pct:.1f}%) | "
+                  f"Time: {self._format_time(epoch_time)}")
+        
         return None
     
     def _format_time(self, seconds: float) -> str:
@@ -964,9 +1054,35 @@ class ProgressTracker:
         metrics_file = self.output_dir / f"metrics_{self.log_type}_{self.config.node_name}_{self.config.job_id}.json"
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=2)
+    
+    def save_checkpoint_progress(self, epoch: int, total_loss: float, additional_info: Dict[str, Any] = None):
+        """Save detailed progress information for potential resumption"""
+        progress_data = {
+            'timestamp': time.time(),
+            'epoch': epoch,
+            'total_epochs': self.total_epochs,
+            'overall_progress_pct': ((epoch + 1) / self.total_epochs) * 100,
+            'elapsed_time': time.time() - self.start_time if self.start_time else 0,
+            'total_loss': total_loss,
+            'avg_epoch_time': np.mean(self.epoch_times) if self.epoch_times else 0,
+            'avg_batch_time': np.mean(self.batch_times[-100:]) if len(self.batch_times) >= 10 else 0,
+            'log_type': self.log_type,
+            'node': self.config.node_name,
+            'job_id': self.config.job_id
+        }
+        
+        if additional_info:
+            progress_data.update(additional_info)
+        
+        progress_file = self.output_dir / f"progress_{self.log_type}_{self.config.node_name}_{self.config.job_id}.json"
+        with open(progress_file, 'w') as f:
+            json.dump(progress_data, f, indent=2)
 
 def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: ProgressTracker, sample_size: int = None) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
     """Optimized data loading with memory management for Nibi and embedding auto-detection"""
+    print(f"🔄 Loading data for {log_type}...")
+    load_start_time = time.time()
+    
     tracker.log_step("Data Loading", {"log_type": log_type, "config": config.__dict__})
     
     # Load embeddings - only load specific log type, not combined
@@ -977,6 +1093,7 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     if not log_file.exists():
         raise FileNotFoundError(f"Embedding file not found: {log_file}")
     
+    print(f"📂 Loading embeddings from {log_file}...")
     with open(log_file, 'rb') as f:
         embeddings = pickle.load(f)
     
@@ -990,6 +1107,7 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     elif embedding_dim == 2314:
         embedding_type = "Enhanced LogBERT (2314D)"
     
+    print(f"🔍 Auto-detected embedding type: {embedding_type} ({embedding_dim}D)")
     tracker.log_step("Embedding Type Auto-Detection", {
         "embedding_dim": embedding_dim,
         "embedding_type": embedding_type,
@@ -1099,6 +1217,13 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
         "n_clusters": C.shape[1] if C is not None else 0,
         "has_true_labels": true_labels is not None
     })
+    
+    # Log completion timing
+    load_time = time.time() - load_start_time
+    print(f"✅ Data loading completed in {load_time:.1f}s")
+    print(f"📊 Loaded {len(embeddings):,} samples with {embedding_dim}D embeddings")
+    if sample_size:
+        print(f"🎯 Using sample size: {len(embeddings):,} (requested: {sample_size:,})")
     
     return embeddings, classes, C, scaler
 
@@ -1720,7 +1845,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
     total_epochs = 50  # Balanced epochs for good convergence without taking too long
-    tracker.start_training(total_epochs)
+    
+    # Initialize progress tracking with batch information
+    total_batches_per_epoch = len(dataloader)
+    tracker.start_training(total_epochs, total_batches_per_epoch)
     
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
     checkpoint_interval = 5   # Save checkpoint every 5 epochs
@@ -1733,6 +1861,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
         epoch_losses = []
+        
+        # Start epoch tracking
+        tracker.start_epoch(epoch)
         
         if config.is_distributed:
             sampler.set_epoch(epoch)
@@ -1825,6 +1956,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         # Advanced pseudo-label refinement with curriculum learning
         if epoch > 0 and epoch % refinement_interval == 0:
+            print(f"🔄 Refining pseudo-labels at epoch {epoch+1}...")
+            refinement_start = time.time()
+            
             model.eval()
             with torch.no_grad():
                 all_predictions = []
@@ -1833,8 +1967,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 # Use smaller inference batch size for memory efficiency
                 inference_batch_size = max(1, batch_size // 2) if config.device == "cuda" else batch_size
+                total_inference_batches = (len(embeddings) + inference_batch_size - 1) // inference_batch_size
                 
-                for i in range(0, len(embeddings), inference_batch_size):
+                for batch_idx, i in enumerate(range(0, len(embeddings), inference_batch_size)):
+                    # Show refinement progress for large datasets
+                    if batch_idx % max(1, total_inference_batches // 10) == 0:
+                        refinement_progress = (batch_idx / total_inference_batches) * 100
+                        print(f"   📊 Refinement progress: {refinement_progress:.1f}% ({batch_idx+1}/{total_inference_batches} batches)")
+                    
                     batch = torch.from_numpy(embeddings[i:i+inference_batch_size]).float().to(device)
                     
                     try:
@@ -1885,59 +2025,66 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
                 )
                 
+                refinement_time = time.time() - refinement_start
+                print(f"✅ Pseudo-label refinement completed in {refinement_time:.1f}s")
+                
                 tracker.log_step("Advanced Pseudo-label Refinement", {
                     "epoch": epoch,
+                    "refinement_time": refinement_time,
+                    "total_inference_batches": total_inference_batches,
+                    "inference_batch_size": inference_batch_size,
                     "avg_confidence": float(np.mean(all_predictions.max(axis=1))),
                     "label_density": float(np.mean(all_predictions.sum(axis=1))),
                     "model_weight": model_weight,
-                    "curriculum_progress": progress,
-                    "inference_batch_size": inference_batch_size
+                    "curriculum_progress": progress
                 })
             
             # Clear memory before resuming training
             clear_gpu_memory()
             model.train()
         
-        # Progress spinner for batches
-        with Halo(text=f"Epoch {epoch+1}/{total_epochs}", spinner='dots') as spinner:
-            for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-                try:
-                    # Ensure tensors are contiguous before GPU transfer to avoid misalignment
-                    if not x_batch.is_contiguous():
-                        x_batch = x_batch.contiguous()
-                    if not y_batch.is_contiguous():
-                        y_batch = y_batch.contiguous()
-                    
-                    # Safe GPU transfer with error handling
-                    try:
-                        x_batch = x_batch.to(device, non_blocking=False)  # Use blocking for stability
-                        y_batch = y_batch.to(device, non_blocking=False)
-                    except RuntimeError as gpu_error:
-                        if "misaligned address" in str(gpu_error) or "CUDA" in str(gpu_error):
-                            print(f"⚠️  GPU transfer error, trying alignment fix...")
-                            # Force tensor alignment by cloning
-                            x_batch = x_batch.clone().contiguous().to(device, non_blocking=False)
-                            y_batch = y_batch.clone().contiguous().to(device, non_blocking=False)
-                        else:
-                            raise gpu_error
-                    
-                    # Force CUDA sync to catch alignment issues early
-                    if device.type == 'cuda':
-                        torch.cuda.synchronize()
+        # Progress tracking for batches (removing spinner as we have detailed progress)
+        print(f"\n🔄 Starting Epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
+        
+        for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+            batch_start_time = time.time()
+            try:
+                # Ensure tensors are contiguous before GPU transfer to avoid misalignment
+                if not x_batch.is_contiguous():
+                    x_batch = x_batch.contiguous()
+                if not y_batch.is_contiguous():
+                    y_batch = y_batch.contiguous()
                 
-                except RuntimeError as batch_error:
-                    if "misaligned address" in str(batch_error) or "out of memory" in str(batch_error):
-                        print(f"⚠️  Batch {batch_idx} failed with CUDA error: {batch_error}")
-                        print(f"   Skipping batch and continuing...")
-                        
-                        # Clear any corrupted GPU memory
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                        
-                        continue  # Skip this batch and continue with next
+                # Safe GPU transfer with error handling
+                try:
+                    x_batch = x_batch.to(device, non_blocking=False)  # Use blocking for stability
+                    y_batch = y_batch.to(device, non_blocking=False)
+                except RuntimeError as gpu_error:
+                    if "misaligned address" in str(gpu_error) or "CUDA" in str(gpu_error):
+                        print(f"⚠️  GPU transfer error, trying alignment fix...")
+                        # Force tensor alignment by cloning
+                        x_batch = x_batch.clone().contiguous().to(device, non_blocking=False)
+                        y_batch = y_batch.clone().contiguous().to(device, non_blocking=False)
                     else:
-                        raise batch_error
+                        raise gpu_error
+                
+                # Force CUDA sync to catch alignment issues early
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                
+            except RuntimeError as batch_error:
+                if "misaligned address" in str(batch_error) or "out of memory" in str(batch_error):
+                    print(f"⚠️  Batch {batch_idx} failed with CUDA error: {batch_error}")
+                    print(f"   Skipping batch and continuing...")
+                    
+                    # Clear any corrupted GPU memory
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    continue  # Skip this batch and continue with next
+                else:
+                    raise batch_error
                 
                 optimizer.zero_grad()
                 
@@ -2272,10 +2419,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 epoch_losses.append(total_loss.item())
                 
-                # Update spinner text with batch progress
-                if batch_idx % 10 == 0:  # Update every 10 batches
-                    progress = (batch_idx + 1) / len(dataloader) * 100
-                    spinner.text = f"Epoch {epoch+1}/{total_epochs} - Batch {batch_idx+1}/{len(dataloader)} ({progress:.1f}%)"
+                # Calculate batch processing time and update progress tracking
+                batch_time = time.time() - batch_start_time
+                
+                # Prepare loss info for progress display
+                loss_info = {
+                    'total': total_loss.item(),
+                    'recon': recon_loss.item(),
+                    'label': label_loss.item()
+                }
+                
+                # Update batch progress with detailed tracking
+                tracker.update_batch_progress(batch_idx, batch_time, loss_info)
         
         scheduler.step()
         
@@ -2309,9 +2464,31 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     optimizer.state_dict(), checkpoint_metrics, 
                     training_hash, config
                 )
+                
+                # Save detailed progress information
+                additional_progress_info = {
+                    'checkpoint_saved': True,
+                    'checkpoint_epoch': epoch + 1,
+                    'n_batches_per_epoch': len(dataloader),
+                    'avg_batch_time': np.mean(tracker.batch_times[-100:]) if len(tracker.batch_times) >= 10 else 0
+                }
+                tracker.save_checkpoint_progress(epoch, avg_loss, additional_progress_info)
+                
+                print(f"💾 Checkpoint saved at epoch {epoch + 1}")
             except Exception as e:
                 print(f"⚠️  Failed to save checkpoint: {e}")
-            
+        
+        # Log metrics with enhanced progress tracking
+        tracker.log_metrics(epoch, {
+            'avg_loss': avg_loss,
+            'best_loss': best_loss,
+            'patience_counter': patience_counter,
+            'learning_rate': scheduler.get_last_lr()[0],
+            'n_confident_samples': n_confident if 'n_confident' in locals() else 0,
+            'epoch_time': epoch_time,
+            'total_batches': len(dataloader)
+        })
+        
         if patience_counter >= patience:
             if config.rank == 0:
                 print(f"Early stopping triggered at epoch {epoch+1}")
@@ -2477,7 +2654,8 @@ def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: Lis
     """
     from sklearn.metrics import (
         precision_recall_fscore_support, f1_score, accuracy_score, 
-        hamming_loss, jaccard_score, balanced_accuracy_score
+        hamming_loss, jaccard_score, balanced_accuracy_score, multilabel_confusion_matrix,
+        precision_score, recall_score
     )
     
     metrics = {}
