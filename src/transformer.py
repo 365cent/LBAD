@@ -1173,41 +1173,69 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             samples_per_gb = 500
     else:  # Enhanced LogBERT (2314D)
         if config.device == "cuda":
-            samples_per_gb = min(100, int(config.gpu_memory_gb * 1.5))  # Very conservative for CUDA
+            samples_per_gb = min(200, int(config.gpu_memory_gb * 2))  # Increased from 100 to 200
         else:
             samples_per_gb = 150
     
-    # Apply more conservative limits for CUDA to prevent OOM
-    if config.device == "cuda":
-        max_samples = min(30000, int(config.gpu_memory_gb * samples_per_gb))
-    else:
-        max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))
+    # Only apply automatic memory-based subsampling if no explicit sample_size is provided
+    # AND the dataset is extremely large (>100k samples)
+    apply_auto_subsampling = (sample_size is None and len(embeddings) > 100000)
     
-    if len(embeddings) > max_samples:
-        indices = np.random.choice(len(embeddings), max_samples, replace=False)
-        embeddings = embeddings[indices]
-        if true_labels is not None:
-            true_labels = true_labels[indices]
-        tracker.log_step("Data Subsampling", {
-            "original_size": len(embeddings),
-            "subsampled_size": max_samples,
-            "memory_gb": embeddings.nbytes / (1024**3),
-            "embedding_dim": embedding_dim,
-            "embedding_type": embedding_type,
-            "samples_per_gb": samples_per_gb,
-            "device_type": config.device
-        })
+    if apply_auto_subsampling:
+        # Apply more conservative limits for CUDA to prevent OOM - but only for very large datasets
+        if config.device == "cuda":
+            max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))  # Increased max
+        else:
+            max_samples = min(100000, int(config.gpu_memory_gb * samples_per_gb))
+        
+        if len(embeddings) > max_samples:
+            print(f"📊 Large dataset detected ({len(embeddings):,} samples)")
+            print(f"   Automatically subsampling to {max_samples:,} samples for memory efficiency")
+            print(f"   Use --sample-size to override or process smaller chunks")
+            
+            indices = np.random.choice(len(embeddings), max_samples, replace=False)
+            embeddings = embeddings[indices]
+            if true_labels is not None:
+                true_labels = true_labels[indices]
+            tracker.log_step("Automatic Data Subsampling", {
+                "original_size": len(embeddings),
+                "subsampled_size": max_samples,
+                "memory_gb": embeddings.nbytes / (1024**3),
+                "embedding_dim": embedding_dim,
+                "embedding_type": embedding_type,
+                "samples_per_gb": samples_per_gb,
+                "device_type": config.device,
+                "reason": "Large dataset auto-subsampling"
+            })
     
-    # Apply sample size limit if specified
+    # Apply explicit sample size limit if specified
     if sample_size is not None and sample_size < len(embeddings):
-        print(f"🎯 Limiting dataset to {sample_size} samples for testing...")
+        print(f"🎯 Limiting dataset to {sample_size:,} samples as requested...")
         # Random sampling to maintain class distribution
         np.random.seed(42)  # For reproducibility
         indices = np.random.choice(len(embeddings), size=sample_size, replace=False)
         embeddings = embeddings[indices]
         if true_labels is not None:
             true_labels = true_labels[indices]
-        print(f"   Dataset reduced to {len(embeddings)} samples")
+        print(f"   Dataset reduced to {len(embeddings):,} samples")
+        
+        tracker.log_step("Explicit Data Sampling", {
+            "requested_size": sample_size,
+            "actual_size": len(embeddings),
+            "memory_gb": embeddings.nbytes / (1024**3),
+            "embedding_dim": embedding_dim,
+            "embedding_type": embedding_type
+        })
+    elif sample_size is None:
+        # Using full dataset
+        print(f"📊 Using full dataset: {len(embeddings):,} samples ({embeddings.nbytes / (1024**3):.1f} GB)")
+        tracker.log_step("Full Dataset Processing", {
+            "total_samples": len(embeddings),
+            "memory_gb": embeddings.nbytes / (1024**3),
+            "embedding_dim": embedding_dim,
+            "embedding_type": embedding_type,
+            "device_type": config.device
+        })
     
     # Normalize with robust scaling to handle outliers better
     from sklearn.preprocessing import RobustScaler
@@ -4374,7 +4402,7 @@ def main():
     parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing results)")
     parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all training checkpoints before starting")
     parser.add_argument("--sample-size", type=int, default=None,
-                      help="Limit training to N samples for testing (e.g., --sample-size 1000)")
+                      help="Limit training to N samples for testing (e.g., --sample-size 1000). Uses full dataset by default.")
     args = parser.parse_args()
     
     try:
