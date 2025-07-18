@@ -1597,6 +1597,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         model = nn.DataParallel(model)
     
     # Training information and CUDA warnings
+    use_mixed_precision = (config.device == "cuda")  # Mixed precision only on CUDA
     print(f"🚀 Starting training for {log_type}")
     print(f"💾 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"📊 Training samples: {len(embeddings):,}")
