@@ -1598,16 +1598,24 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Training information and CUDA warnings
     use_mixed_precision = (config.device == "cuda")  # Mixed precision only on CUDA
+    
+    # Set CUDA debugging environment for better error reporting
+    if device.type == 'cuda':
+        import os
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error tracing
+        print(f"🔧 CUDA_LAUNCH_BLOCKING=1 enabled for debugging")
+    
     print(f"🚀 Starting training for {log_type}")
     print(f"💾 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"📊 Training samples: {len(embeddings):,}")
     print(f"🏷️  Classes: {len(classes)}")
     print(f"🎯 Device: {device} | Mixed precision: {use_mixed_precision}")
     if device.type == 'cuda':
-        print(f"⚠️  CUDA Tips:")
-        print(f"   - If you get 'misaligned address' errors, try --sample-size 1000 first")
-        print(f"   - Set CUDA_LAUNCH_BLOCKING=1 for better error debugging")
-        print(f"   - Anomaly scoring now runs at epoch 3 (instead of 2) for stability")
+        print(f"⚠️  CUDA Safety Measures:")
+        print(f"   - Disabled pin_memory and multiprocessing in DataLoader")
+        print(f"   - Using contiguous tensors and blocking transfers")
+        print(f"   - Anomaly scoring at epoch 3 with error handling")
+        print(f"   - Batch-level error recovery enabled")
     print(f"{'='*60}")
     
     # Generate initial pseudo-labels using all available true labels (if any) for guidance
@@ -1618,10 +1626,11 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     current_pseudo_labels = pseudo_labels.copy()
     
     # Data setup - use ALL data for training (no splitting)
-    dataset = TensorDataset(
-        torch.from_numpy(embeddings).float(),
-        torch.from_numpy(current_pseudo_labels).float()
-    )
+    # Ensure tensors are contiguous to prevent CUDA alignment issues
+    embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
+    labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
+    
+    dataset = TensorDataset(embeddings_tensor, labels_tensor)
     
     sampler = DistributedSampler(dataset) if config.is_distributed else None
     
@@ -1648,8 +1657,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         batch_size=batch_size, 
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers=min(4, config.n_cpus // 4),  # Reduced workers
-        pin_memory=True
+        num_workers=0,  # Disable multiprocessing to avoid alignment issues
+        pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
     )
     
     # Advanced training setup with reduced learning rate for stability
@@ -1767,19 +1776,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                                     0.7  # High confidence for anomaly
                                 )
                         
-                        # Update dataset with anomaly-seeded labels
-                        dataset = TensorDataset(
-                            torch.from_numpy(embeddings).float(),
-                            torch.from_numpy(current_pseudo_labels).float()
-                        )
+                        # Update dataset with anomaly-seeded labels (ensure alignment)
+                        embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
+                        labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
+                        dataset = TensorDataset(embeddings_tensor, labels_tensor)
                         
                         dataloader = DataLoader(
                             dataset, 
                             batch_size=batch_size, 
                             sampler=sampler,
                             shuffle=(sampler is None),
-                            num_workers=min(2, config.n_cpus // 8),
-                            pin_memory=True
+                            num_workers=0,  # Disable multiprocessing to avoid alignment issues
+                            pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
                         )
                     
                     tracker.log_step("Reconstruction Anomaly Seeding (TPLG)", {
@@ -1873,8 +1881,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     batch_size=batch_size, 
                     sampler=sampler,
                     shuffle=(sampler is None),
-                    num_workers=min(2, config.n_cpus // 8),  # Reduced workers for CUDA
-                    pin_memory=True
+                    num_workers=0,  # Disable multiprocessing to avoid alignment issues
+                    pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
                 )
                 
                 tracker.log_step("Advanced Pseudo-label Refinement", {
@@ -1893,8 +1901,43 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         # Progress spinner for batches
         with Halo(text=f"Epoch {epoch+1}/{total_epochs}", spinner='dots') as spinner:
             for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-                x_batch = x_batch.to(device, non_blocking=True)
-                y_batch = y_batch.to(device, non_blocking=True)
+                try:
+                    # Ensure tensors are contiguous before GPU transfer to avoid misalignment
+                    if not x_batch.is_contiguous():
+                        x_batch = x_batch.contiguous()
+                    if not y_batch.is_contiguous():
+                        y_batch = y_batch.contiguous()
+                    
+                    # Safe GPU transfer with error handling
+                    try:
+                        x_batch = x_batch.to(device, non_blocking=False)  # Use blocking for stability
+                        y_batch = y_batch.to(device, non_blocking=False)
+                    except RuntimeError as gpu_error:
+                        if "misaligned address" in str(gpu_error) or "CUDA" in str(gpu_error):
+                            print(f"⚠️  GPU transfer error, trying alignment fix...")
+                            # Force tensor alignment by cloning
+                            x_batch = x_batch.clone().contiguous().to(device, non_blocking=False)
+                            y_batch = y_batch.clone().contiguous().to(device, non_blocking=False)
+                        else:
+                            raise gpu_error
+                    
+                    # Force CUDA sync to catch alignment issues early
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                
+                except RuntimeError as batch_error:
+                    if "misaligned address" in str(batch_error) or "out of memory" in str(batch_error):
+                        print(f"⚠️  Batch {batch_idx} failed with CUDA error: {batch_error}")
+                        print(f"   Skipping batch and continuing...")
+                        
+                        # Clear any corrupted GPU memory
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        
+                        continue  # Skip this batch and continue with next
+                    else:
+                        raise batch_error
                 
                 optimizer.zero_grad()
                 
