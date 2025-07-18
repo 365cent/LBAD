@@ -863,7 +863,7 @@ class ProgressTracker:
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=2)
 
-def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: ProgressTracker) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
+def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: ProgressTracker, sample_size: int = None) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
     """Optimized data loading with memory management for Nibi and embedding auto-detection"""
     tracker.log_step("Data Loading", {"log_type": log_type, "config": config.__dict__})
     
@@ -959,6 +959,17 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             "samples_per_gb": samples_per_gb,
             "device_type": config.device
         })
+    
+    # Apply sample size limit if specified
+    if sample_size is not None and sample_size < len(embeddings):
+        print(f"🎯 Limiting dataset to {sample_size} samples for testing...")
+        # Random sampling to maintain class distribution
+        np.random.seed(42)  # For reproducibility
+        indices = np.random.choice(len(embeddings), size=sample_size, replace=False)
+        embeddings = embeddings[indices]
+        if true_labels is not None:
+            true_labels = true_labels[indices]
+        print(f"   Dataset reduced to {len(embeddings)} samples")
     
     # Normalize with robust scaling to handle outliers better
     from sklearn.preprocessing import RobustScaler
@@ -1133,11 +1144,14 @@ def update_class_prototypes(model: nn.Module, z_prototype: torch.Tensor, labels:
     Update running class prototypes using high-confidence predictions
     
     Args:
-        model: Model containing class_prototypes buffer
+        model: Model containing class_prototypes buffer (may be wrapped in DataParallel)
         z_prototype: Current batch prototype features
         labels: Current batch labels (probabilities)
         momentum: Update momentum
     """
+    # Handle DataParallel wrapper
+    actual_model = model.module if hasattr(model, 'module') else model
+    
     with torch.no_grad():
         # Only update with high-confidence predictions
         confidence_threshold = 0.7
@@ -1154,17 +1168,17 @@ def update_class_prototypes(model: nn.Module, z_prototype: torch.Tensor, labels:
                 class_mean = class_features.mean(dim=0)
                 
                 # Update prototype with momentum
-                if model.prototype_counts[class_idx] == 0:
+                if actual_model.prototype_counts[class_idx] == 0:
                     # First update for this class
-                    model.class_prototypes[class_idx] = class_mean
-                    model.prototype_counts[class_idx] = 1
+                    actual_model.class_prototypes[class_idx] = class_mean
+                    actual_model.prototype_counts[class_idx] = 1
                 else:
                     # Momentum update
-                    model.class_prototypes[class_idx] = (
-                        momentum * model.class_prototypes[class_idx] + 
+                    actual_model.class_prototypes[class_idx] = (
+                        momentum * actual_model.class_prototypes[class_idx] + 
                         (1 - momentum) * class_mean
                     )
-                    model.prototype_counts[class_idx] += class_mask.sum().item()
+                    actual_model.prototype_counts[class_idx] += class_mask.sum().item()
 
 def confidence_regularization_loss(predictions: torch.Tensor, confidence_target: float = 0.8) -> torch.Tensor:
     """
@@ -1804,12 +1818,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         )
                         
                         # Prototype/margin loss
-                        if model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
+                        # Handle DataParallel wrapper
+                        actual_model = model.module if hasattr(model, 'module') else model
+                        if actual_model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
                             prototype_loss = prototype_margin_loss(
                                 outputs['prototype'], 
                                 predictions,  # Use predictions as soft labels
-                                model.class_prototypes,
-                                model.margin
+                                actual_model.class_prototypes,
+                                actual_model.margin
                             )
                         else:
                             prototype_loss = torch.tensor(0.0, device=device)
@@ -1956,12 +1972,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     )
                     
                     # Prototype/margin loss
-                    if model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
+                    # Handle DataParallel wrapper
+                    actual_model = model.module if hasattr(model, 'module') else model
+                    if actual_model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
                         prototype_loss = prototype_margin_loss(
                             outputs['prototype'], 
                             predictions,  # Use predictions as soft labels
-                            model.class_prototypes,
-                            model.margin
+                            actual_model.class_prototypes,
+                            actual_model.margin
                         )
                     else:
                         prototype_loss = torch.tensor(0.0, device=device)
@@ -3790,7 +3808,7 @@ def check_existing_results(log_type: str, config: SystemConfig) -> dict:
     
     return status
 
-def process_log_type_with_args(log_type: str, config: SystemConfig, force_restart: bool = False):
+def process_log_type_with_args(log_type: str, config: SystemConfig, force_restart: bool = False, sample_size: int = None):
     """Process a single log type with resumeable functionality and argument support"""
     output_dir = RESULTS_DIR / log_type
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3830,7 +3848,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
             
             if not result_status['visualizations']:
                 # Load embeddings for visualization
-                embeddings, classes, _, _ = load_and_preprocess_data(log_type, config, tracker)
+                embeddings, classes, _, _ = load_and_preprocess_data(log_type, config, tracker, sample_size)
                 create_comprehensive_visualizations(
                     embeddings, results['predictions'], results['binary_predictions'], 
                     classes, output_dir, log_type, config
@@ -3845,7 +3863,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
     try:
         # Load data with progress
         with Halo(text=f"Loading data for {log_type}...", spinner='dots') as spinner:
-            embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker)
+            embeddings, classes, C, scaler = load_and_preprocess_data(log_type, config, tracker, sample_size)
             spinner.succeed(f"Data loaded: {embeddings.shape[0]} samples, {embeddings.shape[1]} features")
         
         # Train model with checkpointing
@@ -3904,6 +3922,8 @@ def main():
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing results)")
     parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all training checkpoints before starting")
+    parser.add_argument("--sample-size", type=int, default=None,
+                      help="Limit training to N samples for testing (e.g., --sample-size 1000)")
     args = parser.parse_args()
     
     try:
@@ -3991,7 +4011,7 @@ def main():
             start_time = time.time()
             
             # Pass force_restart flag to process_log_type
-            process_log_type_with_args(log_type, config, args.force_restart)
+            process_log_type_with_args(log_type, config, args.force_restart, args.sample_size)
             
             if config.rank == 0:
                 elapsed = time.time() - start_time
