@@ -960,11 +960,29 @@ class ProgressTracker:
                 eta_seconds = remaining_batches * avg_batch_time
                 eta_str = self._format_time(eta_seconds)
             
-            # Format loss information
+            # Format loss information - focus on meaningful unsupervised metrics
             loss_str = ""
             if loss_info:
-                loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in loss_info.items()])
-                loss_str = f" | {loss_str}"
+                # Only show meaningful loss components for unsupervised learning
+                meaningful_losses = {}
+                if 'total' in loss_info and not (loss_info.get('skipped', False) or loss_info.get('oom', False) or loss_info.get('nan_skip', False)):
+                    meaningful_losses['loss'] = loss_info['total']
+                if 'recon' in loss_info:
+                    meaningful_losses['recon'] = loss_info['recon']
+                if 'label' in loss_info:
+                    meaningful_losses['label'] = loss_info['label']
+                
+                # Add status indicators for problematic batches
+                if loss_info.get('skipped', False):
+                    meaningful_losses['status'] = 'SKIPPED'
+                elif loss_info.get('oom', False):
+                    meaningful_losses['status'] = 'OOM'
+                elif loss_info.get('nan_skip', False):
+                    meaningful_losses['status'] = 'NaN'
+                
+                if meaningful_losses:
+                    loss_str = " | ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in meaningful_losses.items()])
+                    loss_str = f" | {loss_str}"
             
             # Print progress update
             print(f"📊 Progress: {overall_progress_pct:.1f}% | "
@@ -2473,11 +2491,20 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         epoch_time = time.time() - epoch_start
         progress_info = tracker.update_epoch_progress(epoch, epoch_time)
         
-        # Log metrics
-        avg_loss = np.mean(epoch_losses)
+        # Log metrics - handle case where no batches were successfully processed
+        if epoch_losses:
+            avg_loss = np.mean(epoch_losses)
+            successful_batches = len(epoch_losses)
+        else:
+            avg_loss = float('nan')  # Explicitly set NaN when no successful batches
+            successful_batches = 0
         
-        # Early stopping check
-        if avg_loss < best_loss - min_delta:
+        # Count total attempted batches
+        total_attempted_batches = len(dataloader)
+        skipped_batches = total_attempted_batches - successful_batches
+        
+        # Early stopping check - only if we have valid losses
+        if not np.isnan(avg_loss) and avg_loss < best_loss - min_delta:
             best_loss = avg_loss
             patience_counter = 0
             # Save best model state
@@ -2519,14 +2546,25 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             'best_loss': best_loss,
             'patience_counter': patience_counter,
             'learning_rate': scheduler.get_last_lr()[0],
-            'n_confident_samples': n_confident if 'n_confident' in locals() else 0,
             'epoch_time': epoch_time,
-            'total_batches': len(dataloader)
+            'total_batches': total_attempted_batches,
+            'successful_batches': successful_batches,
+            'skipped_batches': skipped_batches,
+            'batch_success_rate': successful_batches / total_attempted_batches if total_attempted_batches > 0 else 0.0
         })
+        
+        # Print epoch summary for unsupervised learning
+        if successful_batches > 0:
+            print(f"Epoch {epoch+1}/50 - Loss: {avg_loss:.4f} - Processed: {successful_batches}/{total_attempted_batches} batches - Time: {epoch_time:.2f}s")
+        else:
+            print(f"Epoch {epoch+1}/50 - No valid batches processed ({skipped_batches} skipped) - Time: {epoch_time:.2f}s")
         
         if patience_counter >= patience:
             if config.rank == 0:
-                print(f"Early stopping triggered at epoch {epoch+1}")
+                if successful_batches == 0:
+                    print(f"Early stopping triggered at epoch {epoch+1} - No valid training achieved")
+                else:
+                    print(f"Early stopping triggered at epoch {epoch+1}")
             # Restore best model if we have one
             if best_model_state is not None:
                 model.load_state_dict(best_model_state)
@@ -2534,35 +2572,31 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             else:
                 print(f"No best model state saved - continuing with current model")
             break
-        if config.rank == 0:  # Only log from main process
-            tracker.log_metrics(epoch, {
-                "loss": avg_loss,
-                "recon_loss": recon_loss.item() if 'recon_loss' in locals() else 0.0,
-                "label_loss": label_loss.item() if 'label_loss' in locals() else 0.0,
-                "cluster_loss": cluster_loss.item() if 'cluster_loss' in locals() else 0.0,
-                "contrastive_loss": contrast_loss.item() if 'contrastive_loss' in locals() else 0.0,
-                "mutual_loss": mutual_loss.item() if 'mutual_loss' in locals() else 0.0,
-                "confidence_loss": confidence_loss.item() if 'confidence_loss' in locals() else 0.0,
-                "ensemble_loss": ensemble_loss.item() if 'ensemble_loss' in locals() else 0.0,
-                "supervised_loss": supervised_loss.item() if 'supervised_loss' in locals() else 0.0,
-                "prototype_loss": prototype_loss.item() if 'prototype_loss' in locals() else 0.0,
-                "multilabel_consistency": multilabel_consistency.item() if 'multilabel_consistency' in locals() else 0.0,
-                "class_balance_loss": class_balance_loss.item() if 'class_balance_loss' in locals() else 0.0,
-                "multilabel_contrastive": multilabel_contrastive.item() if 'multilabel_contrastive' in locals() else 0.0,
-                "refined_labels": refined_label_loss.item() if 'refined_label_loss' in locals() else 0.0,
-                "lr": scheduler.get_last_lr()[0],
-                "epoch_time": epoch_time
-            })
         
-        # Print progress with time estimation
-        if config.rank == 0 and progress_info:
-            print(f"Epoch {progress_info['epoch']}/{progress_info['total_epochs']} - "
-                  f"Loss: {avg_loss:.6f} - "
-                  f"Elapsed: {progress_info['elapsed']} - "
-                  f"Remaining: {progress_info['remaining']} - "
-                  f"ETA: {progress_info['estimated_total']}")
-        elif config.rank == 0:
-            print(f"Epoch {epoch+1}/{total_epochs} - Loss: {avg_loss:.6f} - Time: {epoch_time:.2f}s")
+        # Only log detailed loss components if we have valid training
+        if config.rank == 0 and successful_batches > 0:  # Only log from main process and if training occurred
+            # Create meaningful unsupervised metrics dictionary
+            unsupervised_metrics = {
+                "epoch": epoch,
+                "avg_loss": avg_loss,
+                "successful_batches": successful_batches,
+                "skipped_batches": skipped_batches,
+                "batch_success_rate": successful_batches / total_attempted_batches,
+                "lr": scheduler.get_last_lr()[0],
+                "epoch_time": epoch_time,
+                "status": "training" if successful_batches > 0 else "failed"
+            }
+            
+            # Add loss components if they were computed
+            if 'recon_loss' in locals() and not np.isnan(avg_loss):
+                unsupervised_metrics.update({
+                    "recon_loss": recon_loss.item() if 'recon_loss' in locals() else 0.0,
+                    "label_loss": label_loss.item() if 'label_loss' in locals() else 0.0,
+                    "contrastive_loss": contrast_loss.item() if 'contrast_loss' in locals() else 0.0,
+                    "confidence_loss": confidence_loss.item() if 'confidence_loss' in locals() else 0.0,
+                })
+            
+            tracker.log_metrics(epoch, unsupervised_metrics)
     
     # Clean up training checkpoints after completion (keep final checkpoint)
     if config.rank == 0:
