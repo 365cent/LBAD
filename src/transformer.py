@@ -1805,6 +1805,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Check for existing checkpoint
     start_epoch = 0
+    best_model_state = None  # Initialize best model state for early stopping
     checkpoint_data = load_training_checkpoint(log_type, training_hash)
     if checkpoint_data:
         try:
@@ -1817,6 +1818,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             # Restore best loss for early stopping
             if 'metrics' in checkpoint and 'best_loss' in checkpoint['metrics']:
                 best_loss = checkpoint['metrics']['best_loss']
+                # Initialize best model state with current loaded state
+                best_model_state = model.state_dict().copy()
             else:
                 best_loss = float('inf')
         except Exception as e:
@@ -1982,13 +1985,15 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         predictions = torch.sigmoid(outputs['labels']).cpu().numpy()
                         all_predictions.append(predictions)
                     except torch.cuda.OutOfMemoryError:
-                        # Fallback to single sample processing
-                        for j in range(i, min(i + inference_batch_size, len(embeddings))):
-                            single_batch = torch.from_numpy(embeddings[j:j+1]).float().to(device)
-                            single_output = model(single_batch)
-                            single_pred = torch.sigmoid(single_output['labels']).cpu().numpy()
-                            all_predictions.append(single_pred)
+                        # Skip this batch and clear memory
                         clear_gpu_memory()
+                        
+                        # Still track progress for skipped batch
+                        batch_time = time.time() - batch_start_time
+                        loss_info = {'total': 0.0, 'oom': True}
+                        tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                        
+                        continue
                     
                     # Clear memory periodically during inference
                     if config.device == "cuda" and (i // inference_batch_size) % 10 == 0:
@@ -2048,6 +2053,13 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
             batch_start_time = time.time()
+            
+            # Initialize default loss variables in case batch is skipped
+            total_loss = torch.tensor(0.0, device=device)
+            recon_loss = torch.tensor(0.0, device=device)
+            label_loss = torch.tensor(0.0, device=device)
+            supervised_loss = torch.tensor(0.0, device=device)
+            
             try:
                 # Ensure tensors are contiguous before GPU transfer to avoid misalignment
                 if not x_batch.is_contiguous():
@@ -2081,6 +2093,11 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                         torch.cuda.synchronize()
+                    
+                    # Still track progress for skipped batch
+                    batch_time = time.time() - batch_start_time
+                    loss_info = {'total': 0.0, 'skipped': True}
+                    tracker.update_batch_progress(batch_idx, batch_time, loss_info)
                     
                     continue  # Skip this batch and continue with next
                 else:
@@ -2248,6 +2265,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
                             print(f"Skipping batch due to numerical instability.")
                             optimizer.zero_grad()
+                            
+                            # Still track progress for skipped batch
+                            batch_time = time.time() - batch_start_time
+                            loss_info = {'total': 0.0, 'nan_skip': True}
+                            tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                            
                             continue
                     
                     scaler.scale(total_loss).backward()
@@ -2402,6 +2425,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
                         print(f"Skipping batch due to numerical instability.")
                         optimizer.zero_grad()
+                        
+                        # Still track progress for skipped batch
+                        batch_time = time.time() - batch_start_time
+                        loss_info = {'total': 0.0, 'nan_skip': True}
+                        tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                        
                         continue
                     
                     total_loss.backward()
@@ -2422,12 +2451,18 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 # Calculate batch processing time and update progress tracking
                 batch_time = time.time() - batch_start_time
                 
-                # Prepare loss info for progress display
+                # Prepare loss info for progress display - safely handle undefined variables
                 loss_info = {
                     'total': total_loss.item(),
-                    'recon': recon_loss.item(),
-                    'label': label_loss.item()
                 }
+                
+                # Add individual loss components if they exist
+                if 'recon_loss' in locals() and recon_loss is not None:
+                    loss_info['recon'] = recon_loss.item()
+                if 'label_loss' in locals() and label_loss is not None:
+                    loss_info['label'] = label_loss.item()
+                if 'supervised_loss' in locals() and supervised_loss is not None:
+                    loss_info['sup'] = supervised_loss.item()
                 
                 # Update batch progress with detailed tracking
                 tracker.update_batch_progress(batch_idx, batch_time, loss_info)
@@ -2492,16 +2527,20 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         if patience_counter >= patience:
             if config.rank == 0:
                 print(f"Early stopping triggered at epoch {epoch+1}")
-            # Restore best model
-            model.load_state_dict(best_model_state)
+            # Restore best model if we have one
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+                print(f"Restored best model from epoch with loss: {best_loss:.4f}")
+            else:
+                print(f"No best model state saved - continuing with current model")
             break
         if config.rank == 0:  # Only log from main process
             tracker.log_metrics(epoch, {
                 "loss": avg_loss,
-                "recon_loss": recon_loss.item(),
-                "label_loss": label_loss.item(),
-                "cluster_loss": cluster_loss.item(),
-                "contrastive_loss": contrast_loss.item() if 'contrast_loss' in locals() else 0.0,
+                "recon_loss": recon_loss.item() if 'recon_loss' in locals() else 0.0,
+                "label_loss": label_loss.item() if 'label_loss' in locals() else 0.0,
+                "cluster_loss": cluster_loss.item() if 'cluster_loss' in locals() else 0.0,
+                "contrastive_loss": contrast_loss.item() if 'contrastive_loss' in locals() else 0.0,
                 "mutual_loss": mutual_loss.item() if 'mutual_loss' in locals() else 0.0,
                 "confidence_loss": confidence_loss.item() if 'confidence_loss' in locals() else 0.0,
                 "ensemble_loss": ensemble_loss.item() if 'ensemble_loss' in locals() else 0.0,
@@ -4260,6 +4299,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         
         # Save model
         if config.rank == 0:
+            import torch  # Ensure torch is available in this scope
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
                 model_path = MODELS_DIR / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
                 model_path.parent.mkdir(exist_ok=True)
