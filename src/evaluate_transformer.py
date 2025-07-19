@@ -167,6 +167,67 @@ class TransformerEvaluator:
         embeddings = normalize(embeddings, norm='l2', axis=1).astype(np.float32)
         return embeddings
     
+    def load_transformer_embeddings_and_metadata(self, log_type: str) -> Tuple[Optional[np.ndarray], Optional[List[str]], Optional[np.ndarray]]:
+        """
+        Load transformer embeddings generated for the full dataset.
+        This uses the embeddings created by the transformer after training.
+        """
+        print(f"🔄 Loading transformer embeddings for full {log_type} dataset...")
+        load_start_time = time.time()
+        
+        # Look for transformer embeddings directory
+        embeddings_base_dir = Path("embeddings")
+        transformer_dir = embeddings_base_dir / f"{log_type}_transformer_full"
+        
+        if not transformer_dir.exists():
+            print(f"❌ No transformer embeddings directory found: {transformer_dir}")
+            print(f"   Please run transformer training first: python src/transformer.py --log-type {log_type}")
+            return None, None, None
+        
+        # Find the most recent transformer embeddings and metadata files
+        embeddings_files = list(transformer_dir.glob(f"transformer_embeddings_{log_type}_*.pkl"))
+        metadata_files = list(transformer_dir.glob(f"metadata_{log_type}_*.pkl"))
+        
+        if not embeddings_files:
+            print(f"❌ No transformer embeddings found in {transformer_dir}")
+            return None, None, None
+        
+        if not metadata_files:
+            print(f"❌ No metadata files found in {transformer_dir}")
+            return None, None, None
+        
+        # Use the most recent files
+        embeddings_file = max(embeddings_files, key=lambda p: p.stat().st_mtime)
+        metadata_file = max(metadata_files, key=lambda p: p.stat().st_mtime)
+        
+        try:
+            # Load transformer embeddings
+            print(f"📂 Loading transformer embeddings from {embeddings_file.name}...")
+            with open(embeddings_file, 'rb') as f:
+                transformer_embeddings = pickle.load(f)
+            
+            # Load metadata
+            print(f"📂 Loading metadata from {metadata_file.name}...")
+            with open(metadata_file, 'rb') as f:
+                metadata = pickle.load(f)
+            
+            # Extract information from metadata
+            classes = metadata['classes']
+            true_labels = metadata['true_labels']
+            raw_logs = metadata['raw_logs']
+            
+            load_time = time.time() - load_start_time
+            print(f"✅ Transformer embeddings loaded in {load_time:.1f}s")
+            print(f"📊 Dataset: {len(transformer_embeddings):,} samples × {transformer_embeddings.shape[1]}D transformer embeddings")
+            print(f"📊 Classes: {len(classes)} - {classes}")
+            print(f"📄 Original logs: {len(raw_logs):,} entries available")
+            
+            return transformer_embeddings, classes, true_labels
+            
+        except Exception as e:
+            print(f"❌ Error loading transformer embeddings: {e}")
+            return None, None, None
+    
     def load_trained_model(self, model_path: Path, log_type: str) -> Tuple[UnsupervisedMultiLabelTransformer, List[str], int]:
         """Load a trained transformer model and return input dimension"""
         print(f"📂 Loading trained model from {model_path}")
@@ -215,38 +276,83 @@ class TransformerEvaluator:
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
     
-    def evaluate_model(self, model: UnsupervisedMultiLabelTransformer, 
-                      embeddings: np.ndarray, true_labels: np.ndarray, 
-                      classes: List[str]) -> Dict[str, Any]:
-        """Evaluate model and return comprehensive metrics"""
-        print(f"🔍 Evaluating model on {len(embeddings):,} samples...")
+    def evaluate_transformer_embeddings(self, embeddings: np.ndarray, true_labels: np.ndarray, 
+                                       classes: List[str]) -> Dict[str, Any]:
+        """Evaluate transformer embeddings using unsupervised metrics and clustering"""
+        print(f"🔍 Evaluating transformer embeddings on {len(embeddings):,} samples...")
         
-        model.eval()
-        predictions = []
-        batch_size = 64
+        # For unsupervised evaluation, we'll use clustering and similarity-based analysis
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score, calinski_harabasz_score
         
-        # Generate predictions
-        with torch.no_grad():
-            for i in range(0, len(embeddings), batch_size):
-                batch = torch.from_numpy(embeddings[i:i+batch_size]).float().to(self.device)
-                outputs = model(batch)
-                probs = torch.sigmoid(outputs['labels'])
-                predictions.append(probs.cpu().numpy())
+        # Perform clustering with number of clusters = number of classes
+        n_clusters = len(classes)
         
-        predictions = np.vstack(predictions)
+        print(f"🔄 Performing K-means clustering with {n_clusters} clusters...")
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(embeddings)
         
-        # Optimize thresholds and get binary predictions
-        thresholds = self._optimize_thresholds(true_labels, predictions)
-        binary_predictions = (predictions > thresholds).astype(int)
+        # Calculate clustering metrics
+        silhouette = silhouette_score(embeddings, cluster_labels)
+        calinski_harabasz = calinski_harabasz_score(embeddings, cluster_labels)
         
-        # Calculate comprehensive metrics
-        metrics = self._calculate_metrics(true_labels, binary_predictions, predictions, classes, thresholds)
+        print(f"📊 Clustering metrics:")
+        print(f"   Silhouette Score: {silhouette:.4f}")
+        print(f"   Calinski-Harabasz Score: {calinski_harabasz:.2f}")
+        
+        # Create pseudo-predictions based on cluster assignment
+        # Each cluster represents a potential class
+        predictions = np.zeros((len(embeddings), len(classes)), dtype=np.float32)
+        
+        # For each cluster, calculate similarity to each true class
+        for cluster_id in range(n_clusters):
+            cluster_mask = cluster_labels == cluster_id
+            cluster_samples = embeddings[cluster_mask]
+            
+            if len(cluster_samples) == 0:
+                continue
+                
+            # Calculate cluster centroid
+            cluster_center = cluster_samples.mean(axis=0)
+            
+            # For each sample in cluster, assign probability based on distance to center
+            for idx in np.where(cluster_mask)[0]:
+                # Distance-based probability (closer to center = higher probability)
+                distance = np.linalg.norm(embeddings[idx] - cluster_center)
+                # Convert distance to probability (lower distance = higher probability)
+                max_distance = np.max([np.linalg.norm(embeddings[i] - cluster_center) 
+                                     for i in np.where(cluster_mask)[0]])
+                if max_distance > 0:
+                    prob = 1.0 - (distance / max_distance)
+                else:
+                    prob = 1.0
+                
+                # Assign this probability to the corresponding cluster
+                predictions[idx, cluster_id % len(classes)] = prob
+        
+        # Normalize predictions
+        row_sums = predictions.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # Avoid division by zero
+        predictions = predictions / row_sums
+        
+        # Set threshold and create binary predictions
+        threshold = 0.3  # Fixed threshold for unsupervised evaluation
+        binary_predictions = (predictions > threshold).astype(int)
+        
+        # Calculate metrics
+        metrics = self._calculate_unsupervised_metrics(
+            true_labels, binary_predictions, predictions, classes, embeddings, cluster_labels
+        )
         
         return {
             'metrics': metrics,
             'predictions': predictions,
             'binary_predictions': binary_predictions,
-            'thresholds': thresholds
+            'cluster_labels': cluster_labels,
+            'clustering_metrics': {
+                'silhouette_score': silhouette,
+                'calinski_harabasz_score': calinski_harabasz
+            }
         }
     
     def _optimize_thresholds(self, y_true: np.ndarray, y_prob: np.ndarray) -> np.ndarray:
@@ -274,6 +380,88 @@ class TransformerEvaluator:
             thresholds[class_idx] = best_threshold
         
         return thresholds
+    
+    def _calculate_unsupervised_metrics(self, y_true: np.ndarray, y_pred: np.ndarray,
+                                      y_prob: np.ndarray, classes: List[str], 
+                                      embeddings: np.ndarray, cluster_labels: np.ndarray) -> Dict[str, Any]:
+        """Calculate metrics for unsupervised transformer embeddings evaluation"""
+        
+        metrics = {}
+        
+        # If we have true labels, calculate supervised metrics too
+        if y_true is not None:
+            metrics['subset_accuracy'] = float(accuracy_score(y_true, y_pred))
+            metrics['hamming_loss'] = float(hamming_loss(y_true, y_pred))
+            metrics['micro_f1'] = float(f1_score(y_true, y_pred, average='micro', zero_division=0))
+            metrics['macro_f1'] = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
+            metrics['weighted_f1'] = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
+            metrics['samples_f1'] = float(f1_score(y_true, y_pred, average='samples', zero_division=0))
+            
+            # Jaccard scores
+            metrics['jaccard_micro'] = float(jaccard_score(y_true, y_pred, average='micro', zero_division=0))
+            metrics['jaccard_macro'] = float(jaccard_score(y_true, y_pred, average='macro', zero_division=0))
+            
+            # Per-class metrics
+            precision, recall, f1, support = precision_recall_fscore_support(
+                y_true, y_pred, average=None, zero_division=0
+            )
+            
+            metrics['per_class_precision'] = precision.tolist()
+            metrics['per_class_recall'] = recall.tolist()
+            metrics['per_class_f1'] = f1.tolist()
+            metrics['per_class_support'] = support.tolist()
+        else:
+            # For unsupervised case, create placeholder metrics
+            metrics['subset_accuracy'] = 0.0
+            metrics['hamming_loss'] = 0.0
+            metrics['micro_f1'] = 0.0
+            metrics['macro_f1'] = 0.0
+            metrics['weighted_f1'] = 0.0
+            metrics['samples_f1'] = 0.0
+            metrics['jaccard_micro'] = 0.0
+            metrics['jaccard_macro'] = 0.0
+            metrics['per_class_precision'] = [0.0] * len(classes)
+            metrics['per_class_recall'] = [0.0] * len(classes)
+            metrics['per_class_f1'] = [0.0] * len(classes)
+            metrics['per_class_support'] = [0] * len(classes)
+        
+        # Clustering-specific metrics
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+        
+        if y_true is not None:
+            # Convert multi-label to single-label for clustering evaluation
+            y_true_single = np.argmax(y_true, axis=1)
+            
+            metrics['adjusted_rand_score'] = float(adjusted_rand_score(y_true_single, cluster_labels))
+            metrics['normalized_mutual_info'] = float(normalized_mutual_info_score(y_true_single, cluster_labels))
+        
+        # Embedding quality metrics
+        metrics['embedding_dimension'] = embeddings.shape[1]
+        metrics['embedding_norm_mean'] = float(np.linalg.norm(embeddings, axis=1).mean())
+        metrics['embedding_norm_std'] = float(np.linalg.norm(embeddings, axis=1).std())
+        
+        # Prediction confidence
+        metrics['prediction_confidence_mean'] = float(y_prob.mean())
+        metrics['prediction_confidence_std'] = float(y_prob.std())
+        
+        # Sample distribution
+        labels_per_sample = y_pred.sum(axis=1)
+        metrics['avg_labels_per_sample'] = float(labels_per_sample.mean())
+        metrics['std_labels_per_sample'] = float(labels_per_sample.std())
+        metrics['min_labels_per_sample'] = int(labels_per_sample.min())
+        metrics['max_labels_per_sample'] = int(labels_per_sample.max())
+        
+        # Counts
+        metrics['samples_with_no_labels'] = int((labels_per_sample == 0).sum())
+        metrics['samples_with_one_label'] = int((labels_per_sample == 1).sum())
+        metrics['samples_with_multiple_labels'] = int((labels_per_sample > 1).sum())
+        
+        # Test samples
+        metrics['n_test_samples'] = len(y_true) if y_true is not None else len(y_pred)
+        metrics['evaluation_type'] = 'unsupervised_transformer_embeddings'
+        metrics['classes'] = classes
+        
+        return metrics
     
     def _calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
                           y_prob: np.ndarray, classes: List[str], 
@@ -335,14 +523,28 @@ class TransformerEvaluator:
         metrics = results['metrics']
         report_lines = []
         
-        report_lines.append(f"TRANSFORMER Multi-Label Classification Report - {log_type.upper()}")
+        report_lines.append(f"TRANSFORMER Embeddings Evaluation Report - {log_type.upper()}")
         report_lines.append("=" * 80)
         report_lines.append(f"Training time: {training_time:.2f} seconds")
         report_lines.append(f"Test samples: {metrics['n_test_samples']:,}")
         report_lines.append(f"Number of classes: {len(metrics['classes'])}")
         report_lines.append(f"Evaluation type: {metrics['evaluation_type']}")
+        report_lines.append(f"Embedding dimension: {metrics.get('embedding_dimension', 'N/A')}")
         report_lines.append(f"Node: {self.config.node_name} | Job: {self.config.job_id}")
         report_lines.append("")
+        
+        # Add clustering metrics if available
+        if 'clustering_metrics' in results:
+            clustering = results['clustering_metrics']
+            report_lines.append("CLUSTERING METRICS:")
+            report_lines.append("-" * 40)
+            report_lines.append(f"Silhouette Score: {clustering['silhouette_score']:.4f}")
+            report_lines.append(f"Calinski-Harabasz Score: {clustering['calinski_harabasz_score']:.2f}")
+            if 'adjusted_rand_score' in metrics:
+                report_lines.append(f"Adjusted Rand Score: {metrics['adjusted_rand_score']:.4f}")
+            if 'normalized_mutual_info' in metrics:
+                report_lines.append(f"Normalized Mutual Info: {metrics['normalized_mutual_info']:.4f}")
+            report_lines.append("")
         
         report_lines.append("OVERALL METRICS:")
         report_lines.append("-" * 40)
@@ -493,12 +695,13 @@ def main():
         # Load trained model
         model, training_classes, model_input_dim = evaluator.load_trained_model(model_path, args.log_type)
         
-        # Load full TFRecord dataset with correct embedding dimension
-        embeddings, classes, true_labels = evaluator.load_tfrecord_dataset(args.log_type, target_dim=model_input_dim)
+        # Load transformer embeddings generated for full dataset
+        embeddings, classes, true_labels = evaluator.load_transformer_embeddings_and_metadata(args.log_type)
         
         if embeddings is None:
-            print(f"❌ Could not load TFRecord dataset for {args.log_type}")
-            print(f"   Make sure processed/{args.log_type}/*.tfrecord files exist")
+            print(f"❌ Could not load transformer embeddings for {args.log_type}")
+            print(f"   Make sure transformer training completed successfully")
+            print(f"   Run training first: python src/transformer.py --log-type {args.log_type}")
             return
         
         # Check class compatibility
@@ -523,8 +726,8 @@ def main():
         
         print(f"📊 Dataset loaded: {len(embeddings):,} samples vs {len(training_classes)} training classes")
         
-        # Evaluate model
-        results = evaluator.evaluate_model(model, embeddings, true_labels, classes)
+        # Evaluate transformer embeddings
+        results = evaluator.evaluate_transformer_embeddings(embeddings, true_labels, classes)
         
         # Generate outputs
         output_dir = Path(args.output_dir) / args.log_type
