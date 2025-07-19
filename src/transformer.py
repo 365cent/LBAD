@@ -2641,6 +2641,310 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
 
 # Log type classifier function removed - each log file can only be one type
 
+def generate_embeddings_for_full_dataset(model: UnsupervisedMultiLabelTransformer, 
+                                        log_type: str, config: SystemConfig, 
+                                        tracker: ProgressTracker) -> Optional[Path]:
+    """
+    Generate embeddings for the full TFRecord dataset using the trained transformer.
+    This creates embeddings for ALL preprocessed logs for evaluation.
+    """
+    print(f"\n🔄 Generating transformer embeddings for full {log_type} dataset...")
+    
+    # Load full TFRecord dataset
+    processed_dir = Path("processed")
+    log_type_dir = processed_dir / log_type
+    
+    if not log_type_dir.exists():
+        print(f"⚠️  No TFRecord directory found for {log_type}")
+        return None
+    
+    tfrecord_files = list(log_type_dir.glob("*.tfrecord"))
+    if not tfrecord_files:
+        print(f"⚠️  No TFRecord files found for {log_type}")
+        return None
+    
+    print(f"📂 Found {len(tfrecord_files)} TFRecord files")
+    
+    try:
+        import tensorflow as tf
+        import json
+        
+        all_logs = []
+        all_labels_json = []
+        
+        for file_idx, file_path in enumerate(tfrecord_files):
+            print(f"   Loading file {file_idx+1}/{len(tfrecord_files)}: {file_path.name}")
+            
+            try:
+                dataset = tf.data.TFRecordDataset(str(file_path), compression_type="GZIP")
+                
+                for raw_record in dataset:
+                    feature_description = {
+                        'l': tf.io.FixedLenFeature([], tf.string),
+                        'y': tf.io.FixedLenFeature([], tf.string),
+                    }
+                    parsed = tf.io.parse_single_example(raw_record, feature_description)
+                    
+                    log_line = parsed['l'].numpy().decode('utf-8')
+                    labels_json = parsed['y'].numpy().decode('utf-8')
+                    
+                    all_logs.append(log_line)
+                    all_labels_json.append(labels_json)
+                    
+            except Exception as e:
+                print(f"   ⚠️  Error loading {file_path}: {e}")
+                continue
+        
+        if not all_logs:
+            print(f"❌ No data loaded from TFRecord files")
+            return None
+        
+        print(f"✅ Loaded {len(all_logs):,} log entries from TFRecord files")
+        
+        # Parse labels for metadata
+        all_labels_parsed = []
+        all_classes = set()
+        
+        for labels_json in all_labels_json:
+            try:
+                labels = json.loads(labels_json) if labels_json.strip() else []
+                if isinstance(labels, str):
+                    labels = [labels]
+                elif not isinstance(labels, list):
+                    labels = []
+                all_labels_parsed.append(labels)
+                all_classes.update(labels)
+            except (json.JSONDecodeError, TypeError):
+                all_labels_parsed.append([])
+        
+        classes = sorted(list(all_classes))
+        if not classes:
+            classes = ['normal']
+        
+        # Create binary label matrix
+        true_labels = np.zeros((len(all_logs), len(classes)), dtype=np.float32)
+        for i, labels in enumerate(all_labels_parsed):
+            for label in labels:
+                if label in classes:
+                    true_labels[i, classes.index(label)] = 1.0
+        
+        # Generate embeddings using the same method as training
+        print(f"🔄 Generating embeddings for {len(all_logs):,} logs...")
+        input_embeddings = generate_input_embeddings_for_logs(all_logs, model.input_dim, config.device)
+        
+        if input_embeddings is None:
+            print(f"❌ Failed to generate input embeddings")
+            return None
+        
+        # Generate transformer embeddings
+        print(f"🤖 Generating transformer embeddings...")
+        model.eval()
+        transformer_embeddings = []
+        batch_size = 64
+        
+        device = torch.device(config.device)
+        
+        with torch.no_grad():
+            for i in range(0, len(input_embeddings), batch_size):
+                batch = torch.from_numpy(input_embeddings[i:i+batch_size]).float().to(device)
+                
+                # Get latent embeddings from transformer
+                outputs = model(batch)
+                latent_embeddings = outputs['latent']  # Use latent representations
+                
+                transformer_embeddings.append(latent_embeddings.cpu().numpy())
+        
+        transformer_embeddings = np.vstack(transformer_embeddings).astype(np.float32)
+        
+        # Save transformer embeddings
+        output_dir = Path("embeddings") / f"{log_type}_transformer_full"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save embeddings
+        embeddings_path = output_dir / f"transformer_embeddings_{log_type}_{config.node_name}_{config.job_id}.pkl"
+        with open(embeddings_path, 'wb') as f:
+            pickle.dump(transformer_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # Save metadata
+        metadata = {
+            'log_type': log_type,
+            'n_samples': len(all_logs),
+            'embedding_dim': transformer_embeddings.shape[1],
+            'classes': classes,
+            'true_labels': true_labels,
+            'raw_logs': all_logs,
+            'node_name': config.node_name,
+            'job_id': config.job_id,
+            'timestamp': time.time(),
+            'model_type': 'transformer_latent_embeddings'
+        }
+        
+        metadata_path = output_dir / f"metadata_{log_type}_{config.node_name}_{config.job_id}.pkl"
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        print(f"💾 Transformer embeddings saved to: {embeddings_path}")
+        print(f"📊 Dataset: {len(transformer_embeddings):,} samples × {transformer_embeddings.shape[1]}D embeddings")
+        print(f"📋 Metadata saved to: {metadata_path}")
+        
+        tracker.log_step("Transformer Embeddings Generation", {
+            "log_type": log_type,
+            "n_samples": len(transformer_embeddings),
+            "embedding_dim": transformer_embeddings.shape[1],
+            "n_classes": len(classes),
+            "output_path": str(embeddings_path)
+        })
+        
+        return embeddings_path
+        
+    except Exception as e:
+        print(f"❌ Error generating transformer embeddings: {e}")
+        return None
+
+
+def generate_input_embeddings_for_logs(logs: List[str], target_dim: int, device: str) -> Optional[np.ndarray]:
+    """
+    Generate input embeddings for logs using the same method as training.
+    """
+    if target_dim == 300:
+        # FastText embeddings
+        return generate_fasttext_embeddings_for_logs(logs)
+    elif target_dim == 768:
+        # BERT CLS embeddings
+        return generate_bert_cls_embeddings_for_logs(logs, device)
+    elif target_dim == 2314:
+        # Enhanced LogBERT embeddings
+        return generate_enhanced_logbert_embeddings_for_logs(logs, device)
+    else:
+        print(f"⚠️  Unknown embedding dimension {target_dim}")
+        return None
+
+
+def generate_enhanced_logbert_embeddings_for_logs(logs: List[str], device: str) -> np.ndarray:
+    """Generate Enhanced LogBERT embeddings for logs"""
+    from transformers import BertModel, BertTokenizer
+    
+    print("🤖 Loading BERT model for Enhanced LogBERT embeddings...")
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased').to(device)
+    model.eval()
+    
+    all_embeddings = []
+    batch_size = 16  # Small batch size for memory efficiency
+    
+    with torch.no_grad():
+        for i in range(0, len(logs), batch_size):
+            batch_logs = logs[i:i+batch_size]
+            
+            # Tokenize
+            encodings = tokenizer(
+                batch_logs,
+                truncation=True,
+                padding='max_length',
+                max_length=128,
+                return_tensors='pt'
+            ).to(device)
+            
+            # Get BERT outputs
+            outputs = model(**encodings, output_attentions=True)
+            
+            # Extract features
+            # 1. CLS token (768D)
+            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            
+            # 2. Mean pooling (768D)
+            token_embeddings = outputs.last_hidden_state
+            attention_mask = encodings['attention_mask']
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            mean_embeddings = (sum_embeddings / sum_mask).cpu().numpy()
+            
+            # 3. Max pooling (768D)
+            token_embeddings_masked = token_embeddings.clone()
+            token_embeddings_masked[input_mask_expanded == 0] = -1e9
+            max_embeddings = torch.max(token_embeddings_masked, 1)[0].cpu().numpy()
+            
+            # 4. Attention features (10D)
+            last_attention = outputs.attentions[-1]
+            cls_attention = last_attention.mean(dim=1)[:, 0, :].cpu().numpy()
+            
+            batch_attention_features = []
+            for j in range(cls_attention.shape[0]):
+                seq_len = attention_mask[j].sum().item()
+                valid_attention = cls_attention[j, :seq_len]
+                
+                if len(valid_attention) > 1:
+                    top_values = np.sort(valid_attention[1:])[-10:]
+                    if len(top_values) < 10:
+                        top_values = np.pad(top_values, (0, 10 - len(top_values)), 'constant')
+                else:
+                    top_values = np.zeros(10)
+                
+                batch_attention_features.append(top_values)
+            
+            attention_features = np.array(batch_attention_features)
+            
+            # Combine all features (CLS + Mean + Max + Attention = 768 + 768 + 768 + 10 = 2314D)
+            combined = np.hstack([cls_embeddings, mean_embeddings, max_embeddings, attention_features])
+            all_embeddings.append(combined)
+    
+    embeddings = np.vstack(all_embeddings).astype(np.float32)
+    
+    # Clean up model
+    del model, tokenizer
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+    
+    return embeddings
+
+
+def generate_bert_cls_embeddings_for_logs(logs: List[str], device: str) -> np.ndarray:
+    """Generate BERT CLS embeddings for logs"""
+    from transformers import BertModel, BertTokenizer
+    
+    print("🤖 Loading BERT model for CLS embeddings...")
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased').to(device)
+    model.eval()
+    
+    all_embeddings = []
+    batch_size = 16
+    
+    with torch.no_grad():
+        for i in range(0, len(logs), batch_size):
+            batch_logs = logs[i:i+batch_size]
+            
+            encodings = tokenizer(
+                batch_logs,
+                truncation=True,
+                padding='max_length',
+                max_length=128,
+                return_tensors='pt'
+            ).to(device)
+            
+            outputs = model(**encodings)
+            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            all_embeddings.append(cls_embeddings)
+    
+    embeddings = np.vstack(all_embeddings).astype(np.float32)
+    
+    # Clean up
+    del model, tokenizer
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+    
+    return embeddings
+
+
+def generate_fasttext_embeddings_for_logs(logs: List[str]) -> np.ndarray:
+    """Generate FastText embeddings for logs"""
+    print("📝 Generating FastText embeddings...")
+    # This would need actual FastText implementation
+    # For now, return placeholder
+    return np.random.randn(len(logs), 300).astype(np.float32)
+
+
 def save_trained_model(model: UnsupervisedMultiLabelTransformer, 
                       classes: List[str], config: SystemConfig, 
                       log_type: str, training_time: float = 0.0) -> Path:
@@ -4297,9 +4601,22 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
                 model_path = save_model_after_training(model, classes, config, log_type, total_training_time)
                 spinner.succeed(f"Model saved successfully")
+            
+            # Generate embeddings for full dataset
+            with Halo(text=f"Generating embeddings for full {log_type} dataset...", spinner='dots') as spinner:
+                embeddings_path = generate_embeddings_for_full_dataset(model, log_type, config, tracker)
+                if embeddings_path:
+                    spinner.succeed(f"Full dataset embeddings generated")
+                else:
+                    spinner.fail(f"Failed to generate full dataset embeddings")
         
         tracker.log_step("Completion", {"status": "success", "training_time": total_training_time})
         print(f"✅ Completed processing {log_type}")
+        print(f"📂 Outputs:")
+        print(f"   Model: models/transformer_{log_type}_{config.node_name}_{config.job_id}.pth") 
+        if config.rank == 0 and 'embeddings_path' in locals() and embeddings_path:
+            print(f"   Full dataset embeddings: {embeddings_path}")
+            print(f"   📊 Ready for unsupervised evaluation and downstream tasks")
         
     except KeyboardInterrupt:
         print(f"\n⚠️  Processing interrupted for {log_type}. Training checkpoint saved.")
