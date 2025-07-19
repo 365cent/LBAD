@@ -46,7 +46,7 @@ class TransformerEvaluator:
         self.config = config
         self.device = torch.device(config.device)
         
-    def load_tfrecord_dataset(self, log_type: str) -> Tuple[Optional[np.ndarray], Optional[List[str]], Optional[np.ndarray]]:
+    def load_tfrecord_dataset(self, log_type: str, target_dim: int = 768) -> Tuple[Optional[np.ndarray], Optional[List[str]], Optional[np.ndarray]]:
         """
         Load full dataset from TFRecord files for comprehensive evaluation.
         """
@@ -133,8 +133,8 @@ class TransformerEvaluator:
                         true_labels[i, classes.index(label)] = 1.0
             
             # Generate embeddings using TF-IDF
-            print(f"🔄 Generating embeddings for {len(all_logs):,} log entries...")
-            embeddings = self._generate_tfidf_embeddings(all_logs)
+            print(f"🔄 Generating {target_dim}D embeddings for {len(all_logs):,} log entries...")
+            embeddings = self._generate_tfidf_embeddings(all_logs, target_dim=target_dim)
             
             load_time = time.time() - load_start_time
             print(f"✅ Dataset loading completed in {load_time:.1f}s")
@@ -167,8 +167,8 @@ class TransformerEvaluator:
         embeddings = normalize(embeddings, norm='l2', axis=1).astype(np.float32)
         return embeddings
     
-    def load_trained_model(self, model_path: Path, log_type: str) -> Tuple[UnsupervisedMultiLabelTransformer, List[str]]:
-        """Load a trained transformer model"""
+    def load_trained_model(self, model_path: Path, log_type: str) -> Tuple[UnsupervisedMultiLabelTransformer, List[str], int]:
+        """Load a trained transformer model and return input dimension"""
         print(f"📂 Loading trained model from {model_path}")
         
         try:
@@ -210,7 +210,7 @@ class TransformerEvaluator:
             model.eval()
             
             print(f"✅ Model loaded: {input_dim}D → {len(classes)} classes")
-            return model, classes
+            return model, classes, input_dim
             
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
@@ -491,10 +491,10 @@ def main():
             return
         
         # Load trained model
-        model, training_classes = evaluator.load_trained_model(model_path, args.log_type)
+        model, training_classes, model_input_dim = evaluator.load_trained_model(model_path, args.log_type)
         
-        # Load full TFRecord dataset
-        embeddings, classes, true_labels = evaluator.load_tfrecord_dataset(args.log_type)
+        # Load full TFRecord dataset with correct embedding dimension
+        embeddings, classes, true_labels = evaluator.load_tfrecord_dataset(args.log_type, target_dim=model_input_dim)
         
         if embeddings is None:
             print(f"❌ Could not load TFRecord dataset for {args.log_type}")
@@ -507,14 +507,17 @@ def main():
             print(f"   Training classes: {len(training_classes)} - {training_classes[:3]}...")
             print(f"   Evaluation classes: {len(classes)} - {classes[:3]}...")
             print(f"   Using training classes for evaluation")
+            
+            # Store original classes for mapping
+            original_classes = classes
             classes = training_classes
             
             # Adjust true_labels to match training classes
             if true_labels is not None:
                 new_true_labels = np.zeros((len(true_labels), len(training_classes)), dtype=np.float32)
                 for i, train_cls in enumerate(training_classes):
-                    if train_cls in classes:
-                        orig_idx = classes.index(train_cls)
+                    if train_cls in original_classes:
+                        orig_idx = original_classes.index(train_cls)
                         new_true_labels[:, i] = true_labels[:, orig_idx]
                 true_labels = new_true_labels
         
