@@ -1273,6 +1273,10 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
     
     return embeddings, classes, C, scaler
 
+
+
+
+
 def create_label_clusters(classes: List[str], n_clusters: int) -> Optional[np.ndarray]:
     """Create semantic label clusters"""
     if not classes or n_clusters <= 0:
@@ -2583,9 +2587,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         # Print epoch summary for unsupervised learning
         if successful_batches > 0:
-            print(f"Epoch {epoch+1}/50 - Loss: {avg_loss:.4f} - Processed: {successful_batches}/{total_attempted_batches} batches - Time: {epoch_time:.2f}s")
+            print(f"Epoch {epoch+1}/50 - Loss: {avg_loss:.4f} - Batches: {successful_batches}/{total_attempted_batches} - Time: {epoch_time:.2f}s")
         else:
-            print(f"Epoch {epoch+1}/50 - No valid batches processed ({skipped_batches} skipped) - Time: {epoch_time:.2f}s")
+            print(f"Epoch {epoch+1}/50 - Training failed (all {skipped_batches} batches skipped) - Time: {epoch_time:.2f}s")
         
         if patience_counter >= patience:
             if config.rank == 0:
@@ -2596,9 +2600,12 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             # Restore best model if we have one
             if best_model_state is not None:
                 model.load_state_dict(best_model_state)
-                print(f"Restored best model from epoch with loss: {best_loss:.4f}")
+                if best_loss < float('inf'):
+                    print(f"Restored best model from epoch with loss: {best_loss:.4f}")
+                else:
+                    print(f"Restored best model (no valid loss recorded)")
             else:
-                print(f"No best model state saved - continuing with current model")
+                print(f"No best model saved - using current model")
             break
         
         # Only log detailed loss components if we have valid training
@@ -2634,110 +2641,42 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
 
 # Log type classifier function removed - each log file can only be one type
 
-def create_classification_summary(model: UnsupervisedMultiLabelTransformer, 
-                                 embeddings: np.ndarray, classes: List[str],
-                                 config: SystemConfig, tracker: ProgressTracker, 
-                                 output_dir: Path, log_type: str, training_time: float = 0.0):
+def save_trained_model(model: UnsupervisedMultiLabelTransformer, 
+                      classes: List[str], config: SystemConfig, 
+                      log_type: str, training_time: float = 0.0) -> Path:
     """
-    Create comprehensive classification summary with evaluation reports similar to ml_models.py
-    
-    Args:
-        model: Trained model
-        embeddings: Full embeddings array used for training
-        classes: List of class names
-        config: System configuration
-        tracker: Progress tracker
-        output_dir: Output directory
-        log_type: Type of log being processed
-        training_time: Training time in seconds
+    Save the trained model with metadata for later evaluation.
+    This replaces the complex evaluation that was done during training.
     """
+    # Create models directory
+    models_dir = Path("models")
+    models_dir.mkdir(exist_ok=True)
     
-    device = torch.device(config.device)
+    # Save model with comprehensive metadata
+    model_path = models_dir / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
     
-    # Get true labels if available from tracker
-    true_labels = getattr(tracker, 'true_labels', None)
+    model_to_save = model.module if hasattr(model, 'module') else model
     
-    # Use the new comprehensive evaluation function
-    print(f"\n🔍 Evaluating transformer model for {log_type}...")
-    results, predictions, binary_predictions = evaluate_transformer_model(
-        model, embeddings, true_labels, classes, device, val_split=0.3
-    )
-    
-    # Generate comprehensive classification report similar to ml_models.py
-    print(f"\n📊 Generating classification report...")
-    report_path = generate_classification_report(
-        results, true_labels, binary_predictions, predictions, 
-        classes, log_type, output_dir, config, training_time
-    )
-    
-    # Generate comprehensive per-class accuracy report
-    print(f"\n📊 Generating per-class accuracy report...")
-    per_class_report_path = generate_per_class_accuracy_report(
-        output_dir, log_type, config, predictions, binary_predictions, classes, true_labels
-    )
-    
-    # Save comprehensive evaluation results
-    save_evaluation_results(
-        results, predictions, binary_predictions, log_type, output_dir, config
-    )
-    
-    # Print evaluation summary to console
-    print_evaluation_summary(results, log_type)
-    
-    # Save detailed results (backward compatibility)
-    save_path = output_dir / f"results_{log_type}_{config.node_name}_{config.job_id}.pkl"
-    with open(save_path, 'wb') as f:
-        pickle.dump({
-            'predictions': predictions,
-            'binary_predictions': binary_predictions,
-            'classes': classes,
-            'metrics': results,  # Use new results format
-            'adaptive_thresholds': results.get('optimal_thresholds', []),
-            'model_type': 'transformer_with_evaluation',
-            'training_mode': 'fully_unsupervised',
-            'evaluation_type': results['evaluation_type']
-        }, f)
-    
-    # Save labels in evaluation format
-    label_output_path = output_dir / f"label_{log_type}_{config.node_name}_{config.job_id}.pkl"
-    label_data = {
-        'vectors': binary_predictions.astype(np.int8),
+    model_data = {
+        'model_state_dict': model_to_save.state_dict(),
         'classes': classes,
-        'probabilities': predictions.astype(np.float32),
-        'metadata': {
-            'node_name': config.node_name,
-            'job_id': config.job_id,
-            'timestamp': datetime.now().isoformat(),
-            'model_type': 'transformer_with_evaluation',
-            'threshold': results.get('optimal_thresholds', []),
-            'training_mode': 'fully_unsupervised',
-            'total_training_samples': len(embeddings),
-            'evaluation_type': results['evaluation_type']
-        }
+        'config': config.__dict__,
+        'log_type': log_type,
+        'training_time': training_time,
+        'model_type': 'UnsupervisedMultiLabelTransformer',
+        'input_dim': model_to_save.input_dim,
+        'latent_dim': model_to_save.latent_dim,
+        'n_labels': len(classes),
+        'timestamp': time.time()
     }
     
-    with open(label_output_path, 'wb') as f:
-        pickle.dump(label_data, f)
+    torch.save(model_data, model_path)
     
-    # Create visualizations
-    create_comprehensive_visualizations(embeddings, predictions, binary_predictions, classes, output_dir, log_type, config)
+    print(f"💾 Model saved to: {model_path}")
+    print(f"📊 Model info: {model_to_save.input_dim}D → {len(classes)} classes")
+    print(f"🎯 Evaluation: Use 'python src/evaluate_transformer.py --log-type {log_type}' for full evaluation")
     
-    tracker.log_step("Comprehensive Classification Evaluation", {
-        "log_type": log_type,
-        "n_samples": len(embeddings),
-        "n_classes": len(classes),
-        "avg_labels_per_sample": results['avg_labels_per_sample'],
-        "evaluation_type": results['evaluation_type'],
-        "training_time": training_time,
-        "report_path": report_path,
-        "per_class_report_path": per_class_report_path,
-        "has_true_labels": true_labels is not None,
-        "macro_f1": results.get('macro_f1', 'N/A'),
-        "micro_f1": results.get('micro_f1', 'N/A'),
-        "prediction_confidence_mean": results.get('prediction_confidence_mean', 0.0)
-    })
-    
-    return results
+    return model_path
 
 def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str], 
                                   y_true: np.ndarray = None, probs: np.ndarray = None) -> Dict[str, Any]:
@@ -3012,14 +2951,13 @@ def create_comprehensive_visualizations(embeddings: np.ndarray, predictions: np.
 
 
 
-def evaluate_and_save_results(model: UnsupervisedMultiLabelTransformer, 
-                             embeddings: np.ndarray, classes: List[str],
-                             config: SystemConfig, tracker: ProgressTracker, 
-                             output_dir: Path, log_type: str, training_time: float = 0.0):
-    """Evaluate model and save comprehensive results with classification summary"""
+def save_model_after_training(model: UnsupervisedMultiLabelTransformer, 
+                             classes: List[str], config: SystemConfig, 
+                             log_type: str, training_time: float = 0.0) -> Path:
+    """Save the trained model after training completes"""
     
-    # Use the new comprehensive classification summary
-    return create_classification_summary(model, embeddings, classes, config, tracker, output_dir, log_type, training_time)
+    # Save the trained model for later evaluation
+    return save_trained_model(model, classes, config, log_type, training_time)
 
 def create_visualization(embeddings: np.ndarray, predictions: np.ndarray, 
                         classes: List[str], output_dir: Path, log_type: str, config: SystemConfig):
@@ -4354,29 +4292,13 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         # Calculate total training time
         total_training_time = time.time() - training_start_time
         
-        # Evaluate and save
-        with Halo(text=f"Evaluating model for {log_type}...", spinner='dots') as spinner:
-            results = evaluate_and_save_results(model, embeddings, classes, config, tracker, output_dir, log_type, total_training_time)
-            spinner.succeed(f"Evaluation completed for {log_type}")
-        
-        # Save model
+        # Save trained model
         if config.rank == 0:
-            import torch  # Ensure torch is available in this scope
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
-                model_path = MODELS_DIR / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
-                model_path.parent.mkdir(exist_ok=True)
-                
-                model_to_save = model.module if hasattr(model, 'module') else model
-                torch.save({
-                    'model_state_dict': model_to_save.state_dict(),
-                    'config': config.__dict__,
-                    'classes': classes,
-                    'results': results,
-                    'scaler': scaler
-                }, model_path)
-                spinner.succeed(f"Model saved to {model_path}")
+                model_path = save_model_after_training(model, classes, config, log_type, total_training_time)
+                spinner.succeed(f"Model saved successfully")
         
-        tracker.log_step("Completion", {"status": "success", "results": results})
+        tracker.log_step("Completion", {"status": "success", "training_time": total_training_time})
         print(f"✅ Completed processing {log_type}")
         
     except KeyboardInterrupt:
