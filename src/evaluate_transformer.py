@@ -461,6 +461,9 @@ class TransformerEvaluator:
         metrics['evaluation_type'] = 'unsupervised_transformer_embeddings'
         metrics['classes'] = classes
         
+        # Add optimal thresholds (fixed threshold for unsupervised evaluation)
+        metrics['optimal_thresholds'] = [0.3] * len(classes)
+        
         return metrics
     
     def _calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
@@ -568,7 +571,7 @@ class TransformerEvaluator:
             precision = metrics['per_class_precision'][i]
             recall = metrics['per_class_recall'][i]
             support = metrics['per_class_support'][i]
-            threshold = metrics['optimal_thresholds'][i]
+            threshold = metrics.get('optimal_thresholds', [0.3] * len(metrics['classes']))[i]
             
             report_lines.append(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8} {threshold:<10.3f}")
         
