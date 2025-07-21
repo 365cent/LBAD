@@ -77,20 +77,39 @@ class TransformerEvaluator:
         print(f"📂 Loading model from {ckpt_path}")
         
         # Load checkpoint
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        try:
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            print(f"✅ Checkpoint loaded successfully")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint: {e}")
         
         # Extract model configuration
         classes = ckpt['classes']
+        print(f"🔍 Found {len(classes)} classes in checkpoint")
         
-        # Determine input dimension from checkpoint
-        input_dim = None
-        for key, tensor in ckpt['model_state_dict'].items():
-            if 'input_projection' in key and 'weight' in key:
-                input_dim = tensor.shape[1]
-                break
+        # Debug: show available metadata
+        metadata_keys = [k for k in ckpt.keys() if k != 'model_state_dict']
+        print(f"📋 Checkpoint metadata: {metadata_keys}")
+        
+        # Get input dimension from saved metadata (preferred) or infer from model structure
+        input_dim = ckpt.get('input_dim', None)
         
         if input_dim is None:
-            raise ValueError("Could not determine input dimension from model")
+            print("⚠️  No input_dim in metadata, inferring from model weights...")
+            # Fallback: try to determine from model state dict
+            for key, tensor in ckpt['model_state_dict'].items():
+                if 'input_proj' in key and 'weight' in key and len(tensor.shape) == 2:
+                    input_dim = tensor.shape[1]
+                    print(f"✅ Inferred input_dim={input_dim} from {key}")
+                    break
+        else:
+            print(f"✅ Using saved input_dim={input_dim}")
+        
+        if input_dim is None:
+            # Show available keys for debugging
+            model_keys = list(ckpt['model_state_dict'].keys())[:10]
+            raise ValueError(f"Could not determine input dimension from model checkpoint. "
+                           f"Available model keys (first 10): {model_keys}")
         
         # Rebuild model with same architecture
         model = UnsupervisedMultiLabelTransformer(
@@ -139,8 +158,9 @@ class TransformerEvaluator:
         y_true = label_data["vectors"]
         classes = label_data["classes"]
         
-        print(f"✅ Loaded {len(X):,} samples with {X.shape[1]}D embeddings")
+        print(f"✅ Loaded FULL dataset: {len(X):,} samples with {X.shape[1]}D embeddings")
         print(f"📊 Labels: {y_true.shape} for {len(classes)} classes")
+        print(f"🎯 Evaluating on complete dataset (no sampling)")
         
         return X, y_true, classes
     
@@ -358,6 +378,7 @@ def main():
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
     print(f"Threshold optimization: {'Enabled' if args.optimize_thresholds else 'Disabled (0.5 default)'}")
+    print(f"📊 Dataset: Using FULL LogBERT embeddings (no sampling)")
     print("")
     
     try:
@@ -370,14 +391,19 @@ def main():
         # 2. Load embeddings and true labels
         X, y_true, data_classes = evaluator.load_embeddings_and_labels(args.log_type)
         
-        # Verify class compatibility
+                # Verify class compatibility
         if model_classes != data_classes:
             print(f"⚠️  Class mismatch between model and data")
             print(f"   Model classes: {model_classes}")
             print(f"   Data classes: {data_classes}")
             print(f"   Using model classes for evaluation")
             classes = model_classes
+            
+            # Adjust true labels to match model classes if needed
+            if len(model_classes) != len(data_classes):
+                print(f"⚠️  Different number of classes, this may cause issues")
         else:
+            print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
             classes = model_classes
         
         # 3. Preprocess embeddings (same as training)
