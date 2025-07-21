@@ -3,12 +3,26 @@
 Transformer Model Evaluation Pipeline
 ====================================
 
-Evaluates trained transformer models on full TFRecord datasets.
-Provides comprehensive classification performance metrics.
+Evaluates trained transformer models using two methods:
+
+1. Direct Supervised Evaluation (RECOMMENDED):
+   - Loads predictions.pkl saved during training
+   - Applies sklearn metrics directly to saved predictions
+   - Fast and straightforward evaluation
+   
+2. Full TFRecord Evaluation:
+   - Loads full TFRecord dataset and performs clustering-based evaluation
+   - More comprehensive but complex analysis
 
 Usage:
+    # Direct supervised evaluation (recommended)
+    python src/evaluate_transformer.py --log-type wp-error --direct
+    
+    # Full TFRecord evaluation
     python src/evaluate_transformer.py --log-type wp-access
-    python src/evaluate_transformer.py --log-type wp-error --model-path models/transformer_wp-error.pth
+    
+    # Using specific model path
+    python src/evaluate_transformer.py --log-type wp-error --model-path models/transformer_wp-error.pth --direct
 """
 
 import argparse
@@ -45,6 +59,175 @@ class TransformerEvaluator:
     def __init__(self, config: SystemConfig):
         self.config = config
         self.device = torch.device(config.device)
+    
+    def evaluate_direct_supervised(self, log_type: str) -> Dict[str, Any]:
+        """
+        Direct supervised evaluation using saved predictions file.
+        Loads predictions.pkl and applies sklearn metrics directly.
+        """
+        print(f"🔄 Loading predictions for direct supervised evaluation of {log_type}...")
+        
+        # Load predictions file
+        predictions_file = Path(f"results/{log_type}/predictions.pkl")
+        
+        if not predictions_file.exists():
+            raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
+        
+        with open(predictions_file, 'rb') as f:
+            data = pickle.load(f)
+        
+        # Extract data
+        ids = data["ids"]
+        probs = data["probs"]
+        preds = data["preds"]
+        
+        # Check if true labels are available
+        if "true_labels" not in data or data["true_labels"] is None:
+            print(f"❌ No true labels found in predictions file - cannot perform supervised evaluation")
+            return None
+        
+        y_true = data["true_labels"]
+        
+        print(f"✅ Loaded predictions for {len(ids):,} samples")
+        print(f"📊 Shape: {probs.shape} (samples × classes)")
+        print(f"📋 True labels available: {y_true.shape}")
+        
+        # Load model to get classes information
+        model_path = self._find_model_path(log_type)
+        if model_path:
+            try:
+                checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+                classes = checkpoint['classes']
+                print(f"🏷️  Classes: {len(classes)} - {classes[:5]}{'...' if len(classes) > 5 else ''}")
+            except:
+                classes = [f"class_{i}" for i in range(probs.shape[1])]
+                print(f"⚠️  Could not load class names, using generic names")
+        else:
+            classes = [f"class_{i}" for i in range(probs.shape[1])]
+            print(f"⚠️  Model not found, using generic class names")
+        
+        # Calculate comprehensive metrics using sklearn
+        print(f"🔍 Computing supervised evaluation metrics...")
+        
+        # Overall multi-label metrics
+        subset_accuracy = accuracy_score(y_true, preds)
+        hamming_loss_score = hamming_loss(y_true, preds)
+        micro_f1 = f1_score(y_true, preds, average='micro', zero_division=0)
+        macro_f1 = f1_score(y_true, preds, average='macro', zero_division=0)
+        weighted_f1 = f1_score(y_true, preds, average='weighted', zero_division=0)
+        samples_f1 = f1_score(y_true, preds, average='samples', zero_division=0)
+        
+        # Additional metrics
+        micro_precision = precision_score(y_true, preds, average='micro', zero_division=0)
+        macro_precision = precision_score(y_true, preds, average='macro', zero_division=0)
+        micro_recall = recall_score(y_true, preds, average='micro', zero_division=0)
+        macro_recall = recall_score(y_true, preds, average='macro', zero_division=0)
+        
+        # Jaccard scores
+        jaccard_micro = jaccard_score(y_true, preds, average='micro', zero_division=0)
+        jaccard_macro = jaccard_score(y_true, preds, average='macro', zero_division=0)
+        
+        # Per-class metrics
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, preds, average=None, zero_division=0
+        )
+        
+        # Print results
+        print(f"\n📊 DIRECT SUPERVISED EVALUATION RESULTS")
+        print("=" * 60)
+        print(f"Subset Accuracy:  {subset_accuracy:.4f}")
+        print(f"Hamming Loss:     {hamming_loss_score:.4f}")
+        print(f"Micro F1:         {micro_f1:.4f}")
+        print(f"Macro F1:         {macro_f1:.4f}")
+        print(f"Weighted F1:      {weighted_f1:.4f}")
+        print(f"Samples F1:       {samples_f1:.4f}")
+        print(f"Micro Precision:  {micro_precision:.4f}")
+        print(f"Macro Precision:  {macro_precision:.4f}")
+        print(f"Micro Recall:     {micro_recall:.4f}")
+        print(f"Macro Recall:     {macro_recall:.4f}")
+        print(f"Jaccard (Micro):  {jaccard_micro:.4f}")
+        print(f"Jaccard (Macro):  {jaccard_macro:.4f}")
+        print("")
+        
+        # Generate classification report
+        print("📋 PER-CLASS CLASSIFICATION REPORT:")
+        print("-" * 60)
+        from sklearn.metrics import classification_report
+        class_report = classification_report(
+            y_true, preds,
+            target_names=classes,
+            zero_division=0,
+            digits=3
+        )
+        print(class_report)
+        
+        # Sample distribution analysis
+        labels_per_sample = preds.sum(axis=1)
+        true_labels_per_sample = y_true.sum(axis=1)
+        
+        print("📈 SAMPLE DISTRIBUTION ANALYSIS:")
+        print("-" * 60)
+        print(f"Average predicted labels per sample: {labels_per_sample.mean():.3f}")
+        print(f"Average true labels per sample: {true_labels_per_sample.mean():.3f}")
+        print(f"Predicted labels range: {labels_per_sample.min()} - {labels_per_sample.max()}")
+        print(f"True labels range: {true_labels_per_sample.min()} - {true_labels_per_sample.max()}")
+        print(f"Samples with no predicted labels: {(labels_per_sample == 0).sum():,}")
+        print(f"Samples with no true labels: {(true_labels_per_sample == 0).sum():,}")
+        print(f"Samples with multiple predicted labels: {(labels_per_sample > 1).sum():,}")
+        print(f"Samples with multiple true labels: {(true_labels_per_sample > 1).sum():,}")
+        
+        # Compile results
+        results = {
+            'metrics': {
+                'subset_accuracy': float(subset_accuracy),
+                'hamming_loss': float(hamming_loss_score),
+                'micro_f1': float(micro_f1),
+                'macro_f1': float(macro_f1),
+                'weighted_f1': float(weighted_f1),
+                'samples_f1': float(samples_f1),
+                'micro_precision': float(micro_precision),
+                'macro_precision': float(macro_precision),
+                'micro_recall': float(micro_recall),
+                'macro_recall': float(macro_recall),
+                'jaccard_micro': float(jaccard_micro),
+                'jaccard_macro': float(jaccard_macro),
+                'per_class_precision': precision.tolist(),
+                'per_class_recall': recall.tolist(),
+                'per_class_f1': f1.tolist(),
+                'per_class_support': support.tolist(),
+                'classes': classes,
+                'n_test_samples': len(y_true),
+                'evaluation_type': 'direct_supervised',
+                'avg_predicted_labels_per_sample': float(labels_per_sample.mean()),
+                'avg_true_labels_per_sample': float(true_labels_per_sample.mean()),
+                'samples_with_no_predicted_labels': int((labels_per_sample == 0).sum()),
+                'samples_with_no_true_labels': int((true_labels_per_sample == 0).sum()),
+                'samples_with_multiple_predicted_labels': int((labels_per_sample > 1).sum()),
+                'samples_with_multiple_true_labels': int((true_labels_per_sample > 1).sum()),
+            },
+            'predictions': preds,
+            'probabilities': probs,
+            'true_labels': y_true,
+            'ids': ids,
+            'classification_report': class_report
+        }
+        
+        return results
+    
+    def _find_model_path(self, log_type: str) -> Optional[Path]:
+        """Find model path for a given log type"""
+        models_dir = Path("models")
+        patterns = [
+            f"transformer_{log_type}_{self.config.node_name}_{self.config.job_id}.pth",
+            f"transformer_{log_type}_*.pth",
+            f"transformer_{log_type}.pth"
+        ]
+        
+        for pattern in patterns:
+            matches = list(models_dir.glob(pattern))
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
+        return None
         
     def load_tfrecord_dataset(self, log_type: str, target_dim: int = 768) -> Tuple[Optional[np.ndarray], Optional[List[str]], Optional[np.ndarray]]:
         """
@@ -657,7 +840,7 @@ def find_model_path(log_type: str, config: SystemConfig) -> Optional[Path]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained transformer model on full TFRecord dataset")
+    parser = argparse.ArgumentParser(description="Evaluate trained transformer model")
     parser.add_argument("--log-type", type=str, required=True, 
                        help="Log type to evaluate (e.g., wp-access, wp-error)")
     parser.add_argument("--model-path", type=str, 
@@ -666,6 +849,8 @@ def main():
                        help="Output directory for results")
     parser.add_argument("--training-time", type=float, default=0.0,
                        help="Training time in seconds (for reporting)")
+    parser.add_argument("--direct", action="store_true",
+                       help="Use direct supervised evaluation from predictions.pkl file")
     
     args = parser.parse_args()
     
@@ -677,68 +862,100 @@ def main():
     print(f"Log type: {args.log_type}")
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
+    print(f"Method: {'Direct Supervised' if args.direct else 'Full TFRecord Evaluation'}")
     print("")
     
     # Initialize evaluator
     evaluator = TransformerEvaluator(config)
     
     try:
-        # Find model path
-        if args.model_path:
-            model_path = Path(args.model_path)
+        if args.direct:
+            # Use direct supervised evaluation from predictions.pkl
+            print("🎯 Using Direct Supervised Evaluation")
+            print("=" * 50)
+            print("This method loads predictions.pkl and applies sklearn metrics directly")
+            print("")
+            
+            results = evaluator.evaluate_direct_supervised(args.log_type)
+            
+            if results is None:
+                print(f"❌ Direct supervised evaluation failed")
+                return
+            
+            # Save results
+            output_dir = Path(args.output_dir) / args.log_type
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            results_path = output_dir / f"direct_supervised_results_{args.log_type}_{config.node_name}_{config.job_id}.pkl"
+            with open(results_path, 'wb') as f:
+                pickle.dump(results, f)
+            
+            print(f"\n💾 Results saved to: {results_path}")
+            print(f"✅ Direct supervised evaluation completed for {args.log_type}")
+            
         else:
-            model_path = find_model_path(args.log_type, config)
-        
-        if not model_path or not model_path.exists():
-            print(f"❌ Model not found for {args.log_type}")
-            print(f"   Expected location: models/transformer_{args.log_type}_*.pth")
-            print(f"   Please train the model first using: python src/transformer.py --log-type {args.log_type}")
-            return
-        
-        # Load trained model
-        model, training_classes, model_input_dim = evaluator.load_trained_model(model_path, args.log_type)
-        
-        # Load transformer embeddings generated for full dataset
-        embeddings, classes, true_labels = evaluator.load_transformer_embeddings_and_metadata(args.log_type)
-        
-        if embeddings is None:
-            print(f"❌ Could not load transformer embeddings for {args.log_type}")
-            print(f"   Make sure transformer training completed successfully")
-            print(f"   Run training first: python src/transformer.py --log-type {args.log_type}")
-            return
-        
-        # Check class compatibility
-        if set(training_classes) != set(classes):
-            print(f"⚠️  Class mismatch between training and evaluation data")
-            print(f"   Training classes: {len(training_classes)} - {training_classes[:3]}...")
-            print(f"   Evaluation classes: {len(classes)} - {classes[:3]}...")
-            print(f"   Using training classes for evaluation")
+            # Use original complex evaluation method
+            print("🔄 Using Full TFRecord Evaluation")
+            print("=" * 50)
+            print("This method loads TFRecord data and performs clustering-based evaluation")
+            print("")
             
-            # Store original classes for mapping
-            original_classes = classes
-            classes = training_classes
+            # Find model path
+            if args.model_path:
+                model_path = Path(args.model_path)
+            else:
+                model_path = find_model_path(args.log_type, config)
             
-            # Adjust true_labels to match training classes
-            if true_labels is not None:
-                new_true_labels = np.zeros((len(true_labels), len(training_classes)), dtype=np.float32)
-                for i, train_cls in enumerate(training_classes):
-                    if train_cls in original_classes:
-                        orig_idx = original_classes.index(train_cls)
-                        new_true_labels[:, i] = true_labels[:, orig_idx]
-                true_labels = new_true_labels
-        
-        print(f"📊 Dataset loaded: {len(embeddings):,} samples vs {len(training_classes)} training classes")
-        
-        # Evaluate transformer embeddings
-        results = evaluator.evaluate_transformer_embeddings(embeddings, true_labels, classes)
-        
-        # Generate outputs
-        output_dir = Path(args.output_dir) / args.log_type
-        evaluator.generate_classification_report(results, args.log_type, output_dir, args.training_time)
-        evaluator.save_results(results, args.log_type, output_dir)
-        evaluator.print_summary(results, args.log_type, args.training_time)
-        
-        print(f"\n✅ Evaluation completed for {args.log_type}")
+            if not model_path or not model_path.exists():
+                print(f"❌ Model not found for {args.log_type}")
+                print(f"   Expected location: models/transformer_{args.log_type}_*.pth")
+                print(f"   Please train the model first using: python src/transformer.py --log-type {args.log_type}")
+                return
+            
+            # Load trained model
+            model, training_classes, model_input_dim = evaluator.load_trained_model(model_path, args.log_type)
+            
+            # Load transformer embeddings generated for full dataset
+            embeddings, classes, true_labels = evaluator.load_transformer_embeddings_and_metadata(args.log_type)
+            
+            if embeddings is None:
+                print(f"❌ Could not load transformer embeddings for {args.log_type}")
+                print(f"   Make sure transformer training completed successfully")
+                print(f"   Run training first: python src/transformer.py --log-type {args.log_type}")
+                return
+            
+            # Check class compatibility
+            if set(training_classes) != set(classes):
+                print(f"⚠️  Class mismatch between training and evaluation data")
+                print(f"   Training classes: {len(training_classes)} - {training_classes[:3]}...")
+                print(f"   Evaluation classes: {len(classes)} - {classes[:3]}...")
+                print(f"   Using training classes for evaluation")
+                
+                # Store original classes for mapping
+                original_classes = classes
+                classes = training_classes
+                
+                # Adjust true_labels to match training classes
+                if true_labels is not None:
+                    new_true_labels = np.zeros((len(true_labels), len(training_classes)), dtype=np.float32)
+                    for i, train_cls in enumerate(training_classes):
+                        if train_cls in original_classes:
+                            orig_idx = original_classes.index(train_cls)
+                            new_true_labels[:, i] = true_labels[:, orig_idx]
+                    true_labels = new_true_labels
+            
+            print(f"📊 Dataset loaded: {len(embeddings):,} samples vs {len(training_classes)} training classes")
+            
+            # Evaluate transformer embeddings
+            results = evaluator.evaluate_transformer_embeddings(embeddings, true_labels, classes)
+            
+            # Generate outputs
+            output_dir = Path(args.output_dir) / args.log_type
+            evaluator.generate_classification_report(results, args.log_type, output_dir, args.training_time)
+            evaluator.save_results(results, args.log_type, output_dir)
+            evaluator.print_summary(results, args.log_type, args.training_time)
+            
+            print(f"\n✅ Full evaluation completed for {args.log_type}")
         
     except KeyboardInterrupt:
         print(f"\n⚠️  Evaluation interrupted")

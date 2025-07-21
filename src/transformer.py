@@ -2633,9 +2633,77 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             
             tracker.log_metrics(epoch, unsupervised_metrics)
     
-    # Clean up training checkpoints after completion (keep final checkpoint)
+    # Clean up training checkpoints after completion (remove all temporary checkpoints)
     if config.rank == 0:
-        cleanup_training_checkpoints(log_type, keep_latest=1)
+        cleanup_training_checkpoints(log_type, keep_latest=0)  # Remove all checkpoints
+    
+    # Save prediction results after training completion
+    if config.rank == 0:  # Only save from main process
+        print(f"💾 Saving prediction results for {log_type}...")
+        try:
+            import pickle
+            import os
+            
+            # Prepare model for evaluation
+            model.eval()
+            device = torch.device(config.device)
+            
+            # Get true labels from tracker if available
+            true_labels = getattr(tracker, 'true_labels', None)
+            
+            # Generate sample IDs
+            ids = np.arange(len(embeddings))
+            
+            # Generate predictions on training embeddings
+            with torch.no_grad():
+                embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
+                logits = model(embeddings_tensor)['labels']
+                probs = torch.sigmoid(logits).cpu().numpy()
+                preds = (probs >= 0.5).astype(int)
+            
+            # Prepare prediction dictionary
+            prediction_data = {
+                "ids": ids,
+                "probs": probs,     # shape (n_samples, n_classes)
+                "preds": preds,     # binary predictions
+            }
+            
+            # Only include true_labels if they exist
+            if true_labels is not None:
+                prediction_data["true_labels"] = true_labels
+            
+            # Create results directory and save predictions
+            os.makedirs(f"results/{log_type}", exist_ok=True)
+            prediction_file = f"results/{log_type}/predictions.pkl"
+            
+            with open(prediction_file, "wb") as f:
+                pickle.dump(prediction_data, f)
+            
+            print(f"✅ Predictions saved to {prediction_file}")
+            print(f"📊 Saved {len(ids):,} predictions for {len(classes)} classes")
+            if true_labels is not None:
+                print(f"📋 True labels included in output")
+            else:
+                print(f"📋 No true labels available (unsupervised mode)")
+            
+            # Additional cleanup of temporary training files
+            try:
+                checkpoint_dir = Path("checkpoints")
+                if checkpoint_dir.exists():
+                    # Clean up any remaining checkpoint files for this log_type
+                    for checkpoint_file in checkpoint_dir.glob(f"*{log_type}*"):
+                        try:
+                            checkpoint_file.unlink()
+                            print(f"🗑️  Removed temporary file: {checkpoint_file}")
+                        except:
+                            pass  # Ignore errors when removing files
+                            
+                print(f"🧹 Training cleanup completed")
+            except Exception as cleanup_error:
+                print(f"⚠️  Minor cleanup warning: {cleanup_error}")
+                
+        except Exception as e:
+            print(f"⚠️  Failed to save predictions: {e}")
     
     return model, None  # Return None for scaler placeholder
 
