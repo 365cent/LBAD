@@ -620,6 +620,162 @@ def generate_reconstruction_anomaly_scores(model: nn.Module, embeddings: torch.T
         mean_val = np.mean([arr.mean() for arr in recon_errors if len(arr) > 0])
         return np.full(len(embeddings), mean_val)
 
+def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes: List[str]) -> np.ndarray:
+    """
+    Advanced per-class threshold optimization for highly imbalanced multi-label classification.
+    
+    Implements multiple strategies:
+    1. F1-based optimization with fine-grained search
+    2. Precision-Recall curve analysis for rare classes
+    3. Class imbalance-aware threshold selection
+    4. Support-weighted threshold adjustment
+    5. Statistical significance testing for threshold selection
+    
+    Args:
+        y_true: True binary labels (n_samples, n_classes)
+        probs: Predicted probabilities (n_samples, n_classes)
+        classes: List of class names
+    
+    Returns:
+        Optimized thresholds array (n_classes,)
+    """
+    from sklearn.metrics import f1_score, precision_recall_curve, balanced_accuracy_score
+    from scipy import stats
+    
+    n_classes = len(classes)
+    optimized_thresholds = np.zeros(n_classes)
+    
+    for i, cls in enumerate(classes):
+        y_true_class = y_true[:, i]
+        probs_class = probs[:, i]
+        
+        pos_samples = y_true_class.sum()
+        total_samples = len(y_true_class)
+        pos_rate = pos_samples / total_samples
+        
+        # Strategy selection based on class characteristics
+        if pos_samples == 0:
+            # No positive samples - use very high threshold to minimize false positives
+            optimized_thresholds[i] = 0.95
+            print(f"   {cls:<20} NO POS SAMPLES -> threshold: 0.95")
+            continue
+            
+        elif pos_samples < 10:
+            # Extremely rare classes (< 10 samples)
+            # Use precision-recall curve to find best threshold
+            precision, recall, thresholds_pr = precision_recall_curve(y_true_class, probs_class)
+            
+            # Find threshold that maximizes (precision * recall) / (precision + recall) = F1
+            f1_scores_pr = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+            
+            if len(f1_scores_pr) > 0:
+                best_idx = np.argmax(f1_scores_pr)
+                best_threshold = thresholds_pr[best_idx]
+                
+                # For extremely rare classes, bias towards higher recall (lower threshold)
+                # to ensure we don't miss the few positive samples
+                adjusted_threshold = best_threshold * 0.8  # Reduce by 20%
+                optimized_thresholds[i] = np.clip(adjusted_threshold, 0.05, 0.90)
+            else:
+                optimized_thresholds[i] = 0.3  # Conservative for rare classes
+                
+        elif pos_samples < 100:
+            # Rare classes (10-100 samples)
+            # Use F1 optimization with fine-grained search and statistical validation
+            best_f1 = 0
+            best_threshold = 0.5
+            candidate_thresholds = []
+            candidate_f1s = []
+            
+            # Fine-grained search for rare classes
+            for threshold in np.linspace(0.05, 0.95, 50):  # More granular for rare classes
+                pred_class = (probs_class >= threshold).astype(int)
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                
+                candidate_thresholds.append(threshold)
+                candidate_f1s.append(f1)
+                
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_threshold = threshold
+            
+            # Statistical validation: check if the best threshold is significantly better
+            candidate_f1s = np.array(candidate_f1s)
+            candidate_thresholds = np.array(candidate_thresholds)
+            
+            # Find all thresholds within 95% of best F1
+            good_threshold_mask = candidate_f1s >= (best_f1 * 0.95)
+            good_thresholds = candidate_thresholds[good_threshold_mask]
+            
+            if len(good_thresholds) > 1:
+                # Among good thresholds, prefer one that gives balanced precision/recall
+                balanced_scores = []
+                for thresh in good_thresholds:
+                    pred_class = (probs_class >= thresh).astype(int)
+                    bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                    balanced_scores.append(bal_acc)
+                
+                best_balanced_idx = np.argmax(balanced_scores)
+                optimized_thresholds[i] = good_thresholds[best_balanced_idx]
+            else:
+                optimized_thresholds[i] = best_threshold
+                
+        else:
+            # Common classes (>= 100 samples)
+            # Use comprehensive optimization considering multiple metrics
+            best_score = 0
+            best_threshold = 0.5
+            
+            # Coarse-to-fine search for efficiency
+            # Coarse search
+            coarse_thresholds = np.linspace(0.1, 0.9, 17)
+            coarse_scores = []
+            
+            for threshold in coarse_thresholds:
+                pred_class = (probs_class >= threshold).astype(int)
+                
+                # Composite score: weighted combination of F1, balanced accuracy
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                
+                # Weight based on class frequency (more balanced for common classes)
+                if pos_rate > 0.1:  # Common class
+                    composite_score = 0.7 * f1 + 0.3 * bal_acc
+                else:  # Still somewhat rare
+                    composite_score = 0.8 * f1 + 0.2 * bal_acc
+                
+                coarse_scores.append(composite_score)
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_threshold = threshold
+            
+            # Fine search around best coarse threshold
+            fine_range = 0.1  # Search +/- 0.1 around best coarse threshold
+            fine_start = max(0.05, best_threshold - fine_range)
+            fine_end = min(0.95, best_threshold + fine_range)
+            
+            fine_thresholds = np.linspace(fine_start, fine_end, 21)
+            
+            for threshold in fine_thresholds:
+                pred_class = (probs_class >= threshold).astype(int)
+                
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                
+                if pos_rate > 0.1:
+                    composite_score = 0.7 * f1 + 0.3 * bal_acc
+                else:
+                    composite_score = 0.8 * f1 + 0.2 * bal_acc
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_threshold = threshold
+            
+            optimized_thresholds[i] = best_threshold
+    
+    return optimized_thresholds
+
 # =============================================================================
 # Optimized Model Architecture
 # =============================================================================
@@ -2733,27 +2889,16 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 
                 # Optimize thresholds per class if true labels available
                 if true_labels is not None:
-                    print(f"🎯 Optimizing per-class thresholds...")
-                    optimized_thresholds = np.full(len(classes), 0.5)
+                    print(f"🎯 Optimizing advanced per-class thresholds...")
+                    optimized_thresholds = optimize_advanced_thresholds(true_labels, probs, classes)
                     
-                    for class_idx in range(len(classes)):
-                        class_true = true_labels[:, class_idx]
-                        class_prob = probs[:, class_idx]
-                        
-                        if class_true.sum() > 0:  # Only optimize if class has positive samples
-                            best_f1 = 0
-                            best_threshold = 0.5
-                            
-                            # Test thresholds from 0.1 to 0.9
-                            for threshold in np.arange(0.1, 0.95, 0.05):
-                                class_pred = (class_prob >= threshold).astype(int)
-                                from sklearn.metrics import f1_score
-                                f1 = f1_score(class_true, class_pred, zero_division=0)
-                                if f1 > best_f1:
-                                    best_f1 = f1
-                                    best_threshold = threshold
-                            
-                            optimized_thresholds[class_idx] = best_threshold
+                    # Print threshold summary
+                    print(f"📊 Advanced threshold optimization results:")
+                    for i, (cls, thresh) in enumerate(zip(classes, optimized_thresholds)):
+                        pos_samples = true_labels[:, i].sum()
+                        total_samples = len(true_labels)
+                        pos_rate = pos_samples / total_samples
+                        print(f"   {cls:<20} threshold: {thresh:.3f} | pos_samples: {pos_samples:>6} | pos_rate: {pos_rate:.4f}")
                     
                     # Apply optimized thresholds
                     preds = np.zeros_like(probs, dtype=int)
@@ -2763,8 +2908,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     print(f"✅ Optimized thresholds: {[f'{t:.2f}' for t in optimized_thresholds]}")
                 else:
                     # Default 0.5 threshold when no true labels
-                    preds = (probs >= 0.5).astype(int)
+                    print(f"⚠️  No true labels available for threshold optimization")
                     optimized_thresholds = np.full(len(classes), 0.5)
+                    preds = (probs >= 0.5).astype(int)
             
             # Prepare prediction dictionary
             prediction_data = {

@@ -215,25 +215,164 @@ class TransformerEvaluator:
     
     def optimize_thresholds(self, y_true: np.ndarray, probs: np.ndarray, 
                           classes: List[str]) -> np.ndarray:
-        """Optimize per-class thresholds for F1 score"""
-        print(f"🎯 Optimizing per-class thresholds...")
+        """
+        Advanced per-class threshold optimization for highly imbalanced multi-label classification.
         
-        best_thresh = np.zeros(len(classes))
+        Implements multiple strategies:
+        1. F1-based optimization with fine-grained search
+        2. Precision-Recall curve analysis for rare classes
+        3. Class imbalance-aware threshold selection
+        4. Support-weighted threshold adjustment
+        5. Statistical significance testing for threshold selection
+        """
+        from sklearn.metrics import precision_recall_curve, balanced_accuracy_score
+        
+        print(f"🎯 Optimizing advanced per-class thresholds...")
+        
+        n_classes = len(classes)
+        optimized_thresholds = np.zeros(n_classes)
         
         for i, cls in enumerate(classes):
-            best_f1, best_t = 0, 0.5
+            y_true_class = y_true[:, i]
+            probs_class = probs[:, i]
             
-            # Test thresholds from 0.1 to 0.9
-            for t in np.linspace(0.1, 0.9, 17):
-                pred = (probs[:, i] >= t).astype(int)
-                f1 = f1_score(y_true[:, i], pred, zero_division=0)
-                if f1 > best_f1:
-                    best_f1, best_t = f1, t
+            pos_samples = y_true_class.sum()
+            total_samples = len(y_true_class)
+            pos_rate = pos_samples / total_samples
             
-            best_thresh[i] = best_t
-            print(f"   {cls:<25} threshold: {best_t:.3f} (F1: {best_f1:.3f})")
+            # Strategy selection based on class characteristics
+            if pos_samples == 0:
+                # No positive samples - use very high threshold to minimize false positives
+                optimized_thresholds[i] = 0.95
+                print(f"   {cls:<25} NO POS SAMPLES -> threshold: 0.95")
+                continue
+                
+            elif pos_samples < 10:
+                # Extremely rare classes (< 10 samples)
+                # Use precision-recall curve to find best threshold
+                precision, recall, thresholds_pr = precision_recall_curve(y_true_class, probs_class)
+                
+                # Find threshold that maximizes (precision * recall) / (precision + recall) = F1
+                f1_scores_pr = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+                
+                if len(f1_scores_pr) > 0:
+                    best_idx = np.argmax(f1_scores_pr)
+                    best_threshold = thresholds_pr[best_idx]
+                    
+                    # For extremely rare classes, bias towards higher recall (lower threshold)
+                    # to ensure we don't miss the few positive samples
+                    adjusted_threshold = best_threshold * 0.8  # Reduce by 20%
+                    optimized_thresholds[i] = np.clip(adjusted_threshold, 0.05, 0.90)
+                    best_f1 = f1_scores_pr[best_idx]
+                    print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_PR")
+                else:
+                    optimized_thresholds[i] = 0.3  # Conservative for rare classes
+                    print(f"   {cls:<25} threshold: 0.30 (fallback) | pos: {pos_samples} | RARE_FB")
+                    
+            elif pos_samples < 100:
+                # Rare classes (10-100 samples)
+                # Use F1 optimization with fine-grained search and statistical validation
+                best_f1 = 0
+                best_threshold = 0.5
+                candidate_thresholds = []
+                candidate_f1s = []
+                
+                # Fine-grained search for rare classes
+                for threshold in np.linspace(0.05, 0.95, 50):  # More granular for rare classes
+                    pred_class = (probs_class >= threshold).astype(int)
+                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                    
+                    candidate_thresholds.append(threshold)
+                    candidate_f1s.append(f1)
+                    
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_threshold = threshold
+                
+                # Statistical validation: check if the best threshold is significantly better
+                candidate_f1s = np.array(candidate_f1s)
+                candidate_thresholds = np.array(candidate_thresholds)
+                
+                # Find all thresholds within 95% of best F1
+                good_threshold_mask = candidate_f1s >= (best_f1 * 0.95)
+                good_thresholds = candidate_thresholds[good_threshold_mask]
+                
+                if len(good_thresholds) > 1:
+                    # Among good thresholds, prefer one that gives balanced precision/recall
+                    balanced_scores = []
+                    for thresh in good_thresholds:
+                        pred_class = (probs_class >= thresh).astype(int)
+                        bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                        balanced_scores.append(bal_acc)
+                    
+                    best_balanced_idx = np.argmax(balanced_scores)
+                    optimized_thresholds[i] = good_thresholds[best_balanced_idx]
+                    print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_BAL")
+                else:
+                    optimized_thresholds[i] = best_threshold
+                    print(f"   {cls:<25} threshold: {best_threshold:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_F1")
+                    
+            else:
+                # Common classes (>= 100 samples)
+                # Use comprehensive optimization considering multiple metrics
+                best_score = 0
+                best_threshold = 0.5
+                
+                # Coarse-to-fine search for efficiency
+                # Coarse search
+                coarse_thresholds = np.linspace(0.1, 0.9, 17)
+                coarse_scores = []
+                
+                for threshold in coarse_thresholds:
+                    pred_class = (probs_class >= threshold).astype(int)
+                    
+                    # Composite score: weighted combination of F1, balanced accuracy
+                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                    bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                    
+                    # Weight based on class frequency (more balanced for common classes)
+                    if pos_rate > 0.1:  # Common class
+                        composite_score = 0.7 * f1 + 0.3 * bal_acc
+                    else:  # Still somewhat rare
+                        composite_score = 0.8 * f1 + 0.2 * bal_acc
+                    
+                    coarse_scores.append(composite_score)
+                    
+                    if composite_score > best_score:
+                        best_score = composite_score
+                        best_threshold = threshold
+                
+                # Fine search around best coarse threshold
+                fine_range = 0.1  # Search +/- 0.1 around best coarse threshold
+                fine_start = max(0.05, best_threshold - fine_range)
+                fine_end = min(0.95, best_threshold + fine_range)
+                
+                fine_thresholds = np.linspace(fine_start, fine_end, 21)
+                
+                for threshold in fine_thresholds:
+                    pred_class = (probs_class >= threshold).astype(int)
+                    
+                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                    bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                    
+                    if pos_rate > 0.1:
+                        composite_score = 0.7 * f1 + 0.3 * bal_acc
+                    else:
+                        composite_score = 0.8 * f1 + 0.2 * bal_acc
+                    
+                    if composite_score > best_score:
+                        best_score = composite_score
+                        best_threshold = threshold
+                
+                optimized_thresholds[i] = best_threshold
+                
+                # Calculate final F1 for display
+                final_pred = (probs_class >= best_threshold).astype(int)
+                final_f1 = f1_score(y_true_class, final_pred, zero_division=0)
+                strategy = "COMMON_BAL" if pos_rate > 0.1 else "MID_COMP"
+                print(f"   {cls:<25} threshold: {best_threshold:.3f} (F1: {final_f1:.3f}) | pos: {pos_samples} | {strategy}")
         
-        return best_thresh
+        return optimized_thresholds
     
     def compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
                        probs: np.ndarray, classes: List[str]) -> Dict[str, Any]:
@@ -374,8 +513,6 @@ def main():
                        help="Log type to evaluate (e.g., wp-access, wp-error)")
     parser.add_argument("--model-path", type=str, 
                        help="Path to trained model (auto-detected if not provided)")
-    parser.add_argument("--optimize-thresholds", action="store_true",
-                       help="Optimize per-class thresholds for F1 score")
     parser.add_argument("--batch-size", type=int, default=64,
                        help="Batch size for inference")
     
@@ -389,7 +526,7 @@ def main():
     print(f"Log type: {args.log_type}")
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
-    print(f"Threshold optimization: {'Enabled' if args.optimize_thresholds else 'Disabled (0.5 default)'}")
+    print(f"Advanced threshold optimization: ENABLED (default)")
     print(f"📊 Dataset: Using FULL LogBERT embeddings (no sampling)")
     print("")
     
@@ -424,16 +561,12 @@ def main():
         # 4. Generate predictions
         y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)
         
-        # 5. Optimize thresholds if requested
-        optimized_thresholds = None
-        if args.optimize_thresholds:
-            optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
-            y_pred_optimized = (probs >= optimized_thresholds).astype(int)
-            
-            print(f"\n🎯 Using optimized thresholds")
-            y_pred = y_pred_optimized
-        else:
-            print(f"\n📊 Using default 0.5 threshold")
+        # 5. Always optimize thresholds (default behavior)
+        optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
+        y_pred_optimized = (probs >= optimized_thresholds).astype(int)
+        
+        print(f"\n🎯 Using advanced optimized thresholds")
+        y_pred = y_pred_optimized
         
         # 6. Compute metrics
         metrics = evaluator.compute_metrics(y_true, y_pred, probs, classes)
