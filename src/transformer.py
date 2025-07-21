@@ -1705,20 +1705,20 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Clear memory before starting training
     clear_gpu_memory()
     
-    # Adaptive latent dimension and architecture based on embedding type
+    # Enhanced architecture for supercomputer environments
     embedding_dim = embeddings.shape[1]
     if embedding_dim <= 300:  # FastText
-        latent_dim = 256
-        transformer_layers = 8  # Lighter architecture
-        attention_heads = 8
-    elif embedding_dim <= 768:  # Standard BERT
-        latent_dim = 384
-        transformer_layers = 10  # Medium architecture
-        attention_heads = 12
-    else:  # Enhanced LogBERT (2314D)
         latent_dim = 512
-        transformer_layers = 12  # Full architecture for richer embeddings
+        transformer_layers = 12
         attention_heads = 16
+    elif embedding_dim <= 768:  # Standard BERT
+        latent_dim = 768
+        transformer_layers = 16
+        attention_heads = 16
+    else:  # Enhanced LogBERT (2314D) - Supercomputer optimized
+        latent_dim = 1024
+        transformer_layers = 20  # Deep architecture for supercomputer
+        attention_heads = 32
     
     # Model setup - automatically adapts to embedding dimension
     model = UnsupervisedMultiLabelTransformer(
@@ -1777,22 +1777,42 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Early stopping parameters
     patience = 10  # Early stopping patience
     
+    # Initialize class weights
+    class_weights = None
+    
     # Set CUDA debugging environment for better error reporting
     if device.type == 'cuda':
         import os
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error tracing
         print(f"🔧 CUDA_LAUNCH_BLOCKING=1 enabled for debugging")
     
-    print(f"🚀 Starting ENHANCED training for {log_type}")
-    print(f"💾 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"🚀 ENHANCED SUPERCOMPUTER TRAINING - {log_type}")
+    # Calculate model complexity
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = total_params * 4 / (1024 * 1024)  # Assuming float32
+    
+    print(f"💾 Model parameters: {total_params:,} ({trainable_params:,} trainable)")
+    print(f"💽 Model size: {model_size_mb:.1f} MB")
     print(f"📊 Training samples: {len(embeddings):,}")
     print(f"🏷️  Classes: {len(classes)}")
     print(f"🎯 Device: {device} | Mixed precision: {use_mixed_precision}")
-    print(f"⚡ Training improvements:")
+    print(f"🏗️  Enhanced Architecture (Supercomputer-optimized):")
+    print(f"   - Input dimension: {embedding_dim}")
+    print(f"   - Latent dimension: {latent_dim}")
+    print(f"   - Transformer layers: {transformer_layers}")
+    print(f"   - Attention heads: {attention_heads}")
+    
+    # Estimated training time
+    est_time_per_epoch = 0.5 * len(embeddings) / 1000  # Rough estimate
+    est_total_time = est_time_per_epoch * 100 / 60  # in minutes
+    print(f"⏱️  Estimated training time: {est_total_time:.1f} minutes ({est_time_per_epoch:.1f}s/epoch)")
+    print(f"⚡ Supercomputer optimizations:")
     print(f"   - Extended training: 100 epochs with patience={patience}")
-    print(f"   - Optimized thresholds: Per-class F1 optimization")
+    print(f"   - Checkpoint frequency: Every 5% (20 checkpoints)")
     print(f"   - Class balance: {'Enabled' if class_weights is not None else 'Disabled'}")
     print(f"   - Learning rate: 8e-5 with 10-epoch warmup")
+    print(f"   - ETA tracking: Real-time estimation")
     if device.type == 'cuda':
         print(f"⚠️  CUDA Safety Measures:")
         print(f"   - Disabled pin_memory and multiprocessing in DataLoader")
@@ -1848,7 +1868,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     optimizer = optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)  # Slightly lower LR for 100 epochs
     
     # Compute class weights for balanced training if true labels available
-    class_weights = None
     if true_labels is not None:
         # Calculate inverse frequency weights for class balance
         class_frequencies = true_labels.sum(axis=0)
@@ -2563,15 +2582,40 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         else:
             patience_counter += 1
         
-        # Save checkpoint periodically
-        if config.rank == 0 and (epoch + 1) % checkpoint_interval == 0:
+        # Enhanced checkpointing for supercomputer environments (every 5%)
+        progress_pct = ((epoch + 1) / total_epochs) * 100
+        should_checkpoint_5pct = (epoch + 1) % max(1, total_epochs // 20) == 0  # Every 5%
+        should_checkpoint_regular = (epoch + 1) % checkpoint_interval == 0
+        
+        if config.rank == 0 and (should_checkpoint_5pct or should_checkpoint_regular):
             try:
                 model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_metrics = {
                     'avg_loss': avg_loss,
                     'best_loss': best_loss,
-                    'patience_counter': patience_counter
+                    'patience_counter': patience_counter,
+                    'progress_pct': progress_pct,
+                    'epoch': epoch
                 }
+                
+                # Time estimation for supercomputer environment
+                if epoch > 0:
+                    elapsed_time = time.time() - tracker.start_time
+                    time_per_epoch = elapsed_time / (epoch + 1)
+                    remaining_epochs = total_epochs - (epoch + 1)
+                    eta_seconds = remaining_epochs * time_per_epoch
+                    
+                    if eta_seconds > 3600:
+                        eta_str = f"{eta_seconds/3600:.1f}h"
+                    elif eta_seconds > 60:
+                        eta_str = f"{eta_seconds/60:.1f}m"
+                    else:
+                        eta_str = f"{eta_seconds:.0f}s"
+                    
+                    # Enhanced progress for supercomputer
+                    print(f"💾 Checkpoint {progress_pct:.1f}% | ETA: {eta_str} | Loss: {avg_loss:.4f}")
+                    print(f"   ⚡ Epoch {epoch+1}/{total_epochs} | {elapsed_time/60:.1f}min elapsed | {time_per_epoch:.1f}s/epoch")
+                
                 save_training_checkpoint(
                     log_type, epoch, model_to_save.state_dict(), 
                     optimizer.state_dict(), checkpoint_metrics, 
