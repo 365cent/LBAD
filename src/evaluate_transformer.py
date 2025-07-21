@@ -99,6 +99,8 @@ class TransformerEvaluator:
             n_labels=len(classes),
             n_clusters=min(8, len(classes)),
             dropout=0.1,
+            transformer_layers=ckpt.get('transformer_layers', 12),
+            attention_heads=ckpt.get('attention_heads', 16)
         )
         
         # Load weights
@@ -106,6 +108,7 @@ class TransformerEvaluator:
         model.to(self.device).eval()
         
         print(f"✅ Model loaded: {input_dim}D → {len(classes)} classes")
+        print(f"🏗️  Architecture: {ckpt.get('transformer_layers', 12)} layers, {ckpt.get('attention_heads', 16)} heads, {ckpt.get('latent_dim', 512)}D latent")
         print(f"🏷️  Classes: {classes}")
         
         return model, classes

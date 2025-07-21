@@ -659,12 +659,15 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
     """
     
     def __init__(self, input_dim: int, latent_dim: int, n_labels: int, 
-                 n_clusters: int, dropout: float = 0.1):
+                 n_clusters: int, dropout: float = 0.1, 
+                 transformer_layers: int = 12, attention_heads: int = 16):
         super().__init__()
         
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.n_labels = n_labels
+        self.transformer_layers = transformer_layers
+        self.attention_heads = attention_heads
         
         # Much deeper and more powerful encoder
         self.input_proj = nn.Sequential(
@@ -674,9 +677,10 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Very deep encoder with 12 transformer blocks and skip connections
+        # Dynamic encoder with configurable transformer blocks and skip connections
         self.encoder_blocks = nn.ModuleList([
-            OptimizedTransformerBlock(latent_dim, 16, dropout) for _ in range(12)  # 16 heads, 12 layers
+            OptimizedTransformerBlock(latent_dim, attention_heads, dropout) 
+            for _ in range(transformer_layers)
         ])
         
         # Multi-scale feature extraction using different linear transformations
@@ -1725,7 +1729,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         input_dim=embedding_dim,
         latent_dim=latent_dim,
         n_labels=n_labels,
-        n_clusters=n_clusters
+        n_clusters=n_clusters,
+        dropout=0.1,
+        transformer_layers=transformer_layers,
+        attention_heads=attention_heads
     ).to(device)
     
     # UMTL Enhancement: Create teacher network (EMA of student)
@@ -2979,6 +2986,8 @@ def save_trained_model(model: UnsupervisedMultiLabelTransformer,
         'model_type': 'UnsupervisedMultiLabelTransformer',
         'input_dim': model_to_save.input_dim,
         'latent_dim': model_to_save.latent_dim,
+        'transformer_layers': model_to_save.transformer_layers,
+        'attention_heads': model_to_save.attention_heads,
         'n_labels': len(classes),
         'timestamp': time.time()
     }
@@ -2987,6 +2996,7 @@ def save_trained_model(model: UnsupervisedMultiLabelTransformer,
     
     print(f"💾 Model saved to: {model_path}")
     print(f"📊 Model info: {model_to_save.input_dim}D → {len(classes)} classes")
+    print(f"🏗️  Architecture: {model_to_save.transformer_layers} layers, {model_to_save.attention_heads} heads, {model_to_save.latent_dim}D latent")
     print(f"🎯 Evaluation: Use 'python src/evaluate_transformer.py --log-type {log_type}' for full evaluation")
     
     return model_path
