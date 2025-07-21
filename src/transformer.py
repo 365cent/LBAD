@@ -1774,6 +1774,9 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Training information and CUDA warnings
     use_mixed_precision = (config.device == "cuda")  # Mixed precision only on CUDA
     
+    # Early stopping parameters
+    patience = 10  # Early stopping patience
+    
     # Set CUDA debugging environment for better error reporting
     if device.type == 'cuda':
         import os
@@ -1923,8 +1926,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
     checkpoint_interval = 5   # Save checkpoint every 5 epochs
     
-    # Early stopping parameters - more patient for longer training
-    patience = 10  # Increased patience for 100 epochs
+    # Early stopping parameters - more patient for longer training  
     patience_counter = 0
     min_delta = 1e-5  # Smaller minimum improvement threshold
     
