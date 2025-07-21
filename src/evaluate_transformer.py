@@ -50,7 +50,7 @@ class TransformerEvaluator:
         self.config = config
         self.device = torch.device(config.device)
     
-    def load_model(self, log_type: str, model_path: Optional[str] = None) -> Tuple[UnsupervisedMultiLabelTransformer, List[str]]:
+    def load_model(self, log_type: str, model_path: Optional[str] = None) -> Tuple[UnsupervisedMultiLabelTransformer, List[str], Optional[Any]]:
         """Load trained transformer model"""
         
         if model_path:
@@ -130,7 +130,14 @@ class TransformerEvaluator:
         print(f"🏗️  Architecture: {ckpt.get('transformer_layers', 12)} layers, {ckpt.get('attention_heads', 16)} heads, {ckpt.get('latent_dim', 512)}D latent")
         print(f"🏷️  Classes: {classes}")
         
-        return model, classes
+        # Extract saved scaler if available
+        saved_scaler = ckpt.get('scaler', None)
+        if saved_scaler is not None:
+            print(f"✅ Found saved preprocessing scaler from training")
+        else:
+            print(f"⚠️  No saved scaler found (older model format)")
+        
+        return model, classes, saved_scaler
     
     def load_embeddings_and_labels(self, log_type: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """Load LogBERT embeddings and true labels"""
@@ -164,15 +171,20 @@ class TransformerEvaluator:
         
         return X, y_true, classes
     
-    def preprocess_embeddings(self, X: np.ndarray) -> np.ndarray:
-        """Apply same preprocessing as training (RobustScaler + L2 normalization)"""
-        print(f"🔄 Preprocessing embeddings...")
+    def preprocess_embeddings(self, X: np.ndarray, saved_scaler=None) -> np.ndarray:
+        """Apply same preprocessing as training using saved scaler"""
         
-        # Apply RobustScaler (using fit_transform since we're evaluating)
-        scaler = RobustScaler()
-        X_scaled = scaler.fit_transform(X)
+        if saved_scaler is not None:
+            print(f"🔄 Preprocessing embeddings using saved scaler from training...")
+            # Use the same scaler that was used during training
+            X_scaled = saved_scaler.transform(X)
+        else:
+            print(f"⚠️  No saved scaler found, fitting new scaler (may cause inconsistency)...")
+            # Fallback: fit new scaler (not ideal)
+            scaler = RobustScaler()
+            X_scaled = scaler.fit_transform(X)
         
-        # L2 normalization
+        # L2 normalization (same as training)
         X_normalized = normalize(X_scaled, norm='l2', axis=1).astype(np.float32)
         
         print(f"✅ Preprocessing complete")
@@ -386,7 +398,7 @@ def main():
         evaluator = TransformerEvaluator(config)
         
         # 1. Load trained model
-        model, model_classes = evaluator.load_model(args.log_type, args.model_path)
+        model, model_classes, saved_scaler = evaluator.load_model(args.log_type, args.model_path)
         
         # 2. Load embeddings and true labels
         X, y_true, data_classes = evaluator.load_embeddings_and_labels(args.log_type)
@@ -407,7 +419,7 @@ def main():
             classes = model_classes
         
         # 3. Preprocess embeddings (same as training)
-        X_processed = evaluator.preprocess_embeddings(X)
+        X_processed = evaluator.preprocess_embeddings(X, saved_scaler)
         
         # 4. Generate predictions
         y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)

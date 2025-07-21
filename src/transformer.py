@@ -1696,7 +1696,8 @@ def clear_gpu_memory():
     gc.collect()
 
 def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray, 
-                config: SystemConfig, tracker: ProgressTracker, log_type: str) -> Tuple[UnsupervisedMultiLabelTransformer, StandardScaler]:
+                config: SystemConfig, tracker: ProgressTracker, log_type: str, 
+                scaler: 'StandardScaler' = None) -> Tuple[UnsupervisedMultiLabelTransformer, 'StandardScaler']:
     """Optimized training with multi-GPU support, mixed precision, memory management, and resumeable checkpoints"""
     
     device = torch.device(config.device)
@@ -2813,7 +2814,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         except Exception as e:
             print(f"⚠️  Failed to save predictions: {e}")
     
-    return model, None  # Return None for scaler placeholder
+    return model, scaler  # Return the scaler used for preprocessing
 
 # Log type classifier function removed - each log file can only be one type
 
@@ -2963,7 +2964,8 @@ def generate_fasttext_embeddings_for_logs(logs: List[str]) -> np.ndarray:
 
 def save_trained_model(model: UnsupervisedMultiLabelTransformer, 
                       classes: List[str], config: SystemConfig, 
-                      log_type: str, training_time: float = 0.0) -> Path:
+                      log_type: str, training_time: float = 0.0, 
+                      scaler: 'StandardScaler' = None) -> Path:
     """
     Save the trained model with metadata for later evaluation.
     This replaces the complex evaluation that was done during training.
@@ -2989,6 +2991,7 @@ def save_trained_model(model: UnsupervisedMultiLabelTransformer,
         'transformer_layers': model_to_save.transformer_layers,
         'attention_heads': model_to_save.attention_heads,
         'n_labels': len(classes),
+        'scaler': scaler,  # Save the preprocessing scaler
         'timestamp': time.time()
     }
     
@@ -3276,11 +3279,12 @@ def create_comprehensive_visualizations(embeddings: np.ndarray, predictions: np.
 
 def save_model_after_training(model: UnsupervisedMultiLabelTransformer, 
                              classes: List[str], config: SystemConfig, 
-                             log_type: str, training_time: float = 0.0) -> Path:
+                             log_type: str, training_time: float = 0.0, 
+                             scaler: 'StandardScaler' = None) -> Path:
     """Save the trained model after training completes"""
     
     # Save the trained model for later evaluation
-    return save_trained_model(model, classes, config, log_type, training_time)
+    return save_trained_model(model, classes, config, log_type, training_time, scaler)
 
 def create_visualization(embeddings: np.ndarray, predictions: np.ndarray, 
                         classes: List[str], output_dir: Path, log_type: str, config: SystemConfig):
@@ -4609,7 +4613,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
         training_start_time = time.time()
         with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
-            model, _ = train_model(embeddings, classes, C, config, tracker, log_type)
+            model, _ = train_model(embeddings, classes, C, config, tracker, log_type, scaler)
             spinner.succeed(f"Training completed for {log_type}")
         
         # Calculate total training time
@@ -4618,7 +4622,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         # Save trained model
         if config.rank == 0:
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
-                model_path = save_model_after_training(model, classes, config, log_type, total_training_time)
+                model_path = save_model_after_training(model, classes, config, log_type, total_training_time, scaler)
                 spinner.succeed(f"Model saved successfully")
         
         tracker.log_step("Completion", {"status": "success", "training_time": total_training_time})
