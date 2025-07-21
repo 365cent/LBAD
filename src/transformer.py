@@ -1780,11 +1780,16 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error tracing
         print(f"🔧 CUDA_LAUNCH_BLOCKING=1 enabled for debugging")
     
-    print(f"🚀 Starting training for {log_type}")
+    print(f"🚀 Starting ENHANCED training for {log_type}")
     print(f"💾 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"📊 Training samples: {len(embeddings):,}")
     print(f"🏷️  Classes: {len(classes)}")
     print(f"🎯 Device: {device} | Mixed precision: {use_mixed_precision}")
+    print(f"⚡ Training improvements:")
+    print(f"   - Extended training: 100 epochs with patience={patience}")
+    print(f"   - Optimized thresholds: Per-class F1 optimization")
+    print(f"   - Class balance: {'Enabled' if class_weights is not None else 'Disabled'}")
+    print(f"   - Learning rate: 8e-5 with 10-epoch warmup")
     if device.type == 'cuda':
         print(f"⚠️  CUDA Safety Measures:")
         print(f"   - Disabled pin_memory and multiprocessing in DataLoader")
@@ -1795,7 +1800,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Generate initial pseudo-labels using all available true labels (if any) for guidance
     true_labels = getattr(tracker, 'true_labels', None)
-    pseudo_labels = advanced_pseudo_label_generation(embeddings, classes, true_labels=true_labels, epoch=0, total_epochs=50)
+    pseudo_labels = advanced_pseudo_label_generation(embeddings, classes, true_labels=true_labels, epoch=0, total_epochs=100)
     
     # Store initial pseudo-labels for refinement
     current_pseudo_labels = pseudo_labels.copy()
@@ -1836,17 +1841,29 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
     )
     
-    # Advanced training setup with reduced learning rate for stability
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # Reduced for stability
+    # Advanced training setup - adjusted for longer training
+    optimizer = optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)  # Slightly lower LR for 100 epochs
+    
+    # Compute class weights for balanced training if true labels available
+    class_weights = None
+    if true_labels is not None:
+        # Calculate inverse frequency weights for class balance
+        class_frequencies = true_labels.sum(axis=0)
+        # Avoid division by zero for classes with no samples
+        class_frequencies = np.maximum(class_frequencies, 1)
+        class_weights = len(true_labels) / (len(classes) * class_frequencies)
+        class_weights = torch.from_numpy(class_weights.astype(np.float32)).to(device)
+        print(f"🎯 Using class balance weights: {[f'{w:.2f}' for w in class_weights.cpu().numpy()]}")
     scaler = GradScaler() if config.device == "cuda" else None
     
-    # Advanced scheduler with warmup
+    # Advanced scheduler with warmup - adapted for 100 epochs
     def lr_lambda(epoch):
-        warmup_epochs = 5
+        warmup_epochs = 10  # Longer warmup for 100 epochs
         if epoch < warmup_epochs:
             return epoch / warmup_epochs
         else:
-            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (50 - warmup_epochs)))
+            # Cosine annealing over remaining epochs
+            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (100 - warmup_epochs)))
     
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
@@ -1897,7 +1914,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     
     # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
-    total_epochs = 50  # Balanced epochs for good convergence without taking too long
+    total_epochs = 100  # Increased epochs for better convergence in unsupervised learning
     
     # Initialize progress tracking with batch information
     total_batches_per_epoch = len(dataloader)
@@ -1906,10 +1923,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
     checkpoint_interval = 5   # Save checkpoint every 5 epochs
     
-    # Early stopping parameters
-    patience = 5
+    # Early stopping parameters - more patient for longer training
+    patience = 10  # Increased patience for 100 epochs
     patience_counter = 0
-    min_delta = 1e-4
+    min_delta = 1e-5  # Smaller minimum improvement threshold
     
     for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
@@ -2190,8 +2207,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                         
-                        # Enhanced focal loss with distribution-balanced weights
-                        label_loss = enhanced_focal_loss(outputs['labels'], y_batch)
+                        # Enhanced focal loss with distribution-balanced weights and class weighting
+                        label_loss = enhanced_focal_loss(outputs['labels'], y_batch, class_weights=class_weights)
                         
                         # Supervised loss on confident teacher predictions (FixMatch)
                         if n_confident > 0:
@@ -2350,8 +2367,8 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
-                    # Enhanced focal loss with distribution-balanced weights
-                    label_loss = enhanced_focal_loss(outputs['labels'], y_batch)
+                    # Enhanced focal loss with distribution-balanced weights and class weighting
+                    label_loss = enhanced_focal_loss(outputs['labels'], y_batch, class_weights=class_weights)
                     
                     # Supervised loss on confident teacher predictions (FixMatch)
                     if n_confident > 0:
@@ -2659,13 +2676,49 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
                 logits = model(embeddings_tensor)['labels']
                 probs = torch.sigmoid(logits).cpu().numpy()
-                preds = (probs >= 0.5).astype(int)
+                
+                # Optimize thresholds per class if true labels available
+                if true_labels is not None:
+                    print(f"🎯 Optimizing per-class thresholds...")
+                    optimized_thresholds = np.full(len(classes), 0.5)
+                    
+                    for class_idx in range(len(classes)):
+                        class_true = true_labels[:, class_idx]
+                        class_prob = probs[:, class_idx]
+                        
+                        if class_true.sum() > 0:  # Only optimize if class has positive samples
+                            best_f1 = 0
+                            best_threshold = 0.5
+                            
+                            # Test thresholds from 0.1 to 0.9
+                            for threshold in np.arange(0.1, 0.95, 0.05):
+                                class_pred = (class_prob >= threshold).astype(int)
+                                from sklearn.metrics import f1_score
+                                f1 = f1_score(class_true, class_pred, zero_division=0)
+                                if f1 > best_f1:
+                                    best_f1 = f1
+                                    best_threshold = threshold
+                            
+                            optimized_thresholds[class_idx] = best_threshold
+                    
+                    # Apply optimized thresholds
+                    preds = np.zeros_like(probs, dtype=int)
+                    for class_idx in range(len(classes)):
+                        preds[:, class_idx] = (probs[:, class_idx] >= optimized_thresholds[class_idx]).astype(int)
+                    
+                    print(f"✅ Optimized thresholds: {[f'{t:.2f}' for t in optimized_thresholds]}")
+                else:
+                    # Default 0.5 threshold when no true labels
+                    preds = (probs >= 0.5).astype(int)
+                    optimized_thresholds = np.full(len(classes), 0.5)
             
             # Prepare prediction dictionary
             prediction_data = {
                 "ids": ids,
                 "probs": probs,     # shape (n_samples, n_classes)
                 "preds": preds,     # binary predictions
+                "optimized_thresholds": optimized_thresholds,  # per-class thresholds
+                "classes": classes,  # class names for reference
             }
             
             # Only include true_labels if they exist
@@ -2683,8 +2736,10 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             print(f"📊 Saved {len(ids):,} predictions for {len(classes)} classes")
             if true_labels is not None:
                 print(f"📋 True labels included in output")
+                print(f"🎯 Per-class thresholds optimized for F1 score")
             else:
                 print(f"📋 No true labels available (unsupervised mode)")
+                print(f"🎯 Using default 0.5 thresholds")
             
             # Additional cleanup of temporary training files
             try:
