@@ -4517,7 +4517,7 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         print(f"   Predictions: results/{log_type}/predictions.pkl")
         print(f"")
         print(f"🎯 Next steps:")
-        print(f"   Direct evaluation: python src/evaluate_transformer.py --log-type {log_type} --direct")
+        print(f"   Evaluation: python src/evaluate_transformer.py --log-type {log_type}")
         
     except KeyboardInterrupt:
         print(f"\n⚠️  Processing interrupted for {log_type}. Training checkpoint saved.")

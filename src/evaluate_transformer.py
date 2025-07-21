@@ -3,27 +3,24 @@
 Transformer Model Evaluation Pipeline
 ====================================
 
-Evaluates trained transformer models using two methods:
+Automatically evaluates trained transformer models using the best available method:
 
-1. Direct Supervised Evaluation (RECOMMENDED):
+1. Direct Supervised Evaluation (AUTO-DETECTED):
    - Loads predictions.pkl saved during training
    - Applies sklearn metrics directly to saved predictions
    - Fast and straightforward evaluation
    
-2. Full TFRecord Evaluation (LEGACY):
-   - Loads full TFRecord dataset and performs clustering-based evaluation
-   - Requires manually generated embeddings (no longer created during training)
-   - Use --direct method instead for better performance
+2. Model-based Evaluation (FALLBACK):
+   - Loads TFRecord dataset and generates predictions from trained model
+   - Used when predictions.pkl is not available
+   - Slower but comprehensive analysis
 
 Usage:
-    # Direct supervised evaluation (recommended)
-    python src/evaluate_transformer.py --log-type wp-error --direct
-    
-    # Legacy full TFRecord evaluation (not recommended)
-    python src/evaluate_transformer.py --log-type wp-access
+    # Automatic evaluation (detects best method)
+    python src/evaluate_transformer.py --log-type wp-error
     
     # Using specific model path
-    python src/evaluate_transformer.py --log-type wp-error --model-path models/transformer_wp-error.pth --direct
+    python src/evaluate_transformer.py --log-type wp-error --model-path models/transformer_wp-error.pth
 """
 
 import argparse
@@ -851,8 +848,7 @@ def main():
                        help="Output directory for results")
     parser.add_argument("--training-time", type=float, default=0.0,
                        help="Training time in seconds (for reporting)")
-    parser.add_argument("--direct", action="store_true",
-                       help="Use direct supervised evaluation from predictions.pkl file")
+
     
     args = parser.parse_args()
     
@@ -864,42 +860,48 @@ def main():
     print(f"Log type: {args.log_type}")
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
-    print(f"Method: {'Direct Supervised' if args.direct else 'Full TFRecord Evaluation'}")
-    print("")
     
     # Initialize evaluator
     evaluator = TransformerEvaluator(config)
     
+    # Auto-detect best evaluation method
+    predictions_file = Path(f"results/{args.log_type}/predictions.pkl")
+    use_direct = predictions_file.exists()
+    
+    print(f"Method: {'Direct Supervised (predictions.pkl found)' if use_direct else 'Model-based Evaluation (fallback)'}")
+    print("")
+    
     try:
-        if args.direct:
+        if use_direct:
             # Use direct supervised evaluation from predictions.pkl
             print("🎯 Using Direct Supervised Evaluation")
             print("=" * 50)
-            print("This method loads predictions.pkl and applies sklearn metrics directly")
+            print("Found predictions.pkl - applying sklearn metrics directly")
             print("")
             
             results = evaluator.evaluate_direct_supervised(args.log_type)
             
             if results is None:
                 print(f"❌ Direct supervised evaluation failed")
-                return
-            
-            # Save results
-            output_dir = Path(args.output_dir) / args.log_type
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            results_path = output_dir / f"direct_supervised_results_{args.log_type}_{config.node_name}_{config.job_id}.pkl"
-            with open(results_path, 'wb') as f:
-                pickle.dump(results, f)
-            
-            print(f"\n💾 Results saved to: {results_path}")
-            print(f"✅ Direct supervised evaluation completed for {args.log_type}")
-            
-        else:
-            # Use original complex evaluation method
-            print("🔄 Using Full TFRecord Evaluation")
+                print(f"Falling back to model-based evaluation...")
+                use_direct = False
+            else:
+                # Save results
+                output_dir = Path(args.output_dir) / args.log_type
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                results_path = output_dir / f"direct_supervised_results_{args.log_type}_{config.node_name}_{config.job_id}.pkl"
+                with open(results_path, 'wb') as f:
+                    pickle.dump(results, f)
+                
+                print(f"\n💾 Results saved to: {results_path}")
+                print(f"✅ Direct supervised evaluation completed for {args.log_type}")
+        
+        if not use_direct:
+            # Use model-based evaluation method
+            print("🔄 Using Model-based Evaluation")
             print("=" * 50)
-            print("This method loads TFRecord data and performs clustering-based evaluation")
+            print("No predictions.pkl found - generating predictions from trained model")
             print("")
             
             # Find model path
@@ -917,13 +919,12 @@ def main():
             # Load trained model
             model, training_classes, model_input_dim = evaluator.load_trained_model(model_path, args.log_type)
             
-            # Load transformer embeddings generated for full dataset
-            embeddings, classes, true_labels = evaluator.load_transformer_embeddings_and_metadata(args.log_type)
+            # Load TFRecord dataset and generate predictions
+            embeddings, classes, true_labels = evaluator.load_tfrecord_dataset(args.log_type, model_input_dim)
             
             if embeddings is None:
-                print(f"❌ Could not load transformer embeddings for {args.log_type}")
-                print(f"   Full dataset embeddings are no longer generated during training.")
-                print(f"   Use direct evaluation instead: python src/evaluate_transformer.py --log-type {args.log_type} --direct")
+                print(f"❌ Could not load TFRecord dataset for {args.log_type}")
+                print(f"   Please ensure TFRecord files exist in processed/{args.log_type}/")
                 return
             
             # Check class compatibility
@@ -946,10 +947,58 @@ def main():
                             new_true_labels[:, i] = true_labels[:, orig_idx]
                     true_labels = new_true_labels
             
-            print(f"📊 Dataset loaded: {len(embeddings):,} samples vs {len(training_classes)} training classes")
+            print(f"📊 Dataset loaded: {len(embeddings):,} samples")
             
-            # Evaluate transformer embeddings
-            results = evaluator.evaluate_transformer_embeddings(embeddings, true_labels, classes)
+            # Generate predictions using the trained model
+            print(f"🤖 Generating predictions from trained model...")
+            model.eval()
+            device = torch.device(config.device)
+            
+            predictions = []
+            probs = []
+            batch_size = 64
+            
+            with torch.no_grad():
+                for i in range(0, len(embeddings), batch_size):
+                    batch = torch.from_numpy(embeddings[i:i+batch_size]).float().to(device)
+                    logits = model(batch)['labels']
+                    batch_probs = torch.sigmoid(logits).cpu().numpy()
+                    batch_preds = (batch_probs >= 0.5).astype(int)
+                    
+                    probs.append(batch_probs)
+                    predictions.append(batch_preds)
+            
+            probs = np.vstack(probs)
+            predictions = np.vstack(predictions)
+            
+            print(f"✅ Generated predictions for {len(predictions):,} samples")
+            
+            # Calculate metrics using the same method as direct evaluation
+            if true_labels is not None:
+                # We have true labels - do supervised evaluation
+                results = {
+                    'metrics': evaluator._calculate_metrics(true_labels, predictions, probs, classes, 
+                                                          evaluator._optimize_thresholds(true_labels, probs)),
+                    'predictions': predictions,
+                    'probabilities': probs,
+                    'true_labels': true_labels,
+                    'ids': np.arange(len(predictions))
+                }
+                
+                # Print results similar to direct evaluation
+                metrics = results['metrics']
+                print(f"\n📊 MODEL-BASED EVALUATION RESULTS")
+                print("=" * 60)
+                print(f"Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
+                print(f"Hamming Loss:     {metrics['hamming_loss']:.4f}")
+                print(f"Micro F1:         {metrics['micro_f1']:.4f}")
+                print(f"Macro F1:         {metrics['macro_f1']:.4f}")
+                print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
+                print(f"Samples F1:       {metrics['samples_f1']:.4f}")
+                
+            else:
+                # No true labels - do unsupervised evaluation
+                results = evaluator.evaluate_transformer_embeddings(embeddings, true_labels, classes)
             
             # Generate outputs
             output_dir = Path(args.output_dir) / args.log_type
@@ -957,7 +1006,7 @@ def main():
             evaluator.save_results(results, args.log_type, output_dir)
             evaluator.print_summary(results, args.log_type, args.training_time)
             
-            print(f"\n✅ Full evaluation completed for {args.log_type}")
+            print(f"\n✅ Model-based evaluation completed for {args.log_type}")
         
     except KeyboardInterrupt:
         print(f"\n⚠️  Evaluation interrupted")
