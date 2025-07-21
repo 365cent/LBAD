@@ -10,15 +10,16 @@ Evaluates trained transformer models using two methods:
    - Applies sklearn metrics directly to saved predictions
    - Fast and straightforward evaluation
    
-2. Full TFRecord Evaluation:
+2. Full TFRecord Evaluation (LEGACY):
    - Loads full TFRecord dataset and performs clustering-based evaluation
-   - More comprehensive but complex analysis
+   - Requires manually generated embeddings (no longer created during training)
+   - Use --direct method instead for better performance
 
 Usage:
     # Direct supervised evaluation (recommended)
     python src/evaluate_transformer.py --log-type wp-error --direct
     
-    # Full TFRecord evaluation
+    # Legacy full TFRecord evaluation (not recommended)
     python src/evaluate_transformer.py --log-type wp-access
     
     # Using specific model path
@@ -364,7 +365,8 @@ class TransformerEvaluator:
         
         if not transformer_dir.exists():
             print(f"❌ No transformer embeddings directory found: {transformer_dir}")
-            print(f"   Please run transformer training first: python src/transformer.py --log-type {log_type}")
+            print(f"   Full dataset embeddings are no longer generated during training.")
+            print(f"   Use direct evaluation instead: python src/evaluate_transformer.py --log-type {log_type} --direct")
             return None, None, None
         
         # Find the most recent transformer embeddings and metadata files
@@ -920,8 +922,8 @@ def main():
             
             if embeddings is None:
                 print(f"❌ Could not load transformer embeddings for {args.log_type}")
-                print(f"   Make sure transformer training completed successfully")
-                print(f"   Run training first: python src/transformer.py --log-type {args.log_type}")
+                print(f"   Full dataset embeddings are no longer generated during training.")
+                print(f"   Use direct evaluation instead: python src/evaluate_transformer.py --log-type {args.log_type} --direct")
                 return
             
             # Check class compatibility

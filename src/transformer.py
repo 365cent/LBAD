@@ -2709,166 +2709,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
 
 # Log type classifier function removed - each log file can only be one type
 
-def generate_embeddings_for_full_dataset(model: UnsupervisedMultiLabelTransformer, 
-                                        log_type: str, config: SystemConfig, 
-                                        tracker: ProgressTracker) -> Optional[Path]:
-    """
-    Generate embeddings for the full TFRecord dataset using the trained transformer.
-    This creates embeddings for ALL preprocessed logs for evaluation.
-    """
-    print(f"\n🔄 Generating transformer embeddings for full {log_type} dataset...")
-    
-    # Load full TFRecord dataset
-    processed_dir = Path("processed")
-    log_type_dir = processed_dir / log_type
-    
-    if not log_type_dir.exists():
-        print(f"⚠️  No TFRecord directory found for {log_type}")
-        return None
-    
-    tfrecord_files = list(log_type_dir.glob("*.tfrecord"))
-    if not tfrecord_files:
-        print(f"⚠️  No TFRecord files found for {log_type}")
-        return None
-    
-    print(f"📂 Found {len(tfrecord_files)} TFRecord files")
-    
-    try:
-        import tensorflow as tf
-        import json
-        
-        all_logs = []
-        all_labels_json = []
-        
-        for file_idx, file_path in enumerate(tfrecord_files):
-            print(f"   Loading file {file_idx+1}/{len(tfrecord_files)}: {file_path.name}")
-            
-            try:
-                dataset = tf.data.TFRecordDataset(str(file_path), compression_type="GZIP")
-                
-                for raw_record in dataset:
-                    feature_description = {
-                        'l': tf.io.FixedLenFeature([], tf.string),
-                        'y': tf.io.FixedLenFeature([], tf.string),
-                    }
-                    parsed = tf.io.parse_single_example(raw_record, feature_description)
-                    
-                    log_line = parsed['l'].numpy().decode('utf-8')
-                    labels_json = parsed['y'].numpy().decode('utf-8')
-                    
-                    all_logs.append(log_line)
-                    all_labels_json.append(labels_json)
-                    
-            except Exception as e:
-                print(f"   ⚠️  Error loading {file_path}: {e}")
-                continue
-        
-        if not all_logs:
-            print(f"❌ No data loaded from TFRecord files")
-            return None
-        
-        print(f"✅ Loaded {len(all_logs):,} log entries from TFRecord files")
-        
-        # Parse labels for metadata
-        all_labels_parsed = []
-        all_classes = set()
-        
-        for labels_json in all_labels_json:
-            try:
-                labels = json.loads(labels_json) if labels_json.strip() else []
-                if isinstance(labels, str):
-                    labels = [labels]
-                elif not isinstance(labels, list):
-                    labels = []
-                all_labels_parsed.append(labels)
-                all_classes.update(labels)
-            except (json.JSONDecodeError, TypeError):
-                all_labels_parsed.append([])
-        
-        classes = sorted(list(all_classes))
-        if not classes:
-            classes = ['normal']
-        
-        # Create binary label matrix
-        true_labels = np.zeros((len(all_logs), len(classes)), dtype=np.float32)
-        for i, labels in enumerate(all_labels_parsed):
-            for label in labels:
-                if label in classes:
-                    true_labels[i, classes.index(label)] = 1.0
-        
-        # Generate embeddings using the same method as training
-        print(f"🔄 Generating embeddings for {len(all_logs):,} logs...")
-        input_embeddings = generate_input_embeddings_for_logs(all_logs, model.input_dim, config.device)
-        
-        if input_embeddings is None:
-            print(f"❌ Failed to generate input embeddings")
-            return None
-        
-        # Generate transformer embeddings
-        print(f"🤖 Generating transformer embeddings...")
-        model.eval()
-        transformer_embeddings = []
-        batch_size = 64
-        
-        device = torch.device(config.device)
-        
-        with torch.no_grad():
-            for i in range(0, len(input_embeddings), batch_size):
-                batch = torch.from_numpy(input_embeddings[i:i+batch_size]).float().to(device)
-                
-                # Get latent embeddings from transformer
-                outputs = model(batch)
-                latent_embeddings = outputs['latent']  # Use latent representations
-                
-                transformer_embeddings.append(latent_embeddings.cpu().numpy())
-        
-        transformer_embeddings = np.vstack(transformer_embeddings).astype(np.float32)
-        
-        # Save transformer embeddings
-        output_dir = Path("embeddings") / f"{log_type}_transformer_full"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save embeddings
-        embeddings_path = output_dir / f"transformer_embeddings_{log_type}_{config.node_name}_{config.job_id}.pkl"
-        with open(embeddings_path, 'wb') as f:
-            pickle.dump(transformer_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        # Save metadata
-        metadata = {
-            'log_type': log_type,
-            'n_samples': len(all_logs),
-            'embedding_dim': transformer_embeddings.shape[1],
-            'classes': classes,
-            'true_labels': true_labels,
-            'raw_logs': all_logs,
-            'node_name': config.node_name,
-            'job_id': config.job_id,
-            'timestamp': time.time(),
-            'model_type': 'transformer_latent_embeddings'
-        }
-        
-        metadata_path = output_dir / f"metadata_{log_type}_{config.node_name}_{config.job_id}.pkl"
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        print(f"💾 Transformer embeddings saved to: {embeddings_path}")
-        print(f"📊 Dataset: {len(transformer_embeddings):,} samples × {transformer_embeddings.shape[1]}D embeddings")
-        print(f"📋 Metadata saved to: {metadata_path}")
-        
-        tracker.log_step("Transformer Embeddings Generation", {
-            "log_type": log_type,
-            "n_samples": len(transformer_embeddings),
-            "embedding_dim": transformer_embeddings.shape[1],
-            "n_classes": len(classes),
-            "output_path": str(embeddings_path)
-        })
-        
-        return embeddings_path
-        
-    except Exception as e:
-        print(f"❌ Error generating transformer embeddings: {e}")
-        return None
-
 
 def generate_input_embeddings_for_logs(logs: List[str], target_dim: int, device: str) -> Optional[np.ndarray]:
     """
@@ -4669,22 +4509,15 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
             with Halo(text=f"Saving model for {log_type}...", spinner='dots') as spinner:
                 model_path = save_model_after_training(model, classes, config, log_type, total_training_time)
                 spinner.succeed(f"Model saved successfully")
-            
-            # Generate embeddings for full dataset
-            with Halo(text=f"Generating embeddings for full {log_type} dataset...", spinner='dots') as spinner:
-                embeddings_path = generate_embeddings_for_full_dataset(model, log_type, config, tracker)
-                if embeddings_path:
-                    spinner.succeed(f"Full dataset embeddings generated")
-                else:
-                    spinner.fail(f"Failed to generate full dataset embeddings")
         
         tracker.log_step("Completion", {"status": "success", "training_time": total_training_time})
         print(f"✅ Completed processing {log_type}")
         print(f"📂 Outputs:")
-        print(f"   Model: models/transformer_{log_type}_{config.node_name}_{config.job_id}.pth") 
-        if config.rank == 0 and 'embeddings_path' in locals() and embeddings_path:
-            print(f"   Full dataset embeddings: {embeddings_path}")
-            print(f"   📊 Ready for unsupervised evaluation and downstream tasks")
+        print(f"   Model: models/transformer_{log_type}_{config.node_name}_{config.job_id}.pth")
+        print(f"   Predictions: results/{log_type}/predictions.pkl")
+        print(f"")
+        print(f"🎯 Next steps:")
+        print(f"   Direct evaluation: python src/evaluate_transformer.py --log-type {log_type} --direct")
         
     except KeyboardInterrupt:
         print(f"\n⚠️  Processing interrupted for {log_type}. Training checkpoint saved.")
