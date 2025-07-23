@@ -531,10 +531,28 @@ class TransformerEvaluator:
         return results_file
 
 
+def auto_detect_log_types() -> List[str]:
+    """Auto-detect available log types from embeddings directory"""
+    embeddings_dir = Path("embeddings")
+    if not embeddings_dir.exists():
+        return []
+    
+    log_types = []
+    for item in embeddings_dir.iterdir():
+        if item.is_dir() and not item.name.startswith('.'):
+            # Check if this log type has required files
+            log_file = item / f"log_{item.name}.pkl"
+            label_file = item / f"label_{item.name}.pkl"
+            if log_file.exists() and label_file.exists():
+                log_types.append(item.name)
+    
+    return sorted(log_types)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained transformer model")
-    parser.add_argument("--log-type", type=str, required=True, 
-                       help="Log type to evaluate (e.g., wp-access, wp-error)")
+    parser = argparse.ArgumentParser(description="Evaluate trained transformer model(s)")
+    parser.add_argument("--log-type", type=str, 
+                       help="Log type to evaluate (e.g., wp-access, wp-error). If not specified, evaluates all available types.")
     parser.add_argument("--model-path", type=str, 
                        help="Path to trained model (auto-detected if not provided)")
     parser.add_argument("--batch-size", type=int, default=64,
@@ -545,85 +563,131 @@ def main():
     # Detect system configuration
     config = detect_system_resources()
     
+    # Auto-detect log types if not specified
+    if args.log_type:
+        log_types = [args.log_type]
+    else:
+        log_types = auto_detect_log_types()
+        if not log_types:
+            print("❌ No valid log types found in embeddings directory!")
+            print("   Expected structure: embeddings/<log-type>/log_<log-type>.pkl and label_<log-type>.pkl")
+            return
+    
     print("🚀 Transformer Model Evaluation (Direct Supervised)")
     print("=" * 60)
-    print(f"Log type: {args.log_type}")
+    print(f"Log types to evaluate: {', '.join(log_types)}")
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
     print(f"Advanced threshold optimization: ENABLED (default)")
     print(f"📊 Dataset: Using FULL LogBERT embeddings (no sampling)")
     print("")
     
-    try:
-        # Initialize evaluator
-        evaluator = TransformerEvaluator(config)
+    all_results = {}
+    
+    for log_type in log_types:
+        print(f"\n{'='*60}")
+        print(f"🔍 EVALUATING: {log_type.upper()}")
+        print(f"{'='*60}")
         
-        # 1. Load trained model
-        model, model_classes, saved_scaler = evaluator.load_model(args.log_type, args.model_path)
-        
-        # 2. Load embeddings and true labels
-        X, y_true, data_classes = evaluator.load_embeddings_and_labels(args.log_type)
-        
-                # Verify class compatibility
-        if model_classes != data_classes:
-            print(f"⚠️  Class mismatch between model and data")
-            print(f"   Model classes: {model_classes}")
-            print(f"   Data classes: {data_classes}")
-            print(f"   Using model classes for evaluation")
-            classes = model_classes
+        try:
+            # Initialize evaluator
+            evaluator = TransformerEvaluator(config)
             
-            # Adjust true labels to match model classes if needed
-            if len(model_classes) != len(data_classes):
-                print(f"⚠️  Different number of classes, this may cause issues")
-        else:
-            print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
-            classes = model_classes
+            # 1. Load trained model
+            model, model_classes, saved_scaler = evaluator.load_model(log_type, args.model_path)
+            
+            # 2. Load embeddings and true labels
+            X, y_true, data_classes = evaluator.load_embeddings_and_labels(log_type)
+            
+            # Verify class compatibility
+            if model_classes != data_classes:
+                print(f"⚠️  Class mismatch between model and data")
+                print(f"   Model classes: {model_classes}")
+                print(f"   Data classes: {data_classes}")
+                print(f"   Using model classes for evaluation")
+                classes = model_classes
+                
+                # Adjust true labels to match model classes if needed
+                if len(model_classes) != len(data_classes):
+                    print(f"⚠️  Different number of classes, this may cause issues")
+            else:
+                print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
+                classes = model_classes
+            
+            # 3. Preprocess embeddings (same as training)
+            X_processed = evaluator.preprocess_embeddings(X, saved_scaler)
+            
+            # 4. Generate predictions
+            y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)
+            
+            # 5. Always optimize thresholds (default behavior)
+            optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
+            y_pred_optimized = (probs >= optimized_thresholds).astype(int)
+            
+            print(f"\n🎯 Using advanced optimized thresholds")
+            y_pred = y_pred_optimized
+            
+            # 6. Compute metrics
+            metrics = evaluator.compute_metrics(y_true, y_pred, probs, classes)
+            
+            # 7. Print results
+            evaluator.print_results(metrics, classes, y_true, y_pred)
+            
+            # 8. Save results
+            results_file = evaluator.save_results(
+                metrics, y_pred, probs, y_true, log_type, optimized_thresholds
+            )
+            
+            print(f"\n✅ Evaluation completed for {log_type}")
+            print(f"📁 Results saved to: {results_file}")
+            
+            # Store results for summary
+            all_results[log_type] = {
+                'metrics': metrics,
+                'classes': classes,
+                'results_file': results_file
+            }
+            
+            # Summary for this log type
+            print(f"\n🎯 SUMMARY FOR {log_type.upper()}")
+            print(f"   Macro F1:        {metrics['macro_f1']:.4f}")
+            print(f"   Micro F1:        {metrics['micro_f1']:.4f}")
+            print(f"   Label-wise Acc:  {metrics['label_wise_accuracy_micro']:.4f} (meaningful accuracy)")
+            print(f"   Subset Accuracy: {metrics['subset_accuracy']:.4f} (strict exact match)")
+            print(f"   Overall Correct: {metrics['overall_correct_labels']:.4f} (% labels correct)")
+            print("")
+            print(f"📈 INTERPRETATION:")
+            print(f"   • Your model correctly predicts ~{metrics['label_wise_accuracy_micro']*100:.1f}% of individual labels")
+            print(f"   • Only {metrics['subset_accuracy']*100:.1f}% of samples have ALL labels exactly right")
+            print(f"   • This is normal for multi-label problems - focus on F1 scores!")
+            
+        except Exception as e:
+            print(f"❌ Evaluation failed for {log_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Final summary across all log types
+    if len(all_results) > 1:
+        print(f"\n{'='*60}")
+        print(f"🎉 FINAL SUMMARY - ALL LOG TYPES")
+        print(f"{'='*60}")
         
-        # 3. Preprocess embeddings (same as training)
-        X_processed = evaluator.preprocess_embeddings(X, saved_scaler)
+        for log_type, result in all_results.items():
+            metrics = result['metrics']
+            print(f"\n📊 {log_type.upper()}:")
+            print(f"   Macro F1: {metrics['macro_f1']:.4f} | Micro F1: {metrics['micro_f1']:.4f}")
+            print(f"   Label-wise Accuracy: {metrics['label_wise_accuracy_micro']:.4f}")
+            print(f"   Classes: {len(result['classes'])}")
         
-        # 4. Generate predictions
-        y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)
-        
-        # 5. Always optimize thresholds (default behavior)
-        optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
-        y_pred_optimized = (probs >= optimized_thresholds).astype(int)
-        
-        print(f"\n🎯 Using advanced optimized thresholds")
-        y_pred = y_pred_optimized
-        
-        # 6. Compute metrics
-        metrics = evaluator.compute_metrics(y_true, y_pred, probs, classes)
-        
-        # 7. Print results
-        evaluator.print_results(metrics, classes, y_true, y_pred)
-        
-        # 8. Save results
-        results_file = evaluator.save_results(
-            metrics, y_pred, probs, y_true, args.log_type, optimized_thresholds
-        )
-        
-        print(f"\n✅ Evaluation completed for {args.log_type}")
-        print(f"📁 Results saved to: {results_file}")
-        
-        # Summary
-        print(f"\n🎯 SUMMARY")
-        print(f"   Macro F1:        {metrics['macro_f1']:.4f}")
-        print(f"   Micro F1:        {metrics['micro_f1']:.4f}")
-        print(f"   Label-wise Acc:  {metrics['label_wise_accuracy_micro']:.4f} (meaningful accuracy)")
-        print(f"   Subset Accuracy: {metrics['subset_accuracy']:.4f} (strict exact match)")
-        print(f"   Overall Correct: {metrics['overall_correct_labels']:.4f} (% labels correct)")
-        print("")
-        print(f"📈 INTERPRETATION:")
-        print(f"   • Your model correctly predicts ~{metrics['label_wise_accuracy_micro']*100:.1f}% of individual labels")
-        print(f"   • Only {metrics['subset_accuracy']*100:.1f}% of samples have ALL labels exactly right")
-        print(f"   • This is normal for multi-label problems - focus on F1 scores!")
-        print(f"   • Per-class F1 scores show the model works well for 3/4 classes")
-        
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n✅ Evaluated {len(all_results)} log types successfully!")
+        print(f"📁 All results saved to respective results/ subdirectories")
+    
+    elif len(all_results) == 1:
+        log_type = list(all_results.keys())[0]
+        print(f"\n✅ Successfully evaluated {log_type}")
+    else:
+        print(f"\n❌ No evaluations completed successfully")
 
 
 if __name__ == "__main__":
