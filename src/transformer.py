@@ -622,15 +622,11 @@ def generate_reconstruction_anomaly_scores(model: nn.Module, embeddings: torch.T
 
 def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes: List[str]) -> np.ndarray:
     """
-    Enhanced per-class threshold optimization for highly imbalanced multi-label classification.
+    Accuracy-focused threshold optimization for multi-label classification.
     
-    Implements multiple strategies for maximum F1 performance on minor classes:
-    1. Ultra-fine-grained F1-based optimization with extensive search
-    2. Precision-Recall curve analysis for rare classes  
-    3. Class imbalance-aware threshold selection with minor class boost
-    4. Support-weighted threshold adjustment with confidence scoring
-    5. Statistical significance testing and cross-validation
-    6. Minor class focus: special handling for classes with <1% samples
+    Prioritizes subset accuracy while maintaining F1 performance.
+    Based on research showing that accuracy improvements require joint optimization
+    of label combinations rather than individual class thresholds.
     
     Args:
         y_true: True binary labels (n_samples, n_classes)
@@ -638,249 +634,147 @@ def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes:
         classes: List of class names
     
     Returns:
-        Optimized thresholds array (n_classes,) for maximum F1 on minor classes
+        Optimized thresholds array (n_classes,) prioritizing accuracy
     """
-    from sklearn.metrics import f1_score, precision_recall_curve, balanced_accuracy_score, roc_curve, auc
-    from scipy import stats
+    from sklearn.metrics import f1_score, balanced_accuracy_score
     
     n_classes = len(classes)
-    optimized_thresholds = np.zeros(n_classes)
-    threshold_details = []
+    n_samples = len(y_true)
     
-    print(f"🎯 Enhanced threshold optimization for {n_classes} classes...")
-    print(f"   Focus: Maximum F1 performance on minor/rare classes")
+    print(f"🎯 Accuracy-focused threshold optimization for {n_classes} classes")
     
-    for i, cls in enumerate(classes):
-        y_true_class = y_true[:, i]
-        probs_class = probs[:, i]
-        
+    # Strategy 1: Class-specific optimization with accuracy weighting
+    print(f"📊 Phase 1: Class-specific accuracy optimization...")
+    base_thresholds = np.full(n_classes, 0.5)
+    
+    for class_idx in range(n_classes):
+        y_true_class = y_true[:, class_idx]
+        probs_class = probs[:, class_idx]
         pos_samples = y_true_class.sum()
-        total_samples = len(y_true_class)
-        pos_rate = pos_samples / total_samples
+        pos_ratio = pos_samples / len(y_true_class)
         
-        # Classify class rarity
         if pos_samples == 0:
-            # No positive samples - use very high threshold to minimize false positives
-            optimized_thresholds[i] = 0.98
-            threshold_details.append({
-                'class': cls, 'strategy': 'no_positives', 'threshold': 0.98,
-                'pos_samples': 0, 'pos_rate': 0.0, 'expected_f1': 0.0
-            })
-            print(f"   {cls:<20} NO POS SAMPLES -> threshold: 0.98")
+            base_thresholds[class_idx] = 0.99
             continue
-            
-        elif pos_samples < 5:
-            # Ultra-rare classes (< 5 samples) - Maximum recall focus
-            print(f"   {cls:<20} ULTRA-RARE ({pos_samples} samples) - maximizing recall...")
-            
-            # Use all possible thresholds from the actual prediction values
-            unique_thresholds = np.unique(probs_class)
-            unique_thresholds = np.append(unique_thresholds, [0.01, 0.05, 0.1])  # Add conservative options
-            unique_thresholds = np.sort(unique_thresholds)
-            
-            best_f1 = 0
-            best_threshold = 0.1  # Very conservative default
-            
-            for threshold in unique_thresholds:
-                if threshold <= 0.95:  # Don't use overly high thresholds for rare classes
-                    pred_class = (probs_class >= threshold).astype(int)
-                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                    
-                    # For ultra-rare classes, heavily favor recall
-                    recall = (pred_class * y_true_class).sum() / max(1, y_true_class.sum())
-                    precision = (pred_class * y_true_class).sum() / max(1, pred_class.sum())
-                    
-                    # Composite score favoring recall for ultra-rare classes
-                    if recall > 0:  # Only consider thresholds that achieve some recall
-                        composite_score = 0.8 * recall + 0.2 * precision
-                        if composite_score > best_f1:
-                            best_f1 = composite_score
-                            best_threshold = threshold
-            
-            # Ensure threshold isn't too high for ultra-rare classes
-            optimized_thresholds[i] = min(best_threshold, 0.3)
-            threshold_details.append({
-                'class': cls, 'strategy': 'ultra_rare_recall_focus', 'threshold': optimized_thresholds[i],
-                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_f1
-            })
-            
-        elif pos_samples < 50:
-            # Rare classes (5-50 samples) - Enhanced F1 optimization with minor class boost
-            print(f"   {cls:<20} RARE ({pos_samples} samples) - enhanced F1 optimization...")
-            
-            best_f1 = 0
-            best_threshold = 0.5
-            
-            # Ultra-fine search with 200 threshold candidates
-            search_thresholds = np.linspace(0.01, 0.95, 200)
-            f1_scores = []
-            
-            for threshold in search_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                f1_scores.append(f1)
-                
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_threshold = threshold
-            
-            # Statistical validation - find robust threshold region
-            f1_scores = np.array(f1_scores)
-            
-            # Find all thresholds within 98% of best F1 (more generous for rare classes)
-            good_threshold_mask = f1_scores >= (best_f1 * 0.98)
-            good_thresholds = search_thresholds[good_threshold_mask]
-            
-            if len(good_thresholds) > 1:
-                # Among good thresholds, prefer those with balanced precision/recall
-                balanced_scores = []
-                for thresh in good_thresholds:
-                    pred_class = (probs_class >= thresh).astype(int)
-                    
-                    recall = (pred_class * y_true_class).sum() / max(1, y_true_class.sum())
-                    precision = (pred_class * y_true_class).sum() / max(1, pred_class.sum())
-                    
-                    # For rare classes, slightly favor recall
-                    if recall > 0 and precision > 0:
-                        harmonic_mean = 2 * (precision * recall) / (precision + recall)
-                        recall_weighted_score = 0.6 * recall + 0.4 * precision
-                        balanced_scores.append(recall_weighted_score)
-                    else:
-                        balanced_scores.append(0)
-                
-                if balanced_scores and max(balanced_scores) > 0:
-                    best_balanced_idx = np.argmax(balanced_scores)
-                    optimized_thresholds[i] = good_thresholds[best_balanced_idx]
-                else:
-                    optimized_thresholds[i] = best_threshold
-            else:
-                optimized_thresholds[i] = best_threshold
-            
-            threshold_details.append({
-                'class': cls, 'strategy': 'rare_enhanced_f1', 'threshold': optimized_thresholds[i],
-                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_f1
-            })
-            
-        elif pos_samples < 500:
-            # Moderately rare classes (50-500 samples) - Comprehensive optimization
-            print(f"   {cls:<20} MODERATE ({pos_samples} samples) - comprehensive optimization...")
-            
-            best_score = 0
-            best_threshold = 0.5
-            
-            # Three-stage optimization: coarse -> fine -> ultra-fine
-            
-            # Stage 1: Coarse search
-            coarse_thresholds = np.linspace(0.05, 0.95, 50)
-            coarse_scores = []
-            
-            for threshold in coarse_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                
-                # Weighted combination favoring F1 for moderate classes
-                composite_score = 0.8 * f1 + 0.2 * bal_acc
-                coarse_scores.append(composite_score)
-                
-                if composite_score > best_score:
-                    best_score = composite_score
-                    best_threshold = threshold
-            
-            # Stage 2: Fine search around best coarse threshold
-            fine_range = 0.1
-            fine_start = max(0.01, best_threshold - fine_range)
-            fine_end = min(0.99, best_threshold + fine_range)
-            fine_thresholds = np.linspace(fine_start, fine_end, 50)
-            
-            for threshold in fine_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                
-                composite_score = 0.8 * f1 + 0.2 * bal_acc
-                
-                if composite_score > best_score:
-                    best_score = composite_score
-                    best_threshold = threshold
-            
-            # Stage 3: Ultra-fine search
-            ultra_fine_range = 0.05
-            ultra_fine_start = max(0.01, best_threshold - ultra_fine_range)
-            ultra_fine_end = min(0.99, best_threshold + ultra_fine_range)
-            ultra_fine_thresholds = np.linspace(ultra_fine_start, ultra_fine_end, 50)
-            
-            for threshold in ultra_fine_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                
-                composite_score = 0.8 * f1 + 0.2 * bal_acc
-                
-                if composite_score > best_score:
-                    best_score = composite_score
-                    best_threshold = threshold
-            
-            optimized_thresholds[i] = best_threshold
-            threshold_details.append({
-                'class': cls, 'strategy': 'moderate_comprehensive', 'threshold': optimized_thresholds[i],
-                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_score
-            })
-            
+        
+        best_score = 0
+        best_threshold = 0.5
+        
+        # Adaptive threshold range based on class frequency
+        if pos_ratio < 0.01:  # Rare classes like wpscan
+            thresh_range = np.linspace(0.05, 0.4, 30)
+        elif pos_ratio < 0.1:
+            thresh_range = np.linspace(0.1, 0.7, 35)
         else:
-            # Common classes (>= 500 samples) - Balanced optimization
-            print(f"   {cls:<20} COMMON ({pos_samples} samples) - balanced optimization...")
+            thresh_range = np.linspace(0.2, 0.8, 40)
+        
+        for thresh in thresh_range:
+            test_preds = (probs >= np.where(np.arange(n_classes) == class_idx, thresh, 0.5).reshape(1, -1)).astype(int)
             
-            best_score = 0
-            best_threshold = 0.5
+            # Subset accuracy (exact match)
+            subset_acc = np.mean(np.all(test_preds == y_true, axis=1))
             
-            # Coarse search
-            coarse_thresholds = np.linspace(0.1, 0.9, 30)
+            # Class F1 for balance
+            class_pred = (probs_class >= thresh).astype(int)
+            class_f1 = f1_score(y_true_class, class_pred, zero_division=0)
             
-            for threshold in coarse_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                
-                # More balanced weighting for common classes
-                composite_score = 0.7 * f1 + 0.3 * bal_acc
-                
-                if composite_score > best_score:
-                    best_score = composite_score
-                    best_threshold = threshold
+            # Combined score heavily favoring accuracy
+            combined_score = 0.8 * subset_acc + 0.2 * class_f1
             
-            # Fine search around best coarse threshold
-            fine_range = 0.1
-            fine_start = max(0.05, best_threshold - fine_range)
-            fine_end = min(0.95, best_threshold + fine_range)
-            fine_thresholds = np.linspace(fine_start, fine_end, 30)
-            
-            for threshold in fine_thresholds:
-                pred_class = (probs_class >= threshold).astype(int)
-                f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                
-                composite_score = 0.7 * f1 + 0.3 * bal_acc
-                
-                if composite_score > best_score:
-                    best_score = composite_score
-                    best_threshold = threshold
-            
-            optimized_thresholds[i] = best_threshold
-            threshold_details.append({
-                'class': cls, 'strategy': 'common_balanced', 'threshold': optimized_thresholds[i],
-                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_score
-            })
+            if combined_score > best_score:
+                best_score = combined_score
+                best_threshold = thresh
+        
+        base_thresholds[class_idx] = best_threshold
+        print(f"   {classes[class_idx]:<15} thresh: {best_threshold:.3f} (score: {best_score:.3f})")
     
-    # Print detailed summary
-    print(f"📊 Enhanced threshold optimization completed:")
-    print(f"   {'Class':<20} {'Strategy':<20} {'Samples':<8} {'Rate':<8} {'Threshold':<10} {'Exp.F1':<8}")
-    print(f"   {'-'*80}")
-    for detail in threshold_details:
-        print(f"   {detail['class']:<20} {detail['strategy']:<20} {detail['pos_samples']:<8} "
-              f"{detail['pos_rate']:<8.4f} {detail['threshold']:<10.3f} {detail['expected_f1']:<8.3f}")
+    # Strategy 2: Joint optimization for label patterns
+    print(f"📊 Phase 2: Joint optimization for common patterns...")
     
-    return optimized_thresholds
+    # Find frequent label combinations
+    unique_patterns, pattern_counts = np.unique(y_true, axis=0, return_counts=True)
+    pattern_frequencies = pattern_counts / len(y_true)
+    
+    # Focus on patterns with >1% frequency
+    important_patterns = unique_patterns[pattern_frequencies > 0.01]
+    important_freqs = pattern_frequencies[pattern_frequencies > 0.01]
+    
+    print(f"   Optimizing for {len(important_patterns)} common patterns...")
+    
+    refined_thresholds = base_thresholds.copy()
+    
+    for pattern, freq in zip(important_patterns, important_freqs):
+        # Find samples with this pattern
+        pattern_mask = np.all(y_true == pattern.reshape(1, -1), axis=1)
+        if pattern_mask.sum() < 20:  # Need sufficient samples
+            continue
+        
+        pattern_probs = probs[pattern_mask]
+        
+        # Test threshold adjustments for this pattern
+        best_pattern_acc = 0
+        best_adjustment = np.zeros(n_classes)
+        
+        for delta in [-0.15, -0.1, -0.05, 0.05, 0.1, 0.15]:
+            test_thresholds = np.clip(refined_thresholds + delta, 0.01, 0.99)
+            pattern_preds = (pattern_probs >= test_thresholds.reshape(1, -1)).astype(int)
+            pattern_acc = np.mean(np.all(pattern_preds == pattern.reshape(1, -1), axis=1))
+            
+            if pattern_acc > best_pattern_acc:
+                best_pattern_acc = pattern_acc
+                best_adjustment = delta * freq * 2.0  # Weight by frequency
+        
+        # Apply weighted adjustment
+        refined_thresholds += best_adjustment
+        refined_thresholds = np.clip(refined_thresholds, 0.01, 0.99)
+    
+    # Strategy 3: Global accuracy optimization
+    print(f"📊 Phase 3: Global accuracy fine-tuning...")
+    
+    best_global_acc = 0
+    final_thresholds = refined_thresholds.copy()
+    
+    # Test small global adjustments
+    for global_adj in [-0.1, -0.05, -0.02, 0.02, 0.05, 0.1]:
+        test_thresholds = np.clip(refined_thresholds + global_adj, 0.01, 0.99)
+        test_preds = (probs >= test_thresholds.reshape(1, -1)).astype(int)
+        
+        subset_acc = np.mean(np.all(test_preds == y_true, axis=1))
+        
+        if subset_acc > best_global_acc:
+            best_global_acc = subset_acc
+            final_thresholds = test_thresholds.copy()
+    
+    # Final validation
+    final_preds = (probs >= final_thresholds.reshape(1, -1)).astype(int)
+    final_subset_acc = np.mean(np.all(final_preds == y_true, axis=1))
+    
+    # Calculate per-class metrics
+    class_metrics = []
+    for i in range(n_classes):
+        y_true_class = y_true[:, i]
+        y_pred_class = final_preds[:, i]
+        
+        if y_true_class.sum() > 0:
+            f1 = f1_score(y_true_class, y_pred_class, zero_division=0)
+            tp = (y_pred_class * y_true_class).sum()
+            fp = (y_pred_class * (1 - y_true_class)).sum()
+            precision = tp / max(1, tp + fp)
+            recall = tp / max(1, y_true_class.sum())
+        else:
+            f1 = precision = recall = 0.0
+        
+        class_metrics.append((f1, precision, recall))
+        print(f"   {classes[i]:<15} F1: {f1:.3f} P: {precision:.3f} R: {recall:.3f} @ {final_thresholds[i]:.3f}")
+    
+    avg_f1 = np.mean([m[0] for m in class_metrics])
+    
+    print(f"✅ Accuracy optimization complete:")
+    print(f"   Subset accuracy: {final_subset_acc:.3f}")
+    print(f"   Average F1: {avg_f1:.3f}")
+    print(f"   Final thresholds: {[f'{t:.2f}' for t in final_thresholds]}")
+    
+    return final_thresholds
 
 # =============================================================================
 # Optimized Model Architecture
@@ -988,6 +882,25 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
                 nn.Linear(latent_dim // 2, n_labels)
             ) for _ in range(3)  # 3 branches for ensemble
         ])
+        
+        # Accuracy enhancement: Label combination predictor
+        # This helps predict common label patterns to improve subset accuracy
+        self.label_count_predictor = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim // 2, 1)  # Predict number of labels
+        )
+        
+        # Label interaction modeling for common patterns
+        self.label_interaction = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim, n_labels * n_labels),  # Pairwise interactions
+        )
         
         # Advanced cluster prediction with hierarchical clustering
         self.cluster_head = nn.Sequential(
@@ -1101,6 +1014,20 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         # Average ensemble predictions
         labels = torch.stack(branch_predictions, dim=0).mean(dim=0)
         
+        # Accuracy enhancement: Label count prediction for calibration
+        predicted_count = self.label_count_predictor(z_fused)
+        
+        # Label interaction modeling for common patterns
+        interaction_logits = self.label_interaction(z_fused)
+        interaction_matrix = interaction_logits.view(batch_size, self.n_labels, self.n_labels)
+        
+        # Apply interaction effects to label predictions
+        interaction_effect = torch.sigmoid(interaction_matrix)
+        label_interactions = torch.bmm(torch.sigmoid(labels).unsqueeze(1), interaction_effect).squeeze(1)
+        
+        # Combine predictions with interaction effects
+        labels = labels + 0.1 * label_interactions
+        
         # Apply label correlation matrix
         label_correlations = torch.sigmoid(self.label_correlation)
         labels = labels + 0.1 * torch.matmul(torch.sigmoid(labels), label_correlations)
@@ -1123,7 +1050,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             'clusters': clusters,
             'contrastive': z_contrastive,
             'prototype': z_prototype,  # Added for margin loss
-            'branch_predictions': branch_predictions  # For additional loss
+            'branch_predictions': branch_predictions,  # For additional loss
+            'predicted_count': predicted_count,  # For count calibration loss
+            'interaction_matrix': interaction_matrix  # For pattern learning
         }
 
 # =============================================================================
@@ -2935,6 +2864,123 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             
             tracker.log_metrics(epoch, unsupervised_metrics)
     
+    
+    # ACCURACY CALIBRATION PHASE - Address conservative prediction issue
+    if config.rank == 0 and true_labels is not None:
+        print(f"\n🎯 ACCURACY CALIBRATION PHASE")
+        print(f"="*60)
+        
+        # Analyze current prediction patterns
+        model.eval()
+        with torch.no_grad():
+            sample_size = min(1000, len(embeddings))
+            sample_indices = np.random.choice(len(embeddings), sample_size, replace=False)
+            sample_embeddings = torch.from_numpy(embeddings[sample_indices]).float().to(device)
+            sample_outputs = model(sample_embeddings)
+            sample_probs = torch.sigmoid(sample_outputs['labels']).cpu().numpy()
+            sample_true = true_labels[sample_indices]
+            
+            # Current prediction statistics
+            avg_pred_labels = sample_probs.sum(axis=1).mean()
+            avg_true_labels = sample_true.sum(axis=1).mean()
+            
+            print(f"📊 Current prediction patterns:")
+            print(f"   Avg predicted labels/sample: {avg_pred_labels:.2f}")
+            print(f"   Avg true labels/sample: {avg_true_labels:.2f}")
+            print(f"   Prediction ratio: {avg_pred_labels/avg_true_labels:.2f}")
+            
+            # If predictions are too conservative (< 80% of true labels), apply calibration
+            if avg_pred_labels < 0.8 * avg_true_labels:
+                print(f"🔧 Applying calibration for conservative predictions...")
+                
+                # Calibration training - focus on matching label count distribution
+                calibration_epochs = 5
+                calibration_optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=1e-5)
+                
+                # Create calibration dataset focusing on label count matching
+                cal_dataset = TensorDataset(
+                    torch.from_numpy(embeddings).float().contiguous(),
+                    torch.from_numpy(true_labels).float().contiguous()
+                )
+                
+                cal_dataloader = DataLoader(
+                    cal_dataset,
+                    batch_size=max(8, batch_size // 4),  # Smaller batches for calibration
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=False
+                )
+                
+                model.train()
+                
+                for cal_epoch in range(calibration_epochs):
+                    cal_losses = []
+                    
+                    for batch_idx, (x_batch, y_batch) in enumerate(cal_dataloader):
+                        try:
+                            x_batch = x_batch.to(device, non_blocking=False)
+                            y_batch = y_batch.to(device, non_blocking=False)
+                            
+                            calibration_optimizer.zero_grad()
+                            
+                            outputs = model(x_batch)
+                            predictions = torch.sigmoid(outputs['labels'])
+                            
+                            # Label count calibration loss
+                            pred_counts = predictions.sum(dim=1)
+                            true_counts = y_batch.sum(dim=1)
+                            count_loss = F.mse_loss(pred_counts, true_counts)
+                            
+                            # Standard label loss with reduced weight
+                            label_loss = F.binary_cross_entropy(predictions, y_batch)
+                            
+                            # Calibration loss emphasizing count matching
+                            total_cal_loss = 0.6 * count_loss + 0.4 * label_loss
+                            
+                            total_cal_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                            calibration_optimizer.step()
+                            
+                            cal_losses.append(total_cal_loss.item())
+                            
+                            # Memory cleanup
+                            if config.device == "cuda" and batch_idx % 10 == 0:
+                                clear_gpu_memory()
+                                
+                        except RuntimeError as e:
+                            if "out of memory" in str(e) or "misaligned address" in str(e):
+                                print(f"⚠️  Calibration batch {batch_idx} failed, skipping...")
+                                clear_gpu_memory()
+                                continue
+                            else:
+                                raise e
+                    
+                    if cal_losses:
+                        avg_cal_loss = np.mean(cal_losses)
+                        print(f"   Calibration Epoch {cal_epoch+1}/{calibration_epochs} - Loss: {avg_cal_loss:.4f}")
+                
+                # Verify calibration improvement
+                model.eval()
+                with torch.no_grad():
+                    post_cal_outputs = model(sample_embeddings)
+                    post_cal_probs = torch.sigmoid(post_cal_outputs['labels']).cpu().numpy()
+                    post_avg_pred = post_cal_probs.sum(axis=1).mean()
+                    
+                    print(f"✅ Calibration results:")
+                    print(f"   Before: {avg_pred_labels:.2f} labels/sample")
+                    print(f"   After:  {post_avg_pred:.2f} labels/sample")
+                    print(f"   Target: {avg_true_labels:.2f} labels/sample")
+                    print(f"   Improvement: {post_avg_pred - avg_pred_labels:+.2f}")
+            else:
+                print(f"✅ Prediction calibration already good (ratio: {avg_pred_labels/avg_true_labels:.2f})")
+        
+        tracker.log_step("Accuracy Calibration", {
+            "calibration_applied": avg_pred_labels < 0.8 * avg_true_labels if 'avg_true_labels' in locals() else False,
+            "avg_predicted_labels": float(avg_pred_labels) if 'avg_pred_labels' in locals() else 0.0,
+            "avg_true_labels": float(avg_true_labels) if 'avg_true_labels' in locals() else 0.0,
+            "prediction_ratio": float(avg_pred_labels/avg_true_labels) if 'avg_true_labels' in locals() and avg_true_labels > 0 else 0.0
+        })
+
     # ENHANCED MINOR CLASS TRAINING - Additional epochs focused on minor classes
     if config.rank == 0 and true_labels is not None:
         print(f"\n🎯 ENHANCED MINOR CLASS TRAINING")
