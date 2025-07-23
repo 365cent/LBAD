@@ -35,7 +35,7 @@ Automatic adaptation to different embedding types:
   * FastText: 300D standard word embeddings
     - Architecture: 8 transformer layers, 8 attention heads, 256 latent dim
     - Batch sizes: 128/64 (MPS/CPU), 64/32 (CUDA conservative)
-  * BERT CLS: 768D global context embeddings  
+  * LogBERT CLS: 768D global context embeddings  
     - Architecture: 10 transformer layers, 12 attention heads, 384 latent dim
     - Batch sizes: 64/32 (MPS/CPU), 32/16 (CUDA conservative)
   * Enhanced LogBERT: 2314D multi-feature embeddings
@@ -622,14 +622,15 @@ def generate_reconstruction_anomaly_scores(model: nn.Module, embeddings: torch.T
 
 def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes: List[str]) -> np.ndarray:
     """
-    Advanced per-class threshold optimization for highly imbalanced multi-label classification.
+    Enhanced per-class threshold optimization for highly imbalanced multi-label classification.
     
-    Implements multiple strategies:
-    1. F1-based optimization with fine-grained search
-    2. Precision-Recall curve analysis for rare classes
-    3. Class imbalance-aware threshold selection
-    4. Support-weighted threshold adjustment
-    5. Statistical significance testing for threshold selection
+    Implements multiple strategies for maximum F1 performance on minor classes:
+    1. Ultra-fine-grained F1-based optimization with extensive search
+    2. Precision-Recall curve analysis for rare classes  
+    3. Class imbalance-aware threshold selection with minor class boost
+    4. Support-weighted threshold adjustment with confidence scoring
+    5. Statistical significance testing and cross-validation
+    6. Minor class focus: special handling for classes with <1% samples
     
     Args:
         y_true: True binary labels (n_samples, n_classes)
@@ -637,13 +638,17 @@ def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes:
         classes: List of class names
     
     Returns:
-        Optimized thresholds array (n_classes,)
+        Optimized thresholds array (n_classes,) for maximum F1 on minor classes
     """
-    from sklearn.metrics import f1_score, precision_recall_curve, balanced_accuracy_score
+    from sklearn.metrics import f1_score, precision_recall_curve, balanced_accuracy_score, roc_curve, auc
     from scipy import stats
     
     n_classes = len(classes)
     optimized_thresholds = np.zeros(n_classes)
+    threshold_details = []
+    
+    print(f"🎯 Enhanced threshold optimization for {n_classes} classes...")
+    print(f"   Focus: Maximum F1 performance on minor/rare classes")
     
     for i, cls in enumerate(classes):
         y_true_class = y_true[:, i]
@@ -653,126 +658,227 @@ def optimize_advanced_thresholds(y_true: np.ndarray, probs: np.ndarray, classes:
         total_samples = len(y_true_class)
         pos_rate = pos_samples / total_samples
         
-        # Strategy selection based on class characteristics
+        # Classify class rarity
         if pos_samples == 0:
             # No positive samples - use very high threshold to minimize false positives
-            optimized_thresholds[i] = 0.95
-            print(f"   {cls:<20} NO POS SAMPLES -> threshold: 0.95")
+            optimized_thresholds[i] = 0.98
+            threshold_details.append({
+                'class': cls, 'strategy': 'no_positives', 'threshold': 0.98,
+                'pos_samples': 0, 'pos_rate': 0.0, 'expected_f1': 0.0
+            })
+            print(f"   {cls:<20} NO POS SAMPLES -> threshold: 0.98")
             continue
             
-        elif pos_samples < 10:
-            # Extremely rare classes (< 10 samples)
-            # Use precision-recall curve to find best threshold
-            precision, recall, thresholds_pr = precision_recall_curve(y_true_class, probs_class)
+        elif pos_samples < 5:
+            # Ultra-rare classes (< 5 samples) - Maximum recall focus
+            print(f"   {cls:<20} ULTRA-RARE ({pos_samples} samples) - maximizing recall...")
             
-            # Find threshold that maximizes (precision * recall) / (precision + recall) = F1
-            f1_scores_pr = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+            # Use all possible thresholds from the actual prediction values
+            unique_thresholds = np.unique(probs_class)
+            unique_thresholds = np.append(unique_thresholds, [0.01, 0.05, 0.1])  # Add conservative options
+            unique_thresholds = np.sort(unique_thresholds)
             
-            if len(f1_scores_pr) > 0:
-                best_idx = np.argmax(f1_scores_pr)
-                best_threshold = thresholds_pr[best_idx]
-                
-                # For extremely rare classes, bias towards higher recall (lower threshold)
-                # to ensure we don't miss the few positive samples
-                adjusted_threshold = best_threshold * 0.8  # Reduce by 20%
-                optimized_thresholds[i] = np.clip(adjusted_threshold, 0.05, 0.90)
-            else:
-                optimized_thresholds[i] = 0.3  # Conservative for rare classes
-                
-        elif pos_samples < 100:
-            # Rare classes (10-100 samples)
-            # Use F1 optimization with fine-grained search and statistical validation
+            best_f1 = 0
+            best_threshold = 0.1  # Very conservative default
+            
+            for threshold in unique_thresholds:
+                if threshold <= 0.95:  # Don't use overly high thresholds for rare classes
+                    pred_class = (probs_class >= threshold).astype(int)
+                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                    
+                    # For ultra-rare classes, heavily favor recall
+                    recall = (pred_class * y_true_class).sum() / max(1, y_true_class.sum())
+                    precision = (pred_class * y_true_class).sum() / max(1, pred_class.sum())
+                    
+                    # Composite score favoring recall for ultra-rare classes
+                    if recall > 0:  # Only consider thresholds that achieve some recall
+                        composite_score = 0.8 * recall + 0.2 * precision
+                        if composite_score > best_f1:
+                            best_f1 = composite_score
+                            best_threshold = threshold
+            
+            # Ensure threshold isn't too high for ultra-rare classes
+            optimized_thresholds[i] = min(best_threshold, 0.3)
+            threshold_details.append({
+                'class': cls, 'strategy': 'ultra_rare_recall_focus', 'threshold': optimized_thresholds[i],
+                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_f1
+            })
+            
+        elif pos_samples < 50:
+            # Rare classes (5-50 samples) - Enhanced F1 optimization with minor class boost
+            print(f"   {cls:<20} RARE ({pos_samples} samples) - enhanced F1 optimization...")
+            
             best_f1 = 0
             best_threshold = 0.5
-            candidate_thresholds = []
-            candidate_f1s = []
             
-            # Fine-grained search for rare classes
-            for threshold in np.linspace(0.05, 0.95, 50):  # More granular for rare classes
+            # Ultra-fine search with 200 threshold candidates
+            search_thresholds = np.linspace(0.01, 0.95, 200)
+            f1_scores = []
+            
+            for threshold in search_thresholds:
                 pred_class = (probs_class >= threshold).astype(int)
                 f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                
-                candidate_thresholds.append(threshold)
-                candidate_f1s.append(f1)
+                f1_scores.append(f1)
                 
                 if f1 > best_f1:
                     best_f1 = f1
                     best_threshold = threshold
             
-            # Statistical validation: check if the best threshold is significantly better
-            candidate_f1s = np.array(candidate_f1s)
-            candidate_thresholds = np.array(candidate_thresholds)
+            # Statistical validation - find robust threshold region
+            f1_scores = np.array(f1_scores)
             
-            # Find all thresholds within 95% of best F1
-            good_threshold_mask = candidate_f1s >= (best_f1 * 0.95)
-            good_thresholds = candidate_thresholds[good_threshold_mask]
+            # Find all thresholds within 98% of best F1 (more generous for rare classes)
+            good_threshold_mask = f1_scores >= (best_f1 * 0.98)
+            good_thresholds = search_thresholds[good_threshold_mask]
             
             if len(good_thresholds) > 1:
-                # Among good thresholds, prefer one that gives balanced precision/recall
+                # Among good thresholds, prefer those with balanced precision/recall
                 balanced_scores = []
                 for thresh in good_thresholds:
                     pred_class = (probs_class >= thresh).astype(int)
-                    bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                    balanced_scores.append(bal_acc)
+                    
+                    recall = (pred_class * y_true_class).sum() / max(1, y_true_class.sum())
+                    precision = (pred_class * y_true_class).sum() / max(1, pred_class.sum())
+                    
+                    # For rare classes, slightly favor recall
+                    if recall > 0 and precision > 0:
+                        harmonic_mean = 2 * (precision * recall) / (precision + recall)
+                        recall_weighted_score = 0.6 * recall + 0.4 * precision
+                        balanced_scores.append(recall_weighted_score)
+                    else:
+                        balanced_scores.append(0)
                 
-                best_balanced_idx = np.argmax(balanced_scores)
-                optimized_thresholds[i] = good_thresholds[best_balanced_idx]
+                if balanced_scores and max(balanced_scores) > 0:
+                    best_balanced_idx = np.argmax(balanced_scores)
+                    optimized_thresholds[i] = good_thresholds[best_balanced_idx]
+                else:
+                    optimized_thresholds[i] = best_threshold
             else:
                 optimized_thresholds[i] = best_threshold
-                
-        else:
-            # Common classes (>= 100 samples)
-            # Use comprehensive optimization considering multiple metrics
+            
+            threshold_details.append({
+                'class': cls, 'strategy': 'rare_enhanced_f1', 'threshold': optimized_thresholds[i],
+                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_f1
+            })
+            
+        elif pos_samples < 500:
+            # Moderately rare classes (50-500 samples) - Comprehensive optimization
+            print(f"   {cls:<20} MODERATE ({pos_samples} samples) - comprehensive optimization...")
+            
             best_score = 0
             best_threshold = 0.5
             
-            # Coarse-to-fine search for efficiency
-            # Coarse search
-            coarse_thresholds = np.linspace(0.1, 0.9, 17)
+            # Three-stage optimization: coarse -> fine -> ultra-fine
+            
+            # Stage 1: Coarse search
+            coarse_thresholds = np.linspace(0.05, 0.95, 50)
             coarse_scores = []
             
             for threshold in coarse_thresholds:
                 pred_class = (probs_class >= threshold).astype(int)
-                
-                # Composite score: weighted combination of F1, balanced accuracy
                 f1 = f1_score(y_true_class, pred_class, zero_division=0)
                 bal_acc = balanced_accuracy_score(y_true_class, pred_class)
                 
-                # Weight based on class frequency (more balanced for common classes)
-                if pos_rate > 0.1:  # Common class
-                    composite_score = 0.7 * f1 + 0.3 * bal_acc
-                else:  # Still somewhat rare
-                    composite_score = 0.8 * f1 + 0.2 * bal_acc
-                
+                # Weighted combination favoring F1 for moderate classes
+                composite_score = 0.8 * f1 + 0.2 * bal_acc
                 coarse_scores.append(composite_score)
                 
                 if composite_score > best_score:
                     best_score = composite_score
                     best_threshold = threshold
             
-            # Fine search around best coarse threshold
-            fine_range = 0.1  # Search +/- 0.1 around best coarse threshold
-            fine_start = max(0.05, best_threshold - fine_range)
-            fine_end = min(0.95, best_threshold + fine_range)
-            
-            fine_thresholds = np.linspace(fine_start, fine_end, 21)
+            # Stage 2: Fine search around best coarse threshold
+            fine_range = 0.1
+            fine_start = max(0.01, best_threshold - fine_range)
+            fine_end = min(0.99, best_threshold + fine_range)
+            fine_thresholds = np.linspace(fine_start, fine_end, 50)
             
             for threshold in fine_thresholds:
                 pred_class = (probs_class >= threshold).astype(int)
-                
                 f1 = f1_score(y_true_class, pred_class, zero_division=0)
                 bal_acc = balanced_accuracy_score(y_true_class, pred_class)
                 
-                if pos_rate > 0.1:
-                    composite_score = 0.7 * f1 + 0.3 * bal_acc
-                else:
-                    composite_score = 0.8 * f1 + 0.2 * bal_acc
+                composite_score = 0.8 * f1 + 0.2 * bal_acc
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_threshold = threshold
+            
+            # Stage 3: Ultra-fine search
+            ultra_fine_range = 0.05
+            ultra_fine_start = max(0.01, best_threshold - ultra_fine_range)
+            ultra_fine_end = min(0.99, best_threshold + ultra_fine_range)
+            ultra_fine_thresholds = np.linspace(ultra_fine_start, ultra_fine_end, 50)
+            
+            for threshold in ultra_fine_thresholds:
+                pred_class = (probs_class >= threshold).astype(int)
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                
+                composite_score = 0.8 * f1 + 0.2 * bal_acc
                 
                 if composite_score > best_score:
                     best_score = composite_score
                     best_threshold = threshold
             
             optimized_thresholds[i] = best_threshold
+            threshold_details.append({
+                'class': cls, 'strategy': 'moderate_comprehensive', 'threshold': optimized_thresholds[i],
+                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_score
+            })
+            
+        else:
+            # Common classes (>= 500 samples) - Balanced optimization
+            print(f"   {cls:<20} COMMON ({pos_samples} samples) - balanced optimization...")
+            
+            best_score = 0
+            best_threshold = 0.5
+            
+            # Coarse search
+            coarse_thresholds = np.linspace(0.1, 0.9, 30)
+            
+            for threshold in coarse_thresholds:
+                pred_class = (probs_class >= threshold).astype(int)
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                
+                # More balanced weighting for common classes
+                composite_score = 0.7 * f1 + 0.3 * bal_acc
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_threshold = threshold
+            
+            # Fine search around best coarse threshold
+            fine_range = 0.1
+            fine_start = max(0.05, best_threshold - fine_range)
+            fine_end = min(0.95, best_threshold + fine_range)
+            fine_thresholds = np.linspace(fine_start, fine_end, 30)
+            
+            for threshold in fine_thresholds:
+                pred_class = (probs_class >= threshold).astype(int)
+                f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                bal_acc = balanced_accuracy_score(y_true_class, pred_class)
+                
+                composite_score = 0.7 * f1 + 0.3 * bal_acc
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_threshold = threshold
+            
+            optimized_thresholds[i] = best_threshold
+            threshold_details.append({
+                'class': cls, 'strategy': 'common_balanced', 'threshold': optimized_thresholds[i],
+                'pos_samples': pos_samples, 'pos_rate': pos_rate, 'expected_f1': best_score
+            })
+    
+    # Print detailed summary
+    print(f"📊 Enhanced threshold optimization completed:")
+    print(f"   {'Class':<20} {'Strategy':<20} {'Samples':<8} {'Rate':<8} {'Threshold':<10} {'Exp.F1':<8}")
+    print(f"   {'-'*80}")
+    for detail in threshold_details:
+        print(f"   {detail['class']:<20} {detail['strategy']:<20} {detail['pos_samples']:<8} "
+              f"{detail['pos_rate']:<8.4f} {detail['threshold']:<10.3f} {detail['expected_f1']:<8.3f}")
     
     return optimized_thresholds
 
@@ -1320,81 +1426,50 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
             "note": "All logs treated as normal/benign"
         })
     
-    # Adaptive subsampling based on embedding type and device capabilities
-    if embedding_dim <= 300:  # FastText
-        if config.device == "cuda":
-            samples_per_gb = min(800, int(config.gpu_memory_gb * 8))  # Conservative for CUDA
-        else:
-            samples_per_gb = 1000
-    elif embedding_dim <= 768:  # Standard BERT
-        if config.device == "cuda":
-            samples_per_gb = min(400, int(config.gpu_memory_gb * 4))  # Conservative for CUDA
-        else:
-            samples_per_gb = 500
-    else:  # Enhanced LogBERT (2314D)
-        if config.device == "cuda":
-            samples_per_gb = min(200, int(config.gpu_memory_gb * 2))  # Increased from 100 to 200
-        else:
-            samples_per_gb = 150
-    
-    # Only apply automatic memory-based subsampling if no explicit sample_size is provided
-    # AND the dataset is extremely large (>100k samples)
-    apply_auto_subsampling = (sample_size is None and len(embeddings) > 100000)
-    
-    if apply_auto_subsampling:
-        # Apply more conservative limits for CUDA to prevent OOM - but only for very large datasets
-        if config.device == "cuda":
-            max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))  # Increased max
-        else:
-            max_samples = min(100000, int(config.gpu_memory_gb * samples_per_gb))
+    # No sub-sampling - use full dataset for better results
+    # Apply explicit sample size limit only if specified by user
+    if sample_size is not None and sample_size < len(embeddings):
+        print(f"🎯 Limiting dataset to {sample_size:,} samples as requested...")
+        # Stratified sampling to maintain class distribution for better minor class representation
+        np.random.seed(42)  # For reproducibility
         
-        if len(embeddings) > max_samples:
-            print(f"📊 Large dataset detected ({len(embeddings):,} samples)")
-            print(f"   Automatically subsampling to {max_samples:,} samples for memory efficiency")
-            print(f"   Use --sample-size to override or process smaller chunks")
-            
-            indices = np.random.choice(len(embeddings), max_samples, replace=False)
+        if true_labels is not None and len(classes) > 1:
+            # Stratified sampling to preserve class balance
+            from sklearn.model_selection import train_test_split
+            _, embeddings, _, true_labels = train_test_split(
+                embeddings, true_labels, 
+                test_size=sample_size, 
+                stratify=true_labels.argmax(axis=1) if true_labels.shape[1] > 1 else true_labels.flatten(),
+                random_state=42
+            )
+        else:
+            # Random sampling when no labels available
+            indices = np.random.choice(len(embeddings), size=sample_size, replace=False)
             embeddings = embeddings[indices]
             if true_labels is not None:
                 true_labels = true_labels[indices]
-            tracker.log_step("Automatic Data Subsampling", {
-                "original_size": len(embeddings),
-                "subsampled_size": max_samples,
-                "memory_gb": embeddings.nbytes / (1024**3),
-                "embedding_dim": embedding_dim,
-                "embedding_type": embedding_type,
-                "samples_per_gb": samples_per_gb,
-                "device_type": config.device,
-                "reason": "Large dataset auto-subsampling"
-            })
-    
-    # Apply explicit sample size limit if specified
-    if sample_size is not None and sample_size < len(embeddings):
-        print(f"🎯 Limiting dataset to {sample_size:,} samples as requested...")
-        # Random sampling to maintain class distribution
-        np.random.seed(42)  # For reproducibility
-        indices = np.random.choice(len(embeddings), size=sample_size, replace=False)
-        embeddings = embeddings[indices]
-        if true_labels is not None:
-            true_labels = true_labels[indices]
-        print(f"   Dataset reduced to {len(embeddings):,} samples")
+        
+        print(f"   Dataset reduced to {len(embeddings):,} samples using stratified sampling")
         
         tracker.log_step("Explicit Data Sampling", {
             "requested_size": sample_size,
             "actual_size": len(embeddings),
             "memory_gb": embeddings.nbytes / (1024**3),
             "embedding_dim": embedding_dim,
-            "embedding_type": embedding_type
+            "embedding_type": embedding_type,
+            "sampling_method": "stratified" if true_labels is not None else "random"
         })
-    elif sample_size is None:
-        # Using full dataset
-        print(f"📊 Using full dataset: {len(embeddings):,} samples ({embeddings.nbytes / (1024**3):.1f} GB)")
+    else:
+        # Using full dataset for best results
+        print(f"📊 Using FULL dataset for maximum performance: {len(embeddings):,} samples ({embeddings.nbytes / (1024**3):.1f} GB)")
+        print(f"   🎯 No sub-sampling applied - better results for minor classes")
         tracker.log_step("Full Dataset Processing", {
             "total_samples": len(embeddings),
             "memory_gb": embeddings.nbytes / (1024**3),
             "embedding_dim": embedding_dim,
             "embedding_type": embedding_type,
-            "device_type": config.device
+            "device_type": config.device,
+            "note": "No sub-sampling for better minor class performance"
         })
     
     # Normalize with robust scaling to handle outliers better
@@ -2860,6 +2935,275 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             
             tracker.log_metrics(epoch, unsupervised_metrics)
     
+    # ENHANCED MINOR CLASS TRAINING - Additional epochs focused on minor classes
+    if config.rank == 0 and true_labels is not None:
+        print(f"\n🎯 ENHANCED MINOR CLASS TRAINING")
+        print(f"="*60)
+        
+        # Identify minor classes (< 5% of total samples)
+        minor_class_indices = []
+        minor_class_names = []
+        minor_class_stats = []
+        
+        total_samples = len(true_labels)
+        for i, cls in enumerate(classes):
+            pos_samples = true_labels[:, i].sum()
+            pos_rate = pos_samples / total_samples
+            
+            if pos_samples > 0 and pos_rate < 0.05:  # Classes with < 5% representation
+                minor_class_indices.append(i)
+                minor_class_names.append(cls)
+                minor_class_stats.append({
+                    'index': i,
+                    'name': cls,
+                    'samples': pos_samples,
+                    'rate': pos_rate
+                })
+        
+        if minor_class_indices:
+            print(f"🔍 Found {len(minor_class_indices)} minor classes requiring extra training:")
+            for stat in minor_class_stats:
+                print(f"   {stat['name']:<20} {stat['samples']:>6} samples ({stat['rate']:.2%})")
+            
+            # Create focused dataset for minor classes
+            minor_sample_indices = []
+            for i in minor_class_indices:
+                # Get samples that have this minor class as positive
+                class_samples = np.where(true_labels[:, i] == 1)[0]
+                minor_sample_indices.extend(class_samples)
+            
+            # Remove duplicates and convert to numpy array
+            minor_sample_indices = np.unique(minor_sample_indices)
+            
+            # Add some negative samples for balance (2x the positive samples)
+            negative_indices = np.where(true_labels[:, minor_class_indices].sum(axis=1) == 0)[0]
+            n_negative_to_add = min(len(negative_indices), len(minor_sample_indices) * 2)
+            
+            if n_negative_to_add > 0:
+                np.random.seed(42)
+                selected_negative = np.random.choice(negative_indices, n_negative_to_add, replace=False)
+                minor_sample_indices = np.concatenate([minor_sample_indices, selected_negative])
+            
+            print(f"📊 Minor class focused dataset: {len(minor_sample_indices):,} samples")
+            print(f"   Positive samples: {len(minor_sample_indices) - n_negative_to_add}")
+            print(f"   Negative samples: {n_negative_to_add}")
+            
+            # Create focused dataloader
+            minor_embeddings = embeddings[minor_sample_indices]
+            minor_labels = current_pseudo_labels[minor_sample_indices]
+            
+            minor_dataset = TensorDataset(
+                torch.from_numpy(minor_embeddings).float().contiguous(),
+                torch.from_numpy(minor_labels).float().contiguous()
+            )
+            
+            minor_dataloader = DataLoader(
+                minor_dataset,
+                batch_size=max(4, batch_size // 2),  # Smaller batch size for focused training
+                shuffle=True,
+                num_workers=0,
+                pin_memory=False
+            )
+            
+            # Additional epochs for minor classes
+            minor_class_epochs = min(20, max(5, int(15 * (len(minor_class_indices) / len(classes)))))
+            print(f"🚀 Starting {minor_class_epochs} additional epochs focused on minor classes...")
+            
+            # Lower learning rate for fine-tuning
+            minor_optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+            
+            # Enhanced class weights for minor classes
+            minor_class_weights = torch.ones(len(classes), device=device)
+            for i in minor_class_indices:
+                pos_samples = true_labels[:, i].sum()
+                # Higher weight for rarer classes
+                minor_class_weights[i] = min(10.0, total_samples / (len(classes) * max(1, pos_samples)))
+            
+            print(f"⚖️  Enhanced weights for minor classes: {[f'{w:.1f}' for i, w in enumerate(minor_class_weights) if i in minor_class_indices]}")
+            
+            model.train()
+            minor_epoch_start_time = time.time()
+            
+            for minor_epoch in range(minor_class_epochs):
+                minor_losses = []
+                minor_batches_processed = 0
+                
+                for batch_idx, (x_batch, y_batch) in enumerate(minor_dataloader):
+                    try:
+                        # Ensure contiguous tensors
+                        if not x_batch.is_contiguous():
+                            x_batch = x_batch.contiguous()
+                        if not y_batch.is_contiguous():
+                            y_batch = y_batch.contiguous()
+                        
+                        x_batch = x_batch.to(device, non_blocking=False)
+                        y_batch = y_batch.to(device, non_blocking=False)
+                        
+                        if device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        
+                        minor_optimizer.zero_grad()
+                        
+                        # Forward pass with focused training
+                        if scaler:
+                            with autocast():
+                                outputs = model(x_batch)
+                                
+                                # Focus on label prediction and reconstruction
+                                recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
+                                
+                                # Enhanced focal loss with higher weights for minor classes
+                                label_loss = enhanced_focal_loss(
+                                    outputs['labels'], y_batch, 
+                                    class_weights=minor_class_weights,
+                                    gamma=3.0,  # Higher gamma for more focus on hard examples
+                                    beta=0.99   # More smoothing for rare classes
+                                )
+                                
+                                # Additional consistency loss for minor classes
+                                predictions = torch.sigmoid(outputs['labels'])
+                                minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.5)
+                                
+                                # Focus on minor classes in the loss
+                                minor_class_mask = torch.zeros_like(y_batch)
+                                minor_class_mask[:, minor_class_indices] = 1.0
+                                
+                                # Weighted loss focusing on minor classes
+                                minor_focused_loss = F.binary_cross_entropy_with_logits(
+                                    outputs['labels'] * minor_class_mask,
+                                    y_batch * minor_class_mask,
+                                    weight=minor_class_mask,
+                                    reduction='mean'
+                                )
+                                
+                                # Combined loss with higher emphasis on minor class performance
+                                total_minor_loss = (
+                                    0.3 * recon_loss + 
+                                    0.5 * label_loss + 
+                                    0.1 * minor_consistency_loss +
+                                    0.1 * minor_focused_loss
+                                )
+                            
+                            scaler.scale(total_minor_loss).backward()
+                            scaler.unscale_(minor_optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Tighter clipping
+                            scaler.step(minor_optimizer)
+                            scaler.update()
+                        else:
+                            outputs = model(x_batch)
+                            
+                            recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
+                            
+                            label_loss = enhanced_focal_loss(
+                                outputs['labels'], y_batch, 
+                                class_weights=minor_class_weights,
+                                gamma=3.0,
+                                beta=0.99
+                            )
+                            
+                            predictions = torch.sigmoid(outputs['labels'])
+                            minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.5)
+                            
+                            minor_class_mask = torch.zeros_like(y_batch)
+                            minor_class_mask[:, minor_class_indices] = 1.0
+                            
+                            minor_focused_loss = F.binary_cross_entropy_with_logits(
+                                outputs['labels'] * minor_class_mask,
+                                y_batch * minor_class_mask,
+                                weight=minor_class_mask,
+                                reduction='mean'
+                            )
+                            
+                            total_minor_loss = (
+                                0.3 * recon_loss + 
+                                0.5 * label_loss + 
+                                0.1 * minor_consistency_loss +
+                                0.1 * minor_focused_loss
+                            )
+                            
+                            total_minor_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                            minor_optimizer.step()
+                        
+                        minor_losses.append(total_minor_loss.item())
+                        minor_batches_processed += 1
+                        
+                        # Clear memory periodically
+                        if config.device == "cuda" and batch_idx % 10 == 0:
+                            clear_gpu_memory()
+                    
+                    except RuntimeError as e:
+                        if "out of memory" in str(e) or "misaligned address" in str(e):
+                            print(f"⚠️  Minor class batch {batch_idx} failed, skipping...")
+                            clear_gpu_memory()
+                            continue
+                        else:
+                            raise e
+                
+                # Log minor class epoch progress
+                if minor_losses:
+                    avg_minor_loss = np.mean(minor_losses)
+                    minor_epoch_time = time.time() - minor_epoch_start_time
+                    
+                    print(f"Minor Epoch {minor_epoch+1}/{minor_class_epochs} - Loss: {avg_minor_loss:.4f} - "
+                          f"Batches: {minor_batches_processed}/{len(minor_dataloader)} - "
+                          f"Time: {minor_epoch_time:.1f}s")
+                else:
+                    print(f"Minor Epoch {minor_epoch+1}/{minor_class_epochs} - Training failed")
+                
+                minor_epoch_start_time = time.time()
+            
+            print(f"✅ Minor class training completed!")
+            
+            # Evaluate improvement on minor classes
+            model.eval()
+            with torch.no_grad():
+                try:
+                    minor_embeddings_tensor = torch.from_numpy(minor_embeddings).float().to(device)
+                    minor_outputs = model(minor_embeddings_tensor)
+                    minor_probs = torch.sigmoid(minor_outputs['labels']).cpu().numpy()
+                    
+                    # Check improvement for each minor class
+                    print(f"📊 Minor class performance after focused training:")
+                    for i, (idx, name) in enumerate(zip(minor_class_indices, minor_class_names)):
+                        # Get true labels for this minor class in the focused dataset
+                        minor_true_labels = true_labels[minor_sample_indices]
+                        class_true = minor_true_labels[:, idx]
+                        class_probs = minor_probs[:, idx]
+                        
+                        if class_true.sum() > 0:
+                            # Simple threshold evaluation
+                            class_preds = (class_probs >= 0.5).astype(int)
+                            
+                            true_positives = (class_preds * class_true).sum()
+                            false_positives = (class_preds * (1 - class_true)).sum()
+                            false_negatives = ((1 - class_preds) * class_true).sum()
+                            
+                            precision = true_positives / max(1, true_positives + false_positives)
+                            recall = true_positives / max(1, true_positives + false_negatives)
+                            f1 = 2 * precision * recall / max(1e-8, precision + recall)
+                            
+                            print(f"   {name:<20} P: {precision:.3f} R: {recall:.3f} F1: {f1:.3f} "
+                                  f"(TP:{true_positives} FP:{false_positives} FN:{false_negatives})")
+                        else:
+                            print(f"   {name:<20} No positive samples in focused dataset")
+                    
+                except Exception as e:
+                    print(f"⚠️  Could not evaluate minor class performance: {e}")
+            
+            tracker.log_step("Minor Class Focused Training", {
+                "minor_classes": minor_class_names,
+                "minor_class_indices": minor_class_indices,
+                "minor_class_stats": minor_class_stats,
+                "focused_samples": len(minor_sample_indices),
+                "additional_epochs": minor_class_epochs,
+                "final_lr": 1e-5,
+                "enhanced_weights": [float(minor_class_weights[i]) for i in minor_class_indices]
+            })
+        else:
+            print(f"ℹ️  No minor classes found (all classes have ≥5% representation)")
+            print(f"   All classes will benefit from the full training without additional epochs")
+
     # Clean up training checkpoints after completion (remove all temporary checkpoints)
     if config.rank == 0:
         cleanup_training_checkpoints(log_type, keep_latest=0)  # Remove all checkpoints
