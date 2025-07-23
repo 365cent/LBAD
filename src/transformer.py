@@ -2306,11 +2306,25 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
             batch_start_time = time.time()
             
-            # Initialize default loss variables in case batch is skipped
+            # Initialize ALL loss variables to prevent undefined variable errors
             total_loss = torch.tensor(0.0, device=device)
             recon_loss = torch.tensor(0.0, device=device)
             label_loss = torch.tensor(0.0, device=device)
             supervised_loss = torch.tensor(0.0, device=device)
+            prototype_loss = torch.tensor(0.0, device=device)
+            cluster_loss = torch.tensor(0.0, device=device)
+            contrast_loss = torch.tensor(0.0, device=device)
+            mutual_loss = torch.tensor(0.0, device=device)
+            confidence_loss = torch.tensor(0.0, device=device)
+            ensemble_loss = torch.tensor(0.0, device=device)
+            multilabel_consistency = torch.tensor(0.0, device=device)
+            class_balance_loss = torch.tensor(0.0, device=device)
+            multilabel_contrastive = torch.tensor(0.0, device=device)
+            refined_label_loss = torch.tensor(0.0, device=device)
+            
+            # Initialize other variables
+            predictions = None
+            outputs = None
             
             try:
                 # Ensure tensors are contiguous before GPU transfer to avoid misalignment
@@ -2354,40 +2368,40 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     continue  # Skip this batch and continue with next
                 else:
                     raise batch_error
+            
+            optimizer.zero_grad()
+            
+            # Clear memory periodically during training for CUDA
+            if config.device == "cuda" and batch_idx % 20 == 0:
+                clear_gpu_memory()
+            
+            # UMTL Enhancement: Teacher predictions with weak augmentation
+            with torch.no_grad():
+                # Weak augmentation for teacher
+                x_weak = weak_augment(x_batch)
+                teacher_outputs = teacher(x_weak)
+                teacher_probs = torch.sigmoid(teacher_outputs['labels'])
                 
-                optimizer.zero_grad()
+                # Confidence mask for FixMatch-style training
+                max_probs = teacher_probs.max(dim=1).values
+                confidence_mask = (max_probs >= confidence_threshold).float()
                 
-                # Clear memory periodically during training for CUDA
-                if config.device == "cuda" and batch_idx % 20 == 0:
-                    clear_gpu_memory()
-                
-                # UMTL Enhancement: Teacher predictions with weak augmentation
-                with torch.no_grad():
-                    # Weak augmentation for teacher
-                    x_weak = weak_augment(x_batch)
-                    teacher_outputs = teacher(x_weak)
-                    teacher_probs = torch.sigmoid(teacher_outputs['labels'])
-                    
-                    # Confidence mask for FixMatch-style training
-                    max_probs = teacher_probs.max(dim=1).values
-                    confidence_mask = (max_probs >= confidence_threshold).float()
-                    
-                    # Create pseudo-labels from confident teacher predictions
-                    teacher_pseudo_labels = (teacher_probs >= confidence_threshold).float()
-                
-                # Only train on confident samples (FixMatch-style)
-                n_confident = confidence_mask.sum().item()
-                
-                if scaler:
-                    with autocast():
-                        try:
-                            # Strong augmentation for student
-                            x_strong = strong_augment(x_batch)
-                            outputs = model(x_strong)
-                        except torch.cuda.OutOfMemoryError:
-                            # Skip this batch and clear memory
-                            clear_gpu_memory()
-                            continue
+                # Create pseudo-labels from confident teacher predictions
+                teacher_pseudo_labels = (teacher_probs >= confidence_threshold).float()
+            
+            # Only train on confident samples (FixMatch-style)
+            n_confident = confidence_mask.sum().item()
+            
+            if scaler:
+                with autocast():
+                    try:
+                        # Strong augmentation for student
+                        x_strong = strong_augment(x_batch)
+                        outputs = model(x_strong)
+                    except torch.cuda.OutOfMemoryError:
+                        # Skip this batch and clear memory
+                        clear_gpu_memory()
+                        continue
                         
                         # Advanced multi-component loss with curriculum learning
                         recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
@@ -2540,15 +2554,15 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     # Update class prototypes
                     update_class_prototypes(model, outputs['prototype'], predictions)
                     
-                else:
-                    try:
-                        # Strong augmentation for student (same as scaler branch)
-                        x_strong = strong_augment(x_batch)
-                        outputs = model(x_strong)
-                    except torch.cuda.OutOfMemoryError:
-                        # Skip this batch and clear memory
-                        clear_gpu_memory()
-                        continue
+            else:
+                try:
+                    # Strong augmentation for student (same as scaler branch)
+                    x_strong = strong_augment(x_batch)
+                    outputs = model(x_strong)
+                except torch.cuda.OutOfMemoryError:
+                    # Skip this batch and clear memory
+                    clear_gpu_memory()
+                    continue
                     
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
@@ -2697,27 +2711,29 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     # Update class prototypes
                     update_class_prototypes(model, outputs['prototype'], predictions)
-                
+            
+            # Only add to epoch_losses if we successfully computed a loss and didn't skip the batch
+            if not torch.isnan(total_loss) and not torch.isinf(total_loss) and total_loss.item() > 0:
                 epoch_losses.append(total_loss.item())
-                
-                # Calculate batch processing time and update progress tracking
-                batch_time = time.time() - batch_start_time
-                
-                # Prepare loss info for progress display - safely handle undefined variables
-                loss_info = {
-                    'total': total_loss.item(),
-                }
-                
-                # Add individual loss components if they exist
-                if 'recon_loss' in locals() and recon_loss is not None:
-                    loss_info['recon'] = recon_loss.item()
-                if 'label_loss' in locals() and label_loss is not None:
-                    loss_info['label'] = label_loss.item()
-                if 'supervised_loss' in locals() and supervised_loss is not None:
-                    loss_info['sup'] = supervised_loss.item()
-                
-                # Update batch progress with detailed tracking
-                tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+            
+            # Calculate batch processing time and update progress tracking
+            batch_time = time.time() - batch_start_time
+            
+            # Prepare loss info for progress display - safely handle undefined variables
+            loss_info = {
+                'total': total_loss.item(),
+            }
+            
+            # Add individual loss components if they exist
+            if 'recon_loss' in locals() and recon_loss is not None:
+                loss_info['recon'] = recon_loss.item()
+            if 'label_loss' in locals() and label_loss is not None:
+                loss_info['label'] = label_loss.item()
+            if 'supervised_loss' in locals() and supervised_loss is not None:
+                loss_info['sup'] = supervised_loss.item()
+            
+            # Update batch progress with detailed tracking
+            tracker.update_batch_progress(batch_idx, batch_time, loss_info)
         
         scheduler.step()
         
