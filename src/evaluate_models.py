@@ -670,7 +670,7 @@ class ModelComparator:
         return y_pred_multilabel
     
     def compute_comparative_metrics(self, transformer_results: Dict, fanogan_results: Optional[Dict], 
-                                  classes: List[str]) -> Dict[str, Any]:
+                                  classes: List[str], log_type: str) -> Dict[str, Any]:
         """Compute comprehensive comparative metrics"""
         
         # Get transformer predictions and ground truth
@@ -687,55 +687,41 @@ class ModelComparator:
         # Handle empty arrays or wrong shapes
         if not hasattr(y_true, 'shape') or y_true.size == 0:
             print("⚠️  Warning: y_true is empty or invalid, attempting to reload from embeddings...")
-            # Try to reload ground truth from embeddings
+            # Try to reload ground truth from embeddings using the provided log_type
             try:
-                # Auto-detect log type from various sources
-                log_type = None
-                
-                # First try: check if log_type is in transformer_results
-                if 'log_type' in transformer_results:
-                    log_type = transformer_results['log_type']
-                
-                # Second try: extract from config if available
-                elif 'config' in transformer_results and 'log_type' in transformer_results['config']:
-                    log_type = transformer_results['config']['log_type']
-                
-                # Third try: infer from classes (e.g., wp-error_attack1 -> wp-error)
-                elif classes and len(classes) > 0:
-                    first_class = classes[0]
-                    if '_' in first_class:
-                        log_type = first_class.split('_')[0]
-                    elif 'wp-' in first_class:
-                        log_type = 'wp-error' if 'error' in first_class else 'wp-access'
-                
-                # Fourth try: check embeddings directory for available log types
-                if not log_type:
-                    embeddings_dir = Path("embeddings")
-                    if embeddings_dir.exists():
-                        available_log_types = [item.name for item in embeddings_dir.iterdir() 
-                                             if item.is_dir() and (item / f"log_{item.name}.pkl").exists()]
-                        if available_log_types:
-                            log_type = available_log_types[0]  # Use first available
-                            print(f"🔍 Auto-detected log type from embeddings: {log_type}")
-                
-                if not log_type:
-                    log_type = 'wp-error'  # Final fallback
-                    print(f"⚠️  Using fallback log type: {log_type}")
-                
                 embeddings_dir = Path("embeddings") / log_type
                 label_file = embeddings_dir / f"label_{log_type}.pkl"
                 
                 if label_file.exists():
+                    print(f"🔍 Loading ground truth from {label_file}...")
                     with open(label_file, 'rb') as f:
                         label_data = pickle.load(f)
                     y_true = label_data["vectors"]
                     print(f"✅ Reloaded y_true from {label_file}: {y_true.shape}")
                 else:
-                    raise FileNotFoundError(f"No label file found at {label_file}")
+                    print(f"⚠️  Label file not found at {label_file}, trying alternative detection...")
+                    
+                    # Alternative: try to find any label file in embeddings directory
+                    embeddings_base = Path("embeddings")
+                    if embeddings_base.exists():
+                        label_files = list(embeddings_base.glob("*/label_*.pkl"))
+                        if label_files:
+                            # Use the first available label file
+                            label_file = label_files[0]
+                            print(f"🔍 Using alternative label file: {label_file}")
+                            with open(label_file, 'rb') as f:
+                                label_data = pickle.load(f)
+                            y_true = label_data["vectors"]
+                            print(f"✅ Loaded y_true from alternative file: {y_true.shape}")
+                        else:
+                            raise FileNotFoundError("No label files found in embeddings directory")
+                    else:
+                        raise FileNotFoundError("Embeddings directory not found")
             except Exception as e:
                 print(f"❌ Could not reload ground truth: {e}")
                 # Create dummy ground truth (fallback)
                 if hasattr(transformer_pred, 'shape') and transformer_pred.size > 0:
+                    print(f"⚠️  Creating dummy ground truth - this will produce invalid metrics!")
                     y_true = np.zeros_like(transformer_pred)
                     print(f"⚠️  Using dummy ground truth with shape: {y_true.shape}")
                 else:
@@ -1171,7 +1157,7 @@ def main():
             
             # Compute comparison metrics
             comparison_metrics = comparator.compute_comparative_metrics(
-                transformer_results, fanogan_results, classes
+                transformer_results, fanogan_results, classes, log_type
             )
             
             # Print results
