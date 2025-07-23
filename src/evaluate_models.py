@@ -225,8 +225,12 @@ class ModelComparator:
             'classes': classes,
             'n_samples': len(y_true),
             'n_classes': len(classes),
+            'true_labels': y_true,
             'transformer': {
                 'metrics': transformer_results['metrics'],
+                'predictions': transformer_pred,
+                'probabilities': transformer_probs,
+                'optimized_thresholds': transformer_results.get('optimized_thresholds', []),
                 'available': True
             }
         }
@@ -241,7 +245,9 @@ class ModelComparator:
             comparison_metrics['fanogan'] = {
                 'metrics': fanogan_metrics,
                 'anomaly_metrics': fanogan_results['metrics'],  # Original anomaly detection metrics
-                'available': True
+                'available': True,
+                'predictions': fanogan_pred,  # Add predictions for saving
+                'scores': fanogan_scores      # Add scores for saving
             }
             
             # Direct comparison metrics
@@ -392,7 +398,8 @@ class ModelComparator:
             print("")
         
         # Comparison results
-        if comparison_metrics.get('comparison', {}).get('available', False):
+        if (comparison_metrics.get('comparison', {}).get('available', False) and 
+            comparison_metrics.get('fanogan', {}).get('available', False)):
             comp = comparison_metrics['comparison']
             print("🔄 MODEL COMPARISON:")
             print("-" * 50)
@@ -415,6 +422,8 @@ class ModelComparator:
                 print(f"{rank}. {model:<20} {score:.4f}")
             print("")
         
+        elif comparison_metrics.get('fanogan', {}).get('available', False):
+            print("ℹ️  Both models available but comparison disabled")
         else:
             print("ℹ️  Only transformer evaluation available (no comparison)")
     
@@ -431,6 +440,72 @@ class ModelComparator:
             pickle.dump(comparison_metrics, f)
         
         print(f"💾 Comparison results saved to: {results_file}")
+        
+        # Also save individual model results in transformer format for compatibility
+        saved_files = [results_file]
+        
+        # Save transformer results in standard format (if they exist)
+        if comparison_metrics['transformer']['available']:
+            transformer_file = self._save_transformer_format(comparison_metrics, log_type)
+            saved_files.append(transformer_file)
+        
+        # Save f-AnoGAN results in transformer-compatible format (if they exist) 
+        if comparison_metrics.get('fanogan', {}).get('available', False):
+            fanogan_file = self._save_fanogan_as_transformer_format(comparison_metrics, log_type)
+            saved_files.append(fanogan_file)
+        
+        return saved_files
+    
+    def _save_transformer_format(self, comparison_metrics: Dict[str, Any], log_type: str) -> Path:
+        """Save transformer results in standard evaluate_transformer.py format"""
+        
+        output_dir = Path("results") / log_type
+        t_metrics = comparison_metrics['transformer']['metrics']
+        
+        # Create transformer-format results
+        transformer_results = {
+            'metrics': t_metrics,
+            'predictions': comparison_metrics['transformer'].get('predictions', np.array([])),
+            'probabilities': comparison_metrics['transformer'].get('probabilities', np.array([])),
+            'true_labels': comparison_metrics['transformer'].get('true_labels', np.array([])),
+            'optimized_thresholds': comparison_metrics['transformer'].get('optimized_thresholds', []),
+            'evaluation_type': 'direct_supervised_transformer',
+            'config': self.config.__dict__,
+            'timestamp': time.time()
+        }
+        
+        results_file = output_dir / f"transformer_evaluation_{log_type}_{self.config.node_name}_{self.config.job_id}.pkl"
+        with open(results_file, 'wb') as f:
+            pickle.dump(transformer_results, f)
+        
+        print(f"💾 Transformer results saved to: {results_file}")
+        return results_file
+    
+    def _save_fanogan_as_transformer_format(self, comparison_metrics: Dict[str, Any], log_type: str) -> Path:
+        """Save f-AnoGAN multi-label results in transformer-compatible format"""
+        
+        output_dir = Path("results") / log_type
+        f_metrics = comparison_metrics['fanogan']['metrics']
+        
+        # Create transformer-format results from f-AnoGAN
+        fanogan_as_transformer = {
+            'metrics': f_metrics,
+            'predictions': comparison_metrics['fanogan'].get('predictions', np.array([])),
+            'probabilities': None,  # f-AnoGAN uses anomaly scores, not class probabilities
+            'anomaly_scores': comparison_metrics['fanogan'].get('scores', np.array([])),
+            'true_labels': comparison_metrics.get('true_labels', np.array([])),
+            'evaluation_type': 'fanogan_as_multilabel_classifier',
+            'original_anomaly_metrics': comparison_metrics['fanogan']['anomaly_metrics'],
+            'config': self.config.__dict__,
+            'timestamp': time.time(),
+            'note': 'f-AnoGAN results converted to multi-label format for comparison'
+        }
+        
+        results_file = output_dir / f"fanogan_as_transformer_{log_type}_{self.config.node_name}_{self.config.job_id}.pkl"
+        with open(results_file, 'wb') as f:
+            pickle.dump(fanogan_as_transformer, f)
+        
+        print(f"💾 f-AnoGAN (as transformer) results saved to: {results_file}")
         return results_file
 
 
@@ -511,10 +586,12 @@ def main():
         comparator.print_comparison_results(comparison_metrics)
         
         # Save results
-        results_file = comparator.save_comparison_results(comparison_metrics, args.log_type)
+        saved_files = comparator.save_comparison_results(comparison_metrics, args.log_type)
         
         print(f"\n✅ Evaluation completed for {args.log_type}")
-        print(f"📁 Results saved to: {results_file}")
+        print(f"📁 Results saved to:")
+        for file_path in saved_files:
+            print(f"   {file_path}")
         
         # Summary
         t_f1 = comparison_metrics['transformer']['metrics']['macro_f1']
@@ -523,13 +600,15 @@ def main():
         
         if comparison_metrics.get('fanogan', {}).get('available', False):
             f_f1 = comparison_metrics['fanogan']['metrics']['macro_f1']
-            agreement = comparison_metrics['comparison']['agreement_rate']
             print(f"   f-AnoGAN F1:    {f_f1:.4f}")
-            print(f"   Agreement:      {agreement:.4f}")
             
-            if comparison_metrics['comparison']['ensemble_performance']['ensemble_improves_over_transformer']:
-                ens_f1 = comparison_metrics['comparison']['ensemble_performance']['majority_vote_macro_f1']
-                print(f"   Best Ensemble:  {ens_f1:.4f}")
+            if comparison_metrics.get('comparison', {}).get('available', False):
+                agreement = comparison_metrics['comparison']['agreement_rate']
+                print(f"   Agreement:      {agreement:.4f}")
+                
+                if comparison_metrics['comparison']['ensemble_performance']['ensemble_improves_over_transformer']:
+                    ens_f1 = comparison_metrics['comparison']['ensemble_performance']['majority_vote_macro_f1']
+                    print(f"   Best Ensemble:  {ens_f1:.4f}")
         
     except Exception as e:
         print(f"❌ Evaluation failed: {e}")
