@@ -3027,7 +3027,6 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             for minor_epoch in range(minor_class_epochs):
                 minor_losses = []
                 minor_batches_processed = 0
-                minor_class_loss_sum = 0.0  # Track minor class specific loss
                 
                 for batch_idx, (x_batch, y_batch) in enumerate(minor_dataloader):
                     try:
@@ -3050,54 +3049,40 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                             with autocast():
                                 outputs = model(x_batch)
                                 
-                                # Focus primarily on label prediction for minor classes
-                                # Reduced reconstruction weight to focus more on classification
+                                # Focus on label prediction and reconstruction
                                 recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                                 
                                 # Enhanced focal loss with higher weights for minor classes
                                 label_loss = enhanced_focal_loss(
                                     outputs['labels'], y_batch, 
                                     class_weights=minor_class_weights,
-                                    gamma=4.0,  # Higher gamma for more focus on hard examples
+                                    gamma=3.0,  # Higher gamma for more focus on hard examples
                                     beta=0.99   # More smoothing for rare classes
                                 )
                                 
                                 # Additional consistency loss for minor classes
                                 predictions = torch.sigmoid(outputs['labels'])
-                                minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.0)
+                                minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.5)
                                 
-                                # Strong focus on minor classes in the loss
+                                # Focus on minor classes in the loss
                                 minor_class_mask = torch.zeros_like(y_batch)
                                 minor_class_mask[:, minor_class_indices] = 1.0
                                 
-                                # Direct BCE loss on minor classes only (stronger signal)
+                                # Weighted loss focusing on minor classes
                                 minor_focused_loss = F.binary_cross_entropy_with_logits(
-                                    outputs['labels'][:, minor_class_indices],
-                                    y_batch[:, minor_class_indices],
+                                    outputs['labels'] * minor_class_mask,
+                                    y_batch * minor_class_mask,
+                                    weight=minor_class_mask,
                                     reduction='mean'
                                 )
                                 
-                                # Additional penalty for not predicting minor classes when they should be predicted
-                                minor_class_targets = y_batch[:, minor_class_indices]
-                                minor_class_preds = outputs['labels'][:, minor_class_indices]
-                                
-                                # Heavy penalty for missing positive minor class instances
-                                missed_positives_loss = F.mse_loss(
-                                    torch.sigmoid(minor_class_preds) * minor_class_targets,
-                                    minor_class_targets
-                                )
-                                
-                                # Combined loss with heavy emphasis on minor class performance
+                                # Combined loss with higher emphasis on minor class performance
                                 total_minor_loss = (
-                                    0.1 * recon_loss +               # Reduced reconstruction weight
-                                    0.4 * label_loss +               # Standard label loss
-                                    0.05 * minor_consistency_loss +  # Reduced consistency weight
-                                    0.3 * minor_focused_loss +       # Strong minor class focus
-                                    0.15 * missed_positives_loss     # Penalty for missing positives
+                                    0.3 * recon_loss + 
+                                    0.5 * label_loss + 
+                                    0.1 * minor_consistency_loss +
+                                    0.1 * minor_focused_loss
                                 )
-                                
-                                # Track minor class specific loss for monitoring
-                                minor_class_loss_sum += minor_focused_loss.item()
                             
                             scaler.scale(total_minor_loss).backward()
                             scaler.unscale_(minor_optimizer)
@@ -3112,39 +3097,29 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                             label_loss = enhanced_focal_loss(
                                 outputs['labels'], y_batch, 
                                 class_weights=minor_class_weights,
-                                gamma=4.0,
+                                gamma=3.0,
                                 beta=0.99
                             )
                             
                             predictions = torch.sigmoid(outputs['labels'])
-                            minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.0)
+                            minor_consistency_loss = multilabel_consistency_loss(outputs['labels'], temperature=1.5)
                             
                             minor_class_mask = torch.zeros_like(y_batch)
                             minor_class_mask[:, minor_class_indices] = 1.0
                             
                             minor_focused_loss = F.binary_cross_entropy_with_logits(
-                                outputs['labels'][:, minor_class_indices],
-                                y_batch[:, minor_class_indices],
+                                outputs['labels'] * minor_class_mask,
+                                y_batch * minor_class_mask,
+                                weight=minor_class_mask,
                                 reduction='mean'
                             )
                             
-                            minor_class_targets = y_batch[:, minor_class_indices]
-                            minor_class_preds = outputs['labels'][:, minor_class_indices]
-                            
-                            missed_positives_loss = F.mse_loss(
-                                torch.sigmoid(minor_class_preds) * minor_class_targets,
-                                minor_class_targets
-                            )
-                            
                             total_minor_loss = (
-                                0.1 * recon_loss + 
-                                0.4 * label_loss + 
-                                0.05 * minor_consistency_loss +
-                                0.3 * minor_focused_loss +
-                                0.15 * missed_positives_loss
+                                0.3 * recon_loss + 
+                                0.5 * label_loss + 
+                                0.1 * minor_consistency_loss +
+                                0.1 * minor_focused_loss
                             )
-                            
-                            minor_class_loss_sum += minor_focused_loss.item()
                             
                             total_minor_loss.backward()
                             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -3165,35 +3140,14 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         else:
                             raise e
                 
-                # Log minor class epoch progress with detailed metrics
+                # Log minor class epoch progress
                 if minor_losses:
                     avg_minor_loss = np.mean(minor_losses)
-                    avg_minor_class_loss = minor_class_loss_sum / minor_batches_processed if minor_batches_processed > 0 else 0
                     minor_epoch_time = time.time() - minor_epoch_start_time
                     
-                    print(f"Minor Epoch {minor_epoch+1}/{minor_class_epochs} - "
-                          f"Total Loss: {avg_minor_loss:.4f} - "
-                          f"Minor Class Loss: {avg_minor_class_loss:.4f} - "
+                    print(f"Minor Epoch {minor_epoch+1}/{minor_class_epochs} - Loss: {avg_minor_loss:.4f} - "
                           f"Batches: {minor_batches_processed}/{len(minor_dataloader)} - "
                           f"Time: {minor_epoch_time:.1f}s")
-                    
-                    # Quick evaluation during training to see if model is improving
-                    if minor_epoch % 2 == 0:  # Every 2 epochs
-                        model.eval()
-                        with torch.no_grad():
-                            # Sample evaluation on a small subset
-                            sample_size = min(100, len(minor_embeddings))
-                            sample_embeddings = torch.from_numpy(minor_embeddings[:sample_size]).float().to(device)
-                            sample_outputs = model(sample_embeddings)
-                            sample_probs = torch.sigmoid(sample_outputs['labels']).cpu().numpy()
-                            
-                            # Check if model is producing reasonable predictions for minor classes
-                            for i, idx in enumerate(minor_class_indices):
-                                class_probs = sample_probs[:, idx]
-                                max_prob = class_probs.max()
-                                mean_prob = class_probs.mean()
-                                print(f"      {minor_class_names[i]:<15} max: {max_prob:.3f} mean: {mean_prob:.3f}")
-                        model.train()
                 else:
                     print(f"Minor Epoch {minor_epoch+1}/{minor_class_epochs} - Training failed")
                 
@@ -3218,74 +3172,32 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         class_probs = minor_probs[:, idx]
                         
                         if class_true.sum() > 0:
-                            # Use optimized threshold for better evaluation
-                            if class_probs.max() > 0.1:  # Only if model produces meaningful predictions
-                                # Find best threshold for this class
-                                thresholds = np.linspace(0.01, 0.99, 50)
-                                best_f1 = 0
-                                best_threshold = 0.5
-                                best_metrics = {}
-                                
-                                for thresh in thresholds:
-                                    preds = (class_probs >= thresh).astype(int)
-                                    tp = (preds * class_true).sum()
-                                    fp = (preds * (1 - class_true)).sum()
-                                    fn = ((1 - preds) * class_true).sum()
-                                    
-                                    if tp > 0:
-                                        precision = tp / (tp + fp)
-                                        recall = tp / (tp + fn)
-                                        f1 = 2 * precision * recall / (precision + recall)
-                                        
-                                        if f1 > best_f1:
-                                            best_f1 = f1
-                                            best_threshold = thresh
-                                            best_metrics = {
-                                                'tp': tp, 'fp': fp, 'fn': fn,
-                                                'precision': precision, 'recall': recall, 'f1': f1
-                                            }
-                                
-                                if best_f1 > 0:
-                                    print(f"   {name:<20} P: {best_metrics['precision']:.3f} R: {best_metrics['recall']:.3f} F1: {best_metrics['f1']:.3f} "
-                                          f"(TP:{best_metrics['tp']} FP:{best_metrics['fp']} FN:{best_metrics['fn']}) thresh:{best_threshold:.3f}")
-                                else:
-                                    # Fallback to simple evaluation
-                                    class_preds = (class_probs >= 0.5).astype(int)
-                                    true_positives = (class_preds * class_true).sum()
-                                    false_positives = (class_preds * (1 - class_true)).sum()
-                                    false_negatives = ((1 - class_preds) * class_true).sum()
-                                    
-                                    precision = true_positives / max(1, true_positives + false_positives)
-                                    recall = true_positives / max(1, true_positives + false_negatives)
-                                    f1 = 2 * precision * recall / max(1e-8, precision + recall)
-                                    
-                                    print(f"   {name:<20} P: {precision:.3f} R: {recall:.3f} F1: {f1:.3f} "
-                                          f"(TP:{true_positives} FP:{false_positives} FN:{false_negatives}) [no improvement]")
-                            else:
-                                print(f"   {name:<20} Model not producing meaningful predictions (max: {class_probs.max():.3f})")
+                            # Simple threshold evaluation
+                            class_preds = (class_probs >= 0.5).astype(int)
+                            
+                            true_positives = (class_preds * class_true).sum()
+                            false_positives = (class_preds * (1 - class_true)).sum()
+                            false_negatives = ((1 - class_preds) * class_true).sum()
+                            
+                            precision = true_positives / max(1, true_positives + false_positives)
+                            recall = true_positives / max(1, true_positives + false_negatives)
+                            f1 = 2 * precision * recall / max(1e-8, precision + recall)
+                            
+                            print(f"   {name:<20} P: {precision:.3f} R: {recall:.3f} F1: {f1:.3f} "
+                                  f"(TP:{true_positives} FP:{false_positives} FN:{false_negatives})")
                         else:
                             print(f"   {name:<20} No positive samples in focused dataset")
                     
                 except Exception as e:
                     print(f"⚠️  Could not evaluate minor class performance: {e}")
             
-            # Convert numpy types to JSON-serializable Python types
-            json_safe_stats = []
-            for stat in minor_class_stats:
-                json_safe_stats.append({
-                    'index': int(stat['index']),
-                    'name': str(stat['name']),
-                    'samples': int(stat['samples']),
-                    'rate': float(stat['rate'])
-                })
-            
             tracker.log_step("Minor Class Focused Training", {
                 "minor_classes": minor_class_names,
-                "minor_class_indices": [int(x) for x in minor_class_indices],
-                "minor_class_stats": json_safe_stats,
-                "focused_samples": int(len(minor_sample_indices)),
-                "additional_epochs": int(minor_class_epochs),
-                "final_lr": float(1e-5),
+                "minor_class_indices": minor_class_indices,
+                "minor_class_stats": minor_class_stats,
+                "focused_samples": len(minor_sample_indices),
+                "additional_epochs": minor_class_epochs,
+                "final_lr": 1e-5,
                 "enhanced_weights": [float(minor_class_weights[i]) for i in minor_class_indices]
             })
         else:
