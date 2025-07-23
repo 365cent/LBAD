@@ -2893,89 +2893,123 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             if avg_pred_labels < 0.8 * avg_true_labels:
                 print(f"🔧 Applying calibration for conservative predictions...")
                 
-                # Calibration training - focus on matching label count distribution
-                calibration_epochs = 5
-                calibration_optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=1e-5)
-                
-                # Create calibration dataset focusing on label count matching
-                cal_dataset = TensorDataset(
-                    torch.from_numpy(embeddings).float().contiguous(),
-                    torch.from_numpy(true_labels).float().contiguous()
-                )
-                
-                cal_dataloader = DataLoader(
-                    cal_dataset,
-                    batch_size=max(8, batch_size // 4),  # Smaller batches for calibration
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=False
-                )
-                
-                model.train()
-                
-                for cal_epoch in range(calibration_epochs):
-                    cal_losses = []
+                try:
+                    # Calibration training - focus on matching label count distribution
+                    calibration_epochs = 5
+                    calibration_optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=1e-5)
                     
-                    for batch_idx, (x_batch, y_batch) in enumerate(cal_dataloader):
-                        try:
-                            x_batch = x_batch.to(device, non_blocking=False)
-                            y_batch = y_batch.to(device, non_blocking=False)
-                            
-                            calibration_optimizer.zero_grad()
-                            
-                            outputs = model(x_batch)
-                            predictions = torch.sigmoid(outputs['labels'])
-                            
-                            # Label count calibration loss
-                            pred_counts = predictions.sum(dim=1)
-                            true_counts = y_batch.sum(dim=1)
-                            count_loss = F.mse_loss(pred_counts, true_counts)
-                            
-                            # Standard label loss with reduced weight
-                            label_loss = F.binary_cross_entropy(predictions, y_batch)
-                            
-                            # Calibration loss emphasizing count matching
-                            total_cal_loss = 0.6 * count_loss + 0.4 * label_loss
-                            
-                            total_cal_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                            calibration_optimizer.step()
-                            
-                            cal_losses.append(total_cal_loss.item())
-                            
-                            # Memory cleanup
-                            if config.device == "cuda" and batch_idx % 10 == 0:
-                                clear_gpu_memory()
+                    # Ensure model parameters require gradients
+                    for param in model.parameters():
+                        param.requires_grad_(True)
+                    
+                    print(f"🔧 Calibration optimizer parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+                    
+                    # Create calibration dataset focusing on label count matching
+                    cal_dataset = TensorDataset(
+                        torch.from_numpy(embeddings).float().contiguous(),
+                        torch.from_numpy(true_labels.astype(np.float32)).float().contiguous()
+                    )
+                    
+                    cal_dataloader = DataLoader(
+                        cal_dataset,
+                        batch_size=max(8, batch_size // 4),  # Smaller batches for calibration
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=False
+                    )
+                    
+                    model.train()
+                    calibration_successful = True
+                    
+                    for cal_epoch in range(calibration_epochs):
+                        cal_losses = []
+                        
+                        for batch_idx, (x_batch, y_batch) in enumerate(cal_dataloader):
+                            try:
+                                x_batch = x_batch.to(device, non_blocking=False)
+                                y_batch = y_batch.to(device, non_blocking=False)
                                 
-                        except RuntimeError as e:
-                            if "out of memory" in str(e) or "misaligned address" in str(e):
-                                print(f"⚠️  Calibration batch {batch_idx} failed, skipping...")
-                                clear_gpu_memory()
-                                continue
-                            else:
-                                raise e
+                                # Ensure target tensors don't require gradients
+                                y_batch = y_batch.detach()
+                                y_batch.requires_grad_(False)
+                                
+                                calibration_optimizer.zero_grad()
+                                
+                                outputs = model(x_batch)
+                                predictions = torch.sigmoid(outputs['labels'])
+                                
+                                # Label count calibration loss
+                                pred_counts = predictions.sum(dim=1)
+                                true_counts = y_batch.sum(dim=1).detach()  # Detach target counts
+                                count_loss = F.mse_loss(pred_counts, true_counts)
+                                
+                                # Standard label loss with reduced weight
+                                label_loss = F.binary_cross_entropy(predictions, y_batch)  # y_batch already detached
+                                
+                                # Calibration loss emphasizing count matching
+                                total_cal_loss = 0.6 * count_loss + 0.4 * label_loss
+                                
+                                # Check if loss requires gradients before backward pass
+                                if total_cal_loss.requires_grad:
+                                    total_cal_loss.backward()
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                                    calibration_optimizer.step()
+                                else:
+                                    print(f"⚠️  Calibration loss doesn't require gradients, skipping batch...")
+                                    continue
+                                
+                                cal_losses.append(total_cal_loss.item())
+                                
+                                # Memory cleanup
+                                if config.device == "cuda" and batch_idx % 10 == 0:
+                                    clear_gpu_memory()
+                                    
+                            except RuntimeError as e:
+                                if "out of memory" in str(e) or "misaligned address" in str(e):
+                                    print(f"⚠️  Calibration batch {batch_idx} failed, skipping...")
+                                    clear_gpu_memory()
+                                    continue
+                                elif "grad" in str(e).lower() or "requires_grad" in str(e).lower():
+                                    print(f"⚠️  Gradient error in calibration batch {batch_idx}: {e}")
+                                    print(f"   Skipping calibration to continue training...")
+                                    calibration_successful = False
+                                    break  # Exit calibration loop
+                                else:
+                                    raise e
+                        
+                        if not calibration_successful:
+                            break
+                        
+                        if cal_losses:
+                            avg_cal_loss = np.mean(cal_losses)
+                            print(f"   Calibration Epoch {cal_epoch+1}/{calibration_epochs} - Loss: {avg_cal_loss:.4f}")
                     
-                    if cal_losses:
-                        avg_cal_loss = np.mean(cal_losses)
-                        print(f"   Calibration Epoch {cal_epoch+1}/{calibration_epochs} - Loss: {avg_cal_loss:.4f}")
-                
-                # Verify calibration improvement
-                model.eval()
-                with torch.no_grad():
-                    post_cal_outputs = model(sample_embeddings)
-                    post_cal_probs = torch.sigmoid(post_cal_outputs['labels']).cpu().numpy()
-                    post_avg_pred = post_cal_probs.sum(axis=1).mean()
-                    
-                    print(f"✅ Calibration results:")
-                    print(f"   Before: {avg_pred_labels:.2f} labels/sample")
-                    print(f"   After:  {post_avg_pred:.2f} labels/sample")
-                    print(f"   Target: {avg_true_labels:.2f} labels/sample")
-                    print(f"   Improvement: {post_avg_pred - avg_pred_labels:+.2f}")
+                    if calibration_successful:
+                        # Verify calibration improvement
+                        model.eval()
+                        with torch.no_grad():
+                            post_cal_outputs = model(sample_embeddings)
+                            post_cal_probs = torch.sigmoid(post_cal_outputs['labels']).cpu().numpy()
+                            post_avg_pred = post_cal_probs.sum(axis=1).mean()
+                            
+                            print(f"✅ Calibration results:")
+                            print(f"   Before: {avg_pred_labels:.2f} labels/sample")
+                            print(f"   After:  {post_avg_pred:.2f} labels/sample")
+                            print(f"   Target: {avg_true_labels:.2f} labels/sample")
+                            print(f"   Improvement: {post_avg_pred - avg_pred_labels:+.2f}")
+                    else:
+                        print(f"⚠️  Calibration failed, continuing without calibration...")
+                        
+                except Exception as cal_error:
+                    print(f"⚠️  Calibration error: {cal_error}")
+                    print(f"   Continuing training without calibration...")
+                    calibration_successful = False
             else:
                 print(f"✅ Prediction calibration already good (ratio: {avg_pred_labels/avg_true_labels:.2f})")
         
         tracker.log_step("Accuracy Calibration", {
-            "calibration_applied": avg_pred_labels < 0.8 * avg_true_labels if 'avg_true_labels' in locals() else False,
+            "calibration_applied": avg_pred_labels < 0.8 * avg_true_labels if 'avg_true_labels' in locals() and 'avg_pred_labels' in locals() else False,
+            "calibration_successful": calibration_successful if 'calibration_successful' in locals() else True,
             "avg_predicted_labels": float(avg_pred_labels) if 'avg_pred_labels' in locals() else 0.0,
             "avg_true_labels": float(avg_true_labels) if 'avg_true_labels' in locals() else 0.0,
             "prediction_ratio": float(avg_pred_labels/avg_true_labels) if 'avg_true_labels' in locals() and avg_true_labels > 0 else 0.0
