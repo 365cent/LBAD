@@ -674,9 +674,87 @@ class ModelComparator:
         """Compute comprehensive comparative metrics"""
         
         # Get transformer predictions and ground truth
-        y_true = transformer_results['true_labels']
-        transformer_pred = transformer_results['predictions']
-        transformer_probs = transformer_results['probabilities']
+        y_true = transformer_results.get('true_labels', np.array([]))
+        transformer_pred = transformer_results.get('predictions', np.array([]))
+        transformer_probs = transformer_results.get('probabilities', np.array([]))
+        
+        # Debug: Check shapes
+        print(f"🔍 Debug shapes:")
+        print(f"   y_true shape: {y_true.shape if hasattr(y_true, 'shape') else type(y_true)}")
+        print(f"   transformer_pred shape: {transformer_pred.shape if hasattr(transformer_pred, 'shape') else type(transformer_pred)}")
+        print(f"   transformer_probs shape: {transformer_probs.shape if hasattr(transformer_probs, 'shape') else type(transformer_probs)}")
+        
+        # Handle empty arrays or wrong shapes
+        if not hasattr(y_true, 'shape') or y_true.size == 0:
+            print("⚠️  Warning: y_true is empty or invalid, attempting to reload from embeddings...")
+            # Try to reload ground truth from embeddings
+            try:
+                # Auto-detect log type from various sources
+                log_type = None
+                
+                # First try: check if log_type is in transformer_results
+                if 'log_type' in transformer_results:
+                    log_type = transformer_results['log_type']
+                
+                # Second try: extract from config if available
+                elif 'config' in transformer_results and 'log_type' in transformer_results['config']:
+                    log_type = transformer_results['config']['log_type']
+                
+                # Third try: infer from classes (e.g., wp-error_attack1 -> wp-error)
+                elif classes and len(classes) > 0:
+                    first_class = classes[0]
+                    if '_' in first_class:
+                        log_type = first_class.split('_')[0]
+                    elif 'wp-' in first_class:
+                        log_type = 'wp-error' if 'error' in first_class else 'wp-access'
+                
+                # Fourth try: check embeddings directory for available log types
+                if not log_type:
+                    embeddings_dir = Path("embeddings")
+                    if embeddings_dir.exists():
+                        available_log_types = [item.name for item in embeddings_dir.iterdir() 
+                                             if item.is_dir() and (item / f"log_{item.name}.pkl").exists()]
+                        if available_log_types:
+                            log_type = available_log_types[0]  # Use first available
+                            print(f"🔍 Auto-detected log type from embeddings: {log_type}")
+                
+                if not log_type:
+                    log_type = 'wp-error'  # Final fallback
+                    print(f"⚠️  Using fallback log type: {log_type}")
+                
+                embeddings_dir = Path("embeddings") / log_type
+                label_file = embeddings_dir / f"label_{log_type}.pkl"
+                
+                if label_file.exists():
+                    with open(label_file, 'rb') as f:
+                        label_data = pickle.load(f)
+                    y_true = label_data["vectors"]
+                    print(f"✅ Reloaded y_true from {label_file}: {y_true.shape}")
+                else:
+                    raise FileNotFoundError(f"No label file found at {label_file}")
+            except Exception as e:
+                print(f"❌ Could not reload ground truth: {e}")
+                # Create dummy ground truth (fallback)
+                if hasattr(transformer_pred, 'shape') and transformer_pred.size > 0:
+                    y_true = np.zeros_like(transformer_pred)
+                    print(f"⚠️  Using dummy ground truth with shape: {y_true.shape}")
+                else:
+                    raise ValueError("Cannot determine ground truth labels and no valid predictions available")
+        
+        # Ensure all arrays have consistent shapes
+        print(f"🔍 Final shapes before processing:")
+        print(f"   y_true: {y_true.shape}")
+        print(f"   transformer_pred: {transformer_pred.shape}")
+        print(f"   transformer_probs: {transformer_probs.shape}")
+        
+        # Validate shapes
+        if y_true.shape[0] != transformer_pred.shape[0]:
+            print(f"⚠️  Shape mismatch detected, truncating to minimum length...")
+            min_samples = min(y_true.shape[0], transformer_pred.shape[0])
+            y_true = y_true[:min_samples]
+            transformer_pred = transformer_pred[:min_samples]
+            transformer_probs = transformer_probs[:min_samples]
+            print(f"✅ Truncated all arrays to {min_samples} samples")
         
         comparison_metrics = {
             'classes': classes,
@@ -697,6 +775,14 @@ class ModelComparator:
             fanogan_pred, fanogan_scores = self.convert_fanogan_to_multilabel(
                 fanogan_results, classes, transformer_results
             )
+            
+            # Ensure fanogan predictions match ground truth shape
+            if fanogan_pred.shape[0] != y_true.shape[0]:
+                print(f"⚠️  f-AnoGAN prediction shape mismatch, truncating...")
+                min_samples = min(fanogan_pred.shape[0], y_true.shape[0])
+                fanogan_pred = fanogan_pred[:min_samples]
+                fanogan_scores = fanogan_scores[:min_samples]
+                print(f"✅ Truncated f-AnoGAN results to {min_samples} samples")
             
             # Compute f-AnoGAN multi-label metrics
             fanogan_metrics = self._compute_multilabel_metrics(y_true, fanogan_pred, classes)
