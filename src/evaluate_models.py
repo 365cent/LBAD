@@ -613,10 +613,19 @@ class ModelComparator:
                                       transformer_results: Optional[Dict] = None) -> Tuple[np.ndarray, np.ndarray]:
         """Convert f-AnoGAN results to multi-label format for comparison, optionally using transformer guidance"""
         
+        # Try different keys for anomaly scores
+        anomaly_scores = None
+        for score_key in ['anomaly_scores', 'probabilities', 'scores']:
+            if score_key in fanogan_results:
+                anomaly_scores = fanogan_results[score_key]
+                break
+        
+        if anomaly_scores is None:
+            raise KeyError(f"No anomaly scores found in fanogan_results. Available keys: {list(fanogan_results.keys())}")
+        
         if 'predictions_multilabel' in fanogan_results:
             # Use pre-computed multi-label predictions but enhance them if transformer available
             y_pred_multilabel = fanogan_results['predictions_multilabel']
-            anomaly_scores = fanogan_results['anomaly_scores']
             
             # If transformer results available, use them to improve f-AnoGAN predictions
             if transformer_results is not None:
@@ -631,7 +640,6 @@ class ModelComparator:
         else:
             # Fallback: convert binary anomaly to multi-label
             y_pred_binary = fanogan_results['predictions_binary'] if 'predictions_binary' in fanogan_results else fanogan_results['predictions']
-            anomaly_scores = fanogan_results['anomaly_scores']
             
             print(f"🔄 Converting f-AnoGAN binary predictions to multi-label format...")
             
