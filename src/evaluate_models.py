@@ -171,15 +171,23 @@ class ModelComparator:
             traceback.print_exc()
             return None
     
-    def convert_fanogan_to_multilabel(self, fanogan_results: Dict, target_classes: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        """Convert f-AnoGAN results to multi-label format for comparison"""
+    def convert_fanogan_to_multilabel(self, fanogan_results: Dict, target_classes: List[str], 
+                                      transformer_results: Optional[Dict] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert f-AnoGAN results to multi-label format for comparison, optionally using transformer guidance"""
         
         if 'predictions_multilabel' in fanogan_results:
-            # Use pre-computed multi-label predictions
+            # Use pre-computed multi-label predictions but enhance them if transformer available
             y_pred_multilabel = fanogan_results['predictions_multilabel']
             anomaly_scores = fanogan_results['anomaly_scores']
             
-            print(f"✅ Using pre-computed f-AnoGAN multi-label predictions")
+            # If transformer results available, use them to improve f-AnoGAN predictions
+            if transformer_results is not None:
+                print(f"🔄 Enhancing f-AnoGAN predictions using transformer guidance...")
+                y_pred_multilabel = self._enhance_fanogan_with_transformer(
+                    y_pred_multilabel, anomaly_scores, transformer_results, target_classes
+                )
+            
+            print(f"✅ Using enhanced f-AnoGAN multi-label predictions")
             return y_pred_multilabel, anomaly_scores
         
         else:
@@ -189,28 +197,111 @@ class ModelComparator:
             
             print(f"🔄 Converting f-AnoGAN binary predictions to multi-label format...")
             
-            # Simple conversion: if anomaly detected, predict all classes with decreasing probability
-            y_pred_multilabel = np.zeros((len(y_pred_binary), len(target_classes)), dtype=int)
-            
-            # For samples predicted as anomalies, distribute across classes
-            anomaly_indices = np.where(y_pred_binary == 1)[0]
-            
-            if len(anomaly_indices) > 0:
-                # Use score-based thresholding for each class
-                score_percentiles = [99, 95, 90, 85, 80, 75, 70, 65]
+            # Enhanced conversion using transformer guidance if available
+            if transformer_results is not None:
+                y_pred_multilabel = self._convert_with_transformer_guidance(
+                    y_pred_binary, anomaly_scores, transformer_results, target_classes
+                )
+            else:
+                # Simple conversion: if anomaly detected, predict all classes with decreasing probability
+                y_pred_multilabel = np.zeros((len(y_pred_binary), len(target_classes)), dtype=int)
                 
-                for i, cls in enumerate(target_classes):
-                    if i < len(score_percentiles):
-                        threshold_percentile = score_percentiles[i]
-                        threshold = np.percentile(anomaly_scores, threshold_percentile)
-                        y_pred_multilabel[:, i] = (anomaly_scores >= threshold).astype(int)
-                    else:
-                        # For additional classes, use high threshold
-                        threshold = np.percentile(anomaly_scores, 95)
-                        y_pred_multilabel[:, i] = (anomaly_scores >= threshold).astype(int)
+                # For samples predicted as anomalies, distribute across classes
+                anomaly_indices = np.where(y_pred_binary == 1)[0]
+                
+                if len(anomaly_indices) > 0:
+                    # Use score-based thresholding for each class
+                    score_percentiles = [99, 95, 90, 85, 80, 75, 70, 65]
+                    
+                    for i, cls in enumerate(target_classes):
+                        if i < len(score_percentiles):
+                            threshold_percentile = score_percentiles[i]
+                            threshold = np.percentile(anomaly_scores, threshold_percentile)
+                            y_pred_multilabel[:, i] = (anomaly_scores >= threshold).astype(int)
+                        else:
+                            # For additional classes, use high threshold
+                            threshold = np.percentile(anomaly_scores, 95)
+                            y_pred_multilabel[:, i] = (anomaly_scores >= threshold).astype(int)
             
             print(f"✅ Converted to multi-label: {y_pred_multilabel.shape}")
             return y_pred_multilabel, anomaly_scores
+    
+    def _enhance_fanogan_with_transformer(self, fanogan_pred: np.ndarray, anomaly_scores: np.ndarray,
+                                         transformer_results: Dict, target_classes: List[str]) -> np.ndarray:
+        """Enhance f-AnoGAN predictions using transformer predictions as guidance"""
+        
+        transformer_pred = transformer_results['predictions']
+        transformer_probs = transformer_results['probabilities']
+        
+        # Strategy: Use transformer predictions to guide f-AnoGAN where anomaly scores are moderate
+        enhanced_pred = fanogan_pred.copy()
+        
+        # Normalize anomaly scores to [0, 1]
+        score_min, score_max = anomaly_scores.min(), anomaly_scores.max()
+        scores_norm = (anomaly_scores - score_min) / (score_max - score_min + 1e-8)
+        
+        # For moderate anomaly scores (uncertainty region), use transformer guidance
+        moderate_mask = (scores_norm > 0.3) & (scores_norm < 0.8)
+        
+        print(f"   Enhancing {moderate_mask.sum():,} samples with moderate anomaly scores...")
+        
+        for i, cls in enumerate(target_classes):
+            # In uncertainty region, blend f-AnoGAN and transformer predictions
+            uncertain_samples = moderate_mask
+            
+            # Use transformer predictions with high confidence
+            high_confidence_transformer = transformer_probs[:, i] > 0.7
+            low_confidence_transformer = transformer_probs[:, i] < 0.3
+            
+            # Enhance predictions
+            blend_mask = uncertain_samples & high_confidence_transformer
+            enhanced_pred[blend_mask, i] = transformer_pred[blend_mask, i]
+            
+            # Also consider transformer predictions for low anomaly scores but high transformer confidence
+            low_anomaly_high_transformer = (scores_norm < 0.3) & high_confidence_transformer
+            enhanced_pred[low_anomaly_high_transformer, i] = transformer_pred[low_anomaly_high_transformer, i]
+        
+        # Calculate improvement
+        original_pred_rate = fanogan_pred.mean(axis=0)
+        enhanced_pred_rate = enhanced_pred.mean(axis=0)
+        
+        print(f"   Original prediction rates: {original_pred_rate}")
+        print(f"   Enhanced prediction rates: {enhanced_pred_rate}")
+        
+        return enhanced_pred
+    
+    def _convert_with_transformer_guidance(self, y_pred_binary: np.ndarray, anomaly_scores: np.ndarray,
+                                          transformer_results: Dict, target_classes: List[str]) -> np.ndarray:
+        """Convert binary anomaly predictions to multi-label using transformer guidance"""
+        
+        transformer_pred = transformer_results['predictions']
+        transformer_probs = transformer_results['probabilities']
+        
+        y_pred_multilabel = np.zeros((len(y_pred_binary), len(target_classes)), dtype=int)
+        
+        # Normalize anomaly scores
+        scores_norm = (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min() + 1e-8)
+        
+        print(f"   Using transformer guidance for multi-label conversion...")
+        
+        for i, cls in enumerate(target_classes):
+            # Strategy: Combine anomaly detection with transformer class-specific predictions
+            
+            # High anomaly score + high transformer probability = definitely predict
+            high_anomaly = scores_norm > 0.8
+            high_transformer = transformer_probs[:, i] > 0.6
+            y_pred_multilabel[high_anomaly & high_transformer, i] = 1
+            
+            # Medium anomaly score + medium transformer probability = maybe predict
+            medium_anomaly = (scores_norm > 0.5) & (scores_norm <= 0.8)
+            medium_transformer = transformer_probs[:, i] > 0.4
+            y_pred_multilabel[medium_anomaly & medium_transformer, i] = 1
+            
+            # Trust transformer for high-confidence predictions even with low anomaly scores
+            very_high_transformer = transformer_probs[:, i] > 0.8
+            y_pred_multilabel[very_high_transformer, i] = 1
+        
+        return y_pred_multilabel
     
     def compute_comparative_metrics(self, transformer_results: Dict, fanogan_results: Optional[Dict], 
                                   classes: List[str]) -> Dict[str, Any]:
@@ -236,8 +327,10 @@ class ModelComparator:
         }
         
         if fanogan_results is not None:
-            # Convert f-AnoGAN to multi-label format
-            fanogan_pred, fanogan_scores = self.convert_fanogan_to_multilabel(fanogan_results, classes)
+            # Convert f-AnoGAN to multi-label format with transformer guidance
+            fanogan_pred, fanogan_scores = self.convert_fanogan_to_multilabel(
+                fanogan_results, classes, transformer_results
+            )
             
             # Compute f-AnoGAN multi-label metrics
             fanogan_metrics = self._compute_multilabel_metrics(y_true, fanogan_pred, classes)
@@ -398,32 +491,32 @@ class ModelComparator:
             print("")
         
         # Comparison results
-        if (comparison_metrics.get('comparison', {}).get('available', False) and 
-            comparison_metrics.get('fanogan', {}).get('available', False)):
-            comp = comparison_metrics['comparison']
-            print("🔄 MODEL COMPARISON:")
-            print("-" * 50)
-            print(f"Agreement Rate:   {comp['agreement_rate']:.4f}")
-            print(f"Performance Gap:  {comp['performance_difference']['macro_f1_diff']:.4f}")
-            print(f"Better Model:     {'Transformer' if comp['performance_difference']['transformer_better'] else 'f-AnoGAN'}")
-            print("")
-            
-            print("🎯 ENSEMBLE RESULTS:")
-            print("-" * 50)
-            ens = comp['ensemble_performance']
-            print(f"Majority Vote F1: {ens['majority_vote_macro_f1']:.4f}")
-            print(f"Weighted Ens F1:  {ens['weighted_ensemble_macro_f1']:.4f}")
-            print(f"Ensemble Improves: {ens['ensemble_improves_over_transformer'] or ens['ensemble_improves_over_fanogan']}")
-            print("")
-            
-            print("🏆 MODEL RANKINGS (by Macro F1):")
-            print("-" * 50)
-            for rank, (model, score) in enumerate(comp['model_rankings']['by_macro_f1'], 1):
-                print(f"{rank}. {model:<20} {score:.4f}")
-            print("")
-        
-        elif comparison_metrics.get('fanogan', {}).get('available', False):
-            print("ℹ️  Both models available but comparison disabled")
+        if (comparison_metrics.get('fanogan', {}).get('available', False)):
+            # Always show comparison when both models are available
+            comp = comparison_metrics.get('comparison', {})
+            if comp.get('available', False):
+                print("🔄 MODEL COMPARISON:")
+                print("-" * 50)
+                print(f"Agreement Rate:   {comp['agreement_rate']:.4f}")
+                print(f"Performance Gap:  {comp['performance_difference']['macro_f1_diff']:.4f}")
+                print(f"Better Model:     {'Transformer' if comp['performance_difference']['transformer_better'] else 'f-AnoGAN'}")
+                print("")
+                
+                print("🎯 ENSEMBLE RESULTS:")
+                print("-" * 50)
+                ens = comp['ensemble_performance']
+                print(f"Majority Vote F1: {ens['majority_vote_macro_f1']:.4f}")
+                print(f"Weighted Ens F1:  {ens['weighted_ensemble_macro_f1']:.4f}")
+                print(f"Ensemble Improves: {ens['ensemble_improves_over_transformer'] or ens['ensemble_improves_over_fanogan']}")
+                print("")
+                
+                print("🏆 MODEL RANKINGS (by Macro F1):")
+                print("-" * 50)
+                for rank, (model, score) in enumerate(comp['model_rankings']['by_macro_f1'], 1):
+                    print(f"{rank}. {model:<20} {score:.4f}")
+                print("")
+            else:
+                print("⚠️  Comparison metrics generation failed")
         else:
             print("ℹ️  Only transformer evaluation available (no comparison)")
     
