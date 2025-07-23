@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-f-AnoGAN Anomaly Detection Evaluation Pipeline
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_recall_curve,
+    roc_curve, accuracy_score, precision_score, recall_score, f1_score,
+    classification_report, precision_recall_fscore_support
+)
+
+import sys
+sys.path.append('.')
+from src.transformer import detect_system_resources, SystemConfigomaly Detection Evaluation Pipeline
 ==============================================
 
 Implements f-AnoGAN (Schlegl et al., 2019) for anomaly detection on log embeddings.
@@ -351,10 +366,6 @@ class FANOGANEvaluator:
     def evaluate_anomaly_detection(self, fanogan: FANOGAN, X: np.ndarray, 
                                   y_true: np.ndarray, classes: List[str]) -> Dict[str, Any]:
         """Evaluate anomaly detection performance and generate multi-label predictions"""
-        from sklearn.metrics import (
-            roc_auc_score, average_precision_score, precision_recall_curve,
-            roc_curve, accuracy_score, precision_score, recall_score, f1_score
-        )
         
         print(f"🔍 Computing anomaly scores...")
         anomaly_scores = fanogan.score(X)
@@ -490,30 +501,25 @@ class FANOGANEvaluator:
         
         return metrics, anomaly_scores, y_pred_optimal, y_multilabel_pred
     
-    def print_results(self, metrics: Dict[str, Any]):
-        """Print comprehensive anomaly detection results"""
+    def print_results(self, metrics: Dict[str, Any], classes: List[str], 
+                     y_true: np.ndarray, y_pred_binary: np.ndarray, y_pred_multilabel: np.ndarray):
+        """Print comprehensive anomaly detection results with classification report"""
         
         print(f"\n📊 f-AnoGAN ANOMALY DETECTION RESULTS")
         print("=" * 60)
         print(f"Test samples:     {metrics['n_samples']:,}")
-        print(f"Anomaly rate:     {metrics['anomaly_rate_true']:.4f}")
+        print(f"Classes:          {len(classes)}")
         print("")
         
-        print("MAIN METRICS:")
+        print("ANOMALY DETECTION METRICS:")
         print("-" * 40)
         print(f"ROC AUC:          {metrics['roc_auc']:.4f}")
         print(f"Average Precision: {metrics['average_precision']:.4f}")
         print(f"Best F1 Score:    {metrics['best_f1']:.4f}")
         print(f"Best Threshold:   {metrics['best_threshold']:.4f}")
-        print("")
-        
-        print("OPTIMAL THRESHOLD PERFORMANCE:")
-        print("-" * 40)
         print(f"Accuracy:         {metrics['accuracy']:.4f}")
         print(f"Precision:        {metrics['precision']:.4f}")
         print(f"Recall:           {metrics['recall']:.4f}")
-        print(f"F1 Score:         {metrics['f1_score']:.4f}")
-        print(f"Pred Anomaly Rate: {metrics['anomaly_rate_pred']:.4f}")
         print("")
         
         print("SCORE DISTRIBUTION:")
@@ -524,6 +530,48 @@ class FANOGANEvaluator:
         print(f"Max:              {metrics['score_max']:.4f}")
         print("")
         
+        # Multi-label classification report (similar to transformer backup)
+        if hasattr(y_true, 'shape') and len(y_true.shape) > 1:
+            # Show multi-label classification performance
+            
+            print("MULTI-LABEL CLASSIFICATION REPORT:")
+            print("-" * 60)
+            report = classification_report(y_true, y_pred_multilabel, target_names=classes, zero_division=0, digits=3)
+            print(report)
+            
+            # Sample distribution analysis
+            pred_labels_per_sample = y_pred_multilabel.sum(axis=1)
+            true_labels_per_sample = y_true.sum(axis=1)
+            
+            print("")
+            print("SAMPLE DISTRIBUTION:")
+            print("-" * 40)
+            print(f"Avg predicted labels/sample: {pred_labels_per_sample.mean():.3f}")
+            print(f"Avg true labels/sample:      {true_labels_per_sample.mean():.3f}")
+            print(f"Samples with no pred labels: {(pred_labels_per_sample == 0).sum():,}")
+            print(f"Samples with no true labels: {(true_labels_per_sample == 0).sum():,}")
+            print(f"Samples with >1 pred labels: {(pred_labels_per_sample > 1).sum():,}")
+            print(f"Samples with >1 true labels: {(true_labels_per_sample > 1).sum():,}")
+            
+            # Per-class metrics
+            precision, recall, f1, support = precision_recall_fscore_support(
+                y_true, y_pred_multilabel, average=None, zero_division=0
+            )
+            
+            print("")
+            print("PER-CLASS METRICS:")
+            print("-" * 60)
+            print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+            print("-" * 60)
+            
+            for i, cls in enumerate(classes):
+                f1_score = f1[i]
+                precision_score = precision[i]
+                recall_score = recall[i]
+                support_count = support[i]
+                print(f"{cls:<25} {f1_score:<8.3f} {precision_score:<10.3f} {recall_score:<8.3f} {support_count:<8}")
+        
+        print("")
         print("PERCENTILE THRESHOLDS:")
         print("-" * 50)
         print(f"{'Percentile':<10} {'Threshold':<12} {'Precision':<10} {'Recall':<8} {'F1':<8}")
@@ -537,36 +585,39 @@ class FANOGANEvaluator:
     
     def save_results(self, metrics: Dict[str, Any], anomaly_scores: np.ndarray,
                     y_pred: np.ndarray, y_true: np.ndarray, y_multilabel_pred: np.ndarray, 
-                    log_type: str, fanogan_model: FANOGAN):
-        """Save evaluation results and trained model"""
+                    log_type: str, fanogan_model: FANOGAN, classes: List[str]):
+        """Save evaluation results and trained model with pickle predictions"""
         
         output_dir = Path("results") / log_type
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save evaluation results
+        # Save comprehensive evaluation results (like transformer backup)
         results = {
             'metrics': metrics,
-            'anomaly_scores': anomaly_scores.astype(np.float32),
-            'predictions_binary': y_pred.astype(np.int8),
-            'predictions_multilabel': y_multilabel_pred.astype(np.int8),
-            'true_labels': y_true.astype(np.int8) if hasattr(y_true, 'shape') and len(y_true.shape) == 1 else y_true.astype(np.int8),
+            'predictions': y_multilabel_pred.astype(np.int8),  # Multi-label predictions for comparison
+            'probabilities': anomaly_scores.astype(np.float32),  # Use anomaly scores as "probabilities"
+            'true_labels': y_true.astype(np.int8),
+            'predictions_binary': y_pred.astype(np.int8),  # Binary anomaly predictions
             'evaluation_type': 'fanogan_anomaly_detection',
             'config': self.config.__dict__,
             'model_config': fanogan_model.cfg.__dict__,
+            'classes': classes,
+            'n_samples': len(y_true),
             'timestamp': time.time()
         }
         
+        # Save in transformer-compatible format
         results_file = output_dir / f"fanogan_evaluation_{log_type}_{self.config.node_name}_{self.config.job_id}.pkl"
         with open(results_file, 'wb') as f:
             pickle.dump(results, f)
         
-        # Save trained model
+        # Save trained model separately
         model_file = output_dir / f"fanogan_model_{log_type}_{self.config.node_name}_{self.config.job_id}.pth"
         fanogan_model.save(model_file)
         
         print(f"💾 Results saved to: {results_file}")
         print(f"💾 Model saved to: {model_file}")
-        print(f"📊 Saved both binary and multi-label predictions for comparison")
+        print(f"📊 Saved predictions in transformer-compatible format")
         
         return results_file, model_file
 
@@ -628,11 +679,11 @@ def main():
         )
         
         # 4. Print results
-        evaluator.print_results(metrics)
+        evaluator.print_results(metrics, classes, y_true, y_pred, y_multilabel_pred)
         
         # 5. Save results and model
         results_file, model_file = evaluator.save_results(
-            metrics, anomaly_scores, y_pred, y_true, y_multilabel_pred, args.log_type, fanogan_model
+            metrics, anomaly_scores, y_pred, y_true, y_multilabel_pred, args.log_type, fanogan_model, classes
         )
         
         print(f"\n✅ Evaluation completed for {args.log_type}")
