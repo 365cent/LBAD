@@ -1,181 +1,352 @@
-# Makefile for Python Project
+# LBAD - Log-Based Anomaly Detection Pipeline
+# ============================================
 
 # Variables
 PYTHON := python
 PIP := pip
-REQ := requirements.txt
 SRC := ./src
-PREPROCESS := $(SRC)/preprocessing.py
-TEST := $(SRC)/testing.py
-FASTTEXT := $(SRC)/fasttext_embedding.py
-WORD2VEC := $(SRC)/word2vec_embedding.py
-TFIDF := $(SRC)/tfidf_embedding.py
-ML := $(SRC)/ml_models.py
-XGBOOST_ML := $(SRC)/xgboost_ml.py
-MAIN := $(SRC)/main.py
-GAN := $(SRC)/gan_augmentation.py
-EVAL := $(SRC)/gan_evaluation.py
-LOGBERT_EMBEDDINGS := $(SRC)/logbert_embeddings.py
-TRANSFORMER_UNSUPERVISED := $(SRC)/transformer_unsupervised_ml.py
 
-# Log types for specific processing
-# From src/preprocessing.py --log-type choices
-PREPROCESS_LOG_TYPES := web error auth dns firewall vpn audit kernel systemd
-# From src/fasttext_embedding.py LOG_TYPE_ATTACKS.keys()
-FASTTEXT_LOG_TYPES := dns network web error monitoring auth audit
-# Available log types for embeddings (both FastText and LogBERT)
-EMBEDDING_LOG_TYPES := dns network web error monitoring auth audit
+# Available log types (check embeddings/ directory for actual availability)
+LOG_TYPES := wp-access wp-error dns network web error monitoring auth audit
 
-# Contexts for xgboost_ml.py and ml_models.py (specific logical types + all_combined)
-ML_CONTEXTS := all_combined $(FASTTEXT_LOG_TYPES)
+# =============================================================================
+# Main Pipeline Commands
+# =============================================================================
 
-# Help
 help:
-	@echo "Available targets:"
-	@echo "  all              Run full pipeline"
-	@echo "  install          Install dependencies"
-	@echo "  preprocess       Run preprocessing for ALL raw log types (creates 'processed/<type>/...')"
-	@echo "  preprocess-<type>  Run preprocessing for a specific raw log type (e.g., make preprocess-web)"
-	@echo "                     Creates 'processed/<type>/...' outputs."
-	@echo "                     Available types for preprocess: $(PREPROCESS_LOG_TYPES)"
-	@echo "  test             Run testing"
-	@echo "  fasttext         Run FastText embeddings for ALL defined logical log types"
-	@echo "                     (processes data from 'processed/<type>/...', creates 'embeddings/<type>/...')"
-	@echo "  fasttext-<type>    Run FastText for a specific logical log type (e.g., make fasttext-network)"
-	@echo "                     Creates 'embeddings/<type>/...' outputs."
-	@echo "                     Available types for fasttext: $(FASTTEXT_LOG_TYPES)"
-	@echo "  word2vec         Run Word2Vec embeddings"
-	@echo "  tfidf            Run TF-IDF embeddings"
-	@echo "  ml               Run all ML models (all_combined)"
-	@echo "  ml-[rf|xgb|knn|lr]     Run specific ML model (all_combined)"
-	@echo "  ml-<type>        Run all ML models for specific log type (e.g., make ml-web)"
-	@echo "  ml-<type>-[rf|xgb|knn|lr]  Run specific ML model for log type (e.g., make ml-web-rf)"
-	@echo "                     Available log types for ml: $(ML_CONTEXTS)"
-	@echo "  ml-evaluate      Evaluate without training"
-	@echo "  xgboost-ml         Run XGBoost Multi-Label (OvR) for all_combined context"
-	@echo "  xgboost-ml-<ctx>   Run XGBoost Multi-Label (OvR) for a specific context"
-	@echo "                     Available contexts for xgboost-ml: $(ML_CONTEXTS)"
-	@echo "  logbert          Run LogBERT embeddings extraction (all log types, FastText-compatible format)"
-	@echo "  logbert-<type>   Run LogBERT embeddings for specific log type"
-	@echo "                     Available log types for logbert: $(EMBEDDING_LOG_TYPES)"
-	@echo "  transformer-ml   Run transformer-based unsupervised ML (all log types with embeddings)"
-	@echo "  transformer-ml-<type>  Run transformer unsupervised ML for specific log type"
-	@echo "  transformer-ml-fast    Run transformer unsupervised ML (skip transformer training)"
-	@echo "                     Available log types for transformer-ml: $(EMBEDDING_LOG_TYPES)"
-	@echo "  gan              Run VAE-GAN augmentation"
-	@echo "  eval             Evaluate VAE-GAN augmentation"
-	@echo "  gan-pipeline     Run augmentation and evaluation"
-	@echo "  clean            Remove cache files"
-	@echo "  clean-all        Remove all outputs + cache"
-	@echo "  clean-aug        Remove augmented data only"
-	@echo "  help             Show this message"
+	@echo "LBAD - Log-Based Anomaly Detection Pipeline"
+	@echo "==========================================="
+	@echo ""
+	@echo "🚀 MAIN PIPELINES:"
+	@echo "  pipeline-all        Complete pipeline: preprocess → embeddings → train → evaluate"
+	@echo "  pipeline-<type>     Run full pipeline for specific log type (e.g. pipeline-wp-error)"
+	@echo "  pipeline-eval       Quick evaluation pipeline (skip training, use existing models)"
+	@echo ""
+	@echo "📊 DATA PREPARATION:"
+	@echo "  preprocess          Preprocess all log types"
+	@echo "  preprocess-<type>   Preprocess specific log type"
+	@echo "  embeddings          Generate all embeddings (LogBERT + FastText)"
+	@echo "  embeddings-<type>   Generate embeddings for specific log type"
+	@echo ""
+	@echo "🤖 MODEL TRAINING:"
+	@echo "  train               Train transformer models for all log types"
+	@echo "  train-<type>        Train transformer for specific log type"
+	@echo "  train-sample        Train with sample data (faster, for testing)"
+	@echo ""
+	@echo "📈 EVALUATION:"
+	@echo "  evaluate            Evaluate all trained models"
+	@echo "  evaluate-<type>     Evaluate specific log type"
+	@echo "  compare             Compare transformer vs f-AnoGAN models"
+	@echo "  compare-<type>      Compare models for specific log type"
+	@echo ""
+	@echo "🔧 STANDALONE TOOLS:"
+	@echo "  ml-baseline         Run traditional ML baselines (RF, XGBoost, etc.)"
+	@echo "  gan                 Run f-AnoGAN training and evaluation"
+	@echo "  view-data           View processed data and embeddings"
+	@echo "  test                Run tests"
+	@echo ""
+	@echo "🧹 MAINTENANCE:"
+	@echo "  install             Install dependencies"
+	@echo "  clean               Remove cache files"
+	@echo "  clean-models        Remove trained models"
+	@echo "  clean-all           Remove all generated data"
+	@echo ""
+	@echo "Available log types: $(LOG_TYPES)"
 
-# Targets
-all:        ; $(PYTHON) $(MAIN)
-install:    ; $(PIP) install -r $(REQ)
+# =============================================================================
+# Complete Pipelines
+# =============================================================================
 
-# Preprocessing: 'make preprocess' processes all types into subdirectories.
-preprocess: ; $(PYTHON) $(PREPROCESS)
+# Full pipeline for all log types
+pipeline-all: preprocess embeddings train evaluate
+	@echo "✅ Complete pipeline finished for all log types"
 
-# Preprocessing by specific log type (e.g., make preprocess-web)
-# Outputs to 'processed/<type>/'
+# Full pipeline for specific log type
+pipeline-%:
+	@echo "🚀 Running complete pipeline for log type: $*"
+	$(MAKE) preprocess-$*
+	$(MAKE) embeddings-$*
+	$(MAKE) train-$*
+	$(MAKE) evaluate-$*
+	@echo "✅ Pipeline completed for $*"
+
+# Quick evaluation pipeline (use existing models)
+pipeline-eval: evaluate compare
+	@echo "✅ Evaluation pipeline completed"
+
+# =============================================================================
+# Data Preparation
+# =============================================================================
+
+# Preprocessing
+preprocess:
+	@echo "📊 Preprocessing all log types..."
+	$(PYTHON) $(SRC)/preprocessing.py
+
 preprocess-%:
-	@echo "Preprocessing specific log type: $* (from 'logs/' to 'processed/$*/')"
-	$(PYTHON) $(PREPROCESS) --log-type $*
+	@echo "📊 Preprocessing log type: $*"
+	$(PYTHON) $(SRC)/preprocessing.py --log-type $*
 
-test:       ; $(PYTHON) $(TEST)
+# Embeddings generation
+embeddings:
+	@echo "🔄 Generating all embeddings..."
+	$(MAKE) logbert
+	$(MAKE) fasttext
 
-# FastText: 'make fasttext' processes all logical types from 'processed/<type>/' to 'embeddings/<type>/'.
-fasttext:   ; $(PYTHON) $(FASTTEXT)
+embeddings-%:
+	@echo "🔄 Generating embeddings for log type: $*"
+	$(MAKE) logbert-$*
+	$(MAKE) fasttext-$*
 
-# FastText embedding by specific logical log type (e.g., make fasttext-network)
-# Outputs to 'embeddings/<type>/'
-fasttext-%:
-	@echo "Running FastText embedding for specific logical log type: $* (from 'processed/' to 'embeddings/$*/')"
-	$(PYTHON) $(FASTTEXT) --log-type $*
-
-word2vec:   ; $(PYTHON) $(WORD2VEC)
-tfidf:      ; $(PYTHON) $(TFIDF)
-
-# ML models with all_combined (default)
-ml:         ; $(PYTHON) $(ML)
-ml-rf:      ; $(PYTHON) $(ML) --model rf
-ml-xgb:     ; $(PYTHON) $(ML) --model xgb
-ml-knn:     ; $(PYTHON) $(ML) --model knn
-ml-lr:      ; $(PYTHON) $(ML) --model lr
-
-# ML models for specific log type
-ml-%:
-	@echo "Running all ML models for log type: $*"
-	$(PYTHON) $(ML) --log-type $*
-
-# ML models with specific model and log type
-ml-%-rf:    ; $(PYTHON) $(ML) --model rf --log-type $*
-ml-%-xgb:   ; $(PYTHON) $(ML) --model xgb --log-type $*
-ml-%-knn:   ; $(PYTHON) $(ML) --model knn --log-type $*
-ml-%-lr:    ; $(PYTHON) $(ML) --model lr --log-type $*
-
-# XGBoost Multi-Label (OvR) baseline
-xgboost-ml:
-	@echo "Running XGBoost Multi-Label (OvR) for context: all_combined"
-	$(PYTHON) $(XGBOOST_ML) --context all_combined
-
-xgboost-ml-%:
-	@echo "Running XGBoost Multi-Label (OvR) for context: $*"
-	$(PYTHON) $(XGBOOST_ML) --context $*
-
-# LogBERT Embeddings (FastText-compatible format)
+# LogBERT embeddings
 logbert:
-	@echo "Extracting LogBERT CLS embeddings (all log types, FastText-compatible format)"
-	$(PYTHON) $(LOGBERT_EMBEDDINGS)
+	@echo "🧠 Generating LogBERT embeddings for all log types..."
+	$(PYTHON) $(SRC)/logbert_embeddings.py
 
 logbert-%:
-	@echo "Extracting LogBERT CLS embeddings for log type: $*"
-	$(PYTHON) $(LOGBERT_EMBEDDINGS) --log-type $*
+	@echo "🧠 Generating LogBERT embeddings for log type: $*"
+	$(PYTHON) $(SRC)/logbert_embeddings.py --log-type $*
 
-# Transformer Unsupervised ML
-transformer-ml:
-	@echo "Running transformer-based unsupervised ML (all log types with embeddings)"
-	$(PYTHON) $(TRANSFORMER_UNSUPERVISED)
+# FastText embeddings
+fasttext:
+	@echo "📝 Generating FastText embeddings for all log types..."
+	$(PYTHON) $(SRC)/fasttext_embedding.py
 
-transformer-ml-%:
-	@echo "Running transformer-based unsupervised ML for log type: $*"
-	$(PYTHON) $(TRANSFORMER_UNSUPERVISED) --log-type $*
+fasttext-%:
+	@echo "📝 Generating FastText embeddings for log type: $*"
+	$(PYTHON) $(SRC)/fasttext_embedding.py --log-type $*
 
-transformer-ml-fast:
-	@echo "Running transformer-based unsupervised ML (skip transformer training)"
-	$(PYTHON) $(TRANSFORMER_UNSUPERVISED) --skip-training
+# =============================================================================
+# Model Training
+# =============================================================================
 
-ml-evaluate: ; $(PYTHON) $(ML) --no-train
-gan:         ; $(PYTHON) $(GAN)
-eval:        ; $(PYTHON) $(EVAL)
+# Train transformer models
+train:
+	@echo "🤖 Training transformer models for all log types..."
+	$(PYTHON) $(SRC)/transformer.py
 
-# VAE-GAN pipeline
-gan-pipeline:
-	$(MAKE) gan
-	$(MAKE) eval
+train-%:
+	@echo "🤖 Training transformer model for log type: $*"
+	$(PYTHON) $(SRC)/transformer.py --log-type $*
 
-gan-small:   ; $(PYTHON) $(GAN) --epochs 20 --threshold 0.05
-eval-fast:   ; $(PYTHON) $(EVAL)
+# Train with sample data (faster)
+train-sample:
+	@echo "🤖 Training transformer models with sample data..."
+	$(PYTHON) $(SRC)/transformer.py --sample-size 5000
 
+train-%-sample:
+	@echo "🤖 Training transformer model for $* with sample data..."
+	$(PYTHON) $(SRC)/transformer.py --log-type $* --sample-size 5000
+
+# =============================================================================
+# Model Evaluation
+# =============================================================================
+
+# Evaluate trained models
+evaluate:
+	@echo "📈 Evaluating all trained models..."
+	$(PYTHON) $(SRC)/evaluate_models.py
+
+evaluate-%:
+	@echo "📈 Evaluating model for log type: $*"
+	$(PYTHON) $(SRC)/evaluate_models.py --log-type $*
+
+# Compare different model types
+compare:
+	@echo "⚖️  Comparing transformer vs f-AnoGAN models..."
+	$(PYTHON) $(SRC)/evaluate_models.py --compare-all
+
+compare-%:
+	@echo "⚖️  Comparing models for log type: $*"
+	$(PYTHON) $(SRC)/evaluate_models.py --log-type $* --compare
+
+# =============================================================================
+# Standalone Tools
+# =============================================================================
+
+# Traditional ML baselines
+ml-baseline:
+	@echo "📊 Running traditional ML baselines..."
+	$(PYTHON) $(SRC)/ml_models.py
+
+ml-baseline-%:
+	@echo "📊 Running ML baselines for log type: $*"
+	$(PYTHON) $(SRC)/ml_models.py --log-type $*
+
+# XGBoost specifically
+xgboost:
+	@echo "🌲 Running XGBoost models..."
+	$(PYTHON) $(SRC)/xgboost_ml.py
+
+xgboost-%:
+	@echo "🌲 Running XGBoost for context: $*"
+	$(PYTHON) $(SRC)/xgboost_ml.py --context $*
+
+# f-AnoGAN (GAN-based anomaly detection)
+gan:
+	@echo "🎭 Running f-AnoGAN training and evaluation..."
+	$(PYTHON) $(SRC)/gan_augmentation.py
+	$(PYTHON) $(SRC)/gan_evaluation.py
+
+gan-train:
+	@echo "🎭 Training f-AnoGAN models..."
+	$(PYTHON) $(SRC)/gan_augmentation.py
+
+gan-eval:
+	@echo "🎭 Evaluating f-AnoGAN models..."
+	$(PYTHON) $(SRC)/gan_evaluation.py
+
+# Data viewing and analysis
+view-data:
+	@echo "👁️  Viewing processed data and embeddings..."
+	$(PYTHON) $(SRC)/pickle_viewer.py
+
+view-embeddings:
+	@echo "👁️  Viewing embedding statistics..."
+	$(PYTHON) $(SRC)/embedding_testing.py
+
+# Testing
+test:
+	@echo "🧪 Running tests..."
+	$(PYTHON) $(SRC)/test_transformer.py
+	$(PYTHON) $(SRC)/test_combined_transformer.py
+
+test-preprocess:
+	@echo "🧪 Testing preprocessing..."
+	$(PYTHON) $(SRC)/preprocess_testing.py
+
+# =============================================================================
+# Development and Maintenance
+# =============================================================================
+
+# Install dependencies
+install:
+	@echo "📦 Installing dependencies..."
+	$(PIP) install -r requirements.txt
+
+# Status check - show what's available
+status:
+	@echo "📋 LBAD Pipeline Status:"
+	@echo "======================="
+	@echo "📁 Processed data:"
+	@ls -la processed/ 2>/dev/null || echo "   No processed data found"
+	@echo ""
+	@echo "🔗 Embeddings:"
+	@ls -la embeddings/ 2>/dev/null || echo "   No embeddings found"
+	@echo ""
+	@echo "🤖 Models:"
+	@ls -la models/ 2>/dev/null || echo "   No trained models found"
+	@echo ""
+	@echo "📊 Results:"
+	@ls -la results/ 2>/dev/null || echo "   No evaluation results found"
+
+# Cleaning
 clean:
+	@echo "🧹 Cleaning cache files..."
 	rm -rf __pycache__/ *.pyc
-	find . -name "__pycache__" -type d -exec rm -rf {} +
-	find . -name "*.pyc" -delete
+	find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+	find . -name "*.pyc" -delete 2>/dev/null || true
 
-clean-aug:
-	rm -rf augmented
-	mkdir -p augmented
+clean-models:
+	@echo "🧹 Removing trained models..."
+	rm -rf models/* checkpoints/*
+	mkdir -p models checkpoints
 
-clean-all:
-	rm -rf processed embeddings models results augmented
-	mkdir -p processed embeddings models results augmented
-	$(MAKE) clean
+clean-results:
+	@echo "🧹 Removing evaluation results..."
+	rm -rf results/*
+	mkdir -p results
 
-.PHONY: all install preprocess test fasttext word2vec tfidf ml ml-rf ml-xgb ml-knn ml-lr \
-        ml-evaluate xgboost-ml logbert transformer-ml transformer-ml-fast gan eval gan-pipeline gan-small eval-fast clean clean-aug clean-all help \
-        $(addprefix ml-,$(ML_CONTEXTS)) \
-        $(foreach ctx,$(ML_CONTEXTS),$(addprefix ml-$(ctx)-,rf xgb knn lr)) \
-        $(addprefix xgboost-ml-,$(ML_CONTEXTS)) \
-        $(addprefix logbert-,$(EMBEDDING_LOG_TYPES)) \
-        $(addprefix transformer-ml-,$(EMBEDDING_LOG_TYPES))
+clean-embeddings:
+	@echo "🧹 Removing embeddings..."
+	rm -rf embeddings/*
+	mkdir -p embeddings
+
+clean-processed:
+	@echo "🧹 Removing processed data..."
+	rm -rf processed/*
+	mkdir -p processed
+
+clean-all: clean
+	@echo "🧹 Removing all generated data..."
+	rm -rf processed embeddings models results checkpoints augmented
+	mkdir -p processed embeddings models results checkpoints augmented
+
+# =============================================================================
+# Quick Start Examples
+# =============================================================================
+
+# Quick start for new users
+quickstart:
+	@echo "🚀 LBAD Quick Start Guide:"
+	@echo "========================="
+	@echo ""
+	@echo "1. Install dependencies:"
+	@echo "   make install"
+	@echo ""
+	@echo "2. Run sample pipeline for wp-error:"
+	@echo "   make pipeline-wp-error"
+	@echo ""
+	@echo "3. Or run full pipeline for all types:"
+	@echo "   make pipeline-all"
+	@echo ""
+	@echo "4. Check results:"
+	@echo "   make status"
+	@echo ""
+	@echo "For help: make help"
+
+# Demo with sample data
+demo:
+	@echo "🎬 Running demo with sample data..."
+	$(MAKE) preprocess-wp-error
+	$(MAKE) embeddings-wp-error
+	$(MAKE) train-wp-error-sample
+	$(MAKE) evaluate-wp-error
+	@echo "✅ Demo completed! Check results/ directory"
+
+# =============================================================================
+# Advanced Workflows
+# =============================================================================
+
+# Research workflow - train and compare all models
+research:
+	@echo "🔬 Running research workflow..."
+	$(MAKE) pipeline-all
+	$(MAKE) ml-baseline
+	$(MAKE) gan
+	$(MAKE) compare
+	@echo "✅ Research workflow completed"
+
+# Production workflow - optimized for specific log type
+production-%:
+	@echo "🏭 Running production workflow for $*..."
+	$(MAKE) preprocess-$*
+	$(MAKE) logbert-$*
+	$(MAKE) train-$*
+	$(MAKE) evaluate-$*
+	@echo "✅ Production workflow completed for $*"
+
+# Benchmark all models
+benchmark:
+	@echo "⏱️  Running benchmark of all models..."
+	time $(MAKE) train-sample
+	time $(MAKE) ml-baseline
+	time $(MAKE) gan-train
+	$(MAKE) compare
+	@echo "✅ Benchmark completed"
+
+.PHONY: help pipeline-all pipeline-eval preprocess embeddings logbert fasttext train evaluate compare \
+        ml-baseline xgboost gan gan-train gan-eval view-data view-embeddings test test-preprocess \
+        install status clean clean-models clean-results clean-embeddings clean-processed clean-all \
+        quickstart demo research benchmark \
+        $(addprefix pipeline-,$(LOG_TYPES)) \
+        $(addprefix preprocess-,$(LOG_TYPES)) \
+        $(addprefix embeddings-,$(LOG_TYPES)) \
+        $(addprefix logbert-,$(LOG_TYPES)) \
+        $(addprefix fasttext-,$(LOG_TYPES)) \
+        $(addprefix train-,$(LOG_TYPES)) \
+        $(addprefix train-,$(addsuffix -sample,$(LOG_TYPES))) \
+        $(addprefix evaluate-,$(LOG_TYPES)) \
+        $(addprefix compare-,$(LOG_TYPES)) \
+        $(addprefix ml-baseline-,$(LOG_TYPES)) \
+        $(addprefix production-,$(LOG_TYPES))
