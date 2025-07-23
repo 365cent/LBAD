@@ -47,6 +47,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_recall_curve,
+    roc_curve, accuracy_score, precision_score, recall_score, f1_score,
+    classification_report, precision_recall_fscore_support
+)
+
 # Import system configuration from transformer module
 import sys
 sys.path.append('.')
@@ -626,10 +632,24 @@ class FANOGANEvaluator:
 #  MAIN EVALUATION PIPELINE
 # ---------------------------------------------------------------------------
 
+def discover_available_log_types() -> List[str]:
+    """Auto-discover available log types from embeddings directory"""
+    log_types = set()
+    
+    # Check embeddings directory
+    embeddings_dir = Path("embeddings")
+    if embeddings_dir.exists():
+        for item in embeddings_dir.iterdir():
+            if item.is_dir() and (item / f"log_{item.name}.pkl").exists():
+                log_types.add(item.name)
+    
+    return sorted(list(log_types))
+
+
 def main():
     parser = argparse.ArgumentParser(description="f-AnoGAN anomaly detection evaluation")
-    parser.add_argument("--log-type", type=str, required=True,
-                       help="Log type to evaluate (e.g., wp-access, wp-error)")
+    parser.add_argument("--log-type", type=str,
+                       help="Log type to evaluate (e.g., wp-access, wp-error). If not provided, runs on all available log types.")
     parser.add_argument("--latent-dim", type=int, default=128,
                        help="Latent dimension for f-AnoGAN")
     parser.add_argument("--epochs", type=int, default=200,
@@ -644,9 +664,21 @@ def main():
     # Detect system configuration
     config = detect_system_resources()
     
-    print("🚀 f-AnoGAN Anomaly Detection Evaluation")
-    print("=" * 60)
-    print(f"Log type: {args.log_type}")
+    # Auto-discover log types if not specified
+    if args.log_type:
+        log_types = [args.log_type]
+        print(f"🚀 f-AnoGAN Anomaly Detection Evaluation")
+        print("=" * 60)
+        print(f"Log type: {args.log_type}")
+    else:
+        log_types = discover_available_log_types()
+        print(f"🚀 f-AnoGAN Anomaly Detection Evaluation (Auto-Discovery)")
+        print("=" * 60)
+        print(f"🔍 Auto-detected log types: {log_types}")
+        if not log_types:
+            print("❌ No log types found. Please ensure embeddings are available.")
+            return
+    
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
     print(f"Latent dim: {args.latent_dim}")
@@ -655,51 +687,57 @@ def main():
     print(f"Lambda recon: {args.lambda_recon}")
     print("")
     
-    try:
-        # Initialize evaluator
-        evaluator = FANOGANEvaluator(config)
+    # Process each log type
+    for i, log_type in enumerate(log_types):
+        if len(log_types) > 1:
+            print(f"\n{'='*20} Processing {log_type} ({i+1}/{len(log_types)}) {'='*20}")
         
-        # 1. Load embeddings and labels
-        X, y_true, classes = evaluator.load_embeddings_and_labels(args.log_type)
-        
-        # 2. Train f-AnoGAN model
-        fanogan_model = evaluator.train_fanogan(
-            X, y_true, 
-            latent_dim=args.latent_dim,
-            n_epochs=args.epochs,
-            batch_size=args.batch_size
-        )
-        
-        # Update lambda_recon if specified
-        fanogan_model.cfg.lambda_recon = args.lambda_recon
-        
-        # 3. Evaluate anomaly detection
-        metrics, anomaly_scores, y_pred, y_multilabel_pred = evaluator.evaluate_anomaly_detection(
-            fanogan_model, X, y_true, classes
-        )
-        
-        # 4. Print results
-        evaluator.print_results(metrics, classes, y_true, y_pred, y_multilabel_pred)
-        
-        # 5. Save results and model
-        results_file, model_file = evaluator.save_results(
-            metrics, anomaly_scores, y_pred, y_true, y_multilabel_pred, args.log_type, fanogan_model, classes
-        )
-        
-        print(f"\n✅ Evaluation completed for {args.log_type}")
-        print(f"📁 Results: {results_file}")
-        print(f"📁 Model: {model_file}")
-        
-        # Summary
-        print(f"\n🎯 SUMMARY")
-        print(f"   ROC AUC:  {metrics['roc_auc']:.4f}")
-        print(f"   Avg Precision: {metrics['average_precision']:.4f}")
-        print(f"   Best F1:  {metrics['best_f1']:.4f}")
-        
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            # Initialize evaluator
+            evaluator = FANOGANEvaluator(config)
+            
+            # 1. Load embeddings and labels
+            X, y_true, classes = evaluator.load_embeddings_and_labels(log_type)
+            
+            # 2. Train f-AnoGAN model
+            fanogan_model = evaluator.train_fanogan(
+                X, y_true, 
+                latent_dim=args.latent_dim,
+                n_epochs=args.epochs,
+                batch_size=args.batch_size
+            )
+            
+            # Update lambda_recon if specified
+            fanogan_model.cfg.lambda_recon = args.lambda_recon
+            
+            # 3. Evaluate anomaly detection
+            metrics, anomaly_scores, y_pred, y_multilabel_pred = evaluator.evaluate_anomaly_detection(
+                fanogan_model, X, y_true, classes
+            )
+            
+            # 4. Print results
+            evaluator.print_results(metrics, classes, y_true, y_pred, y_multilabel_pred)
+            
+            # 5. Save results and model
+            results_file, model_file = evaluator.save_results(
+                metrics, anomaly_scores, y_pred, y_true, y_multilabel_pred, log_type, fanogan_model, classes
+            )
+            
+            print(f"\n✅ Evaluation completed for {log_type}")
+            print(f"📁 Results: {results_file}")
+            print(f"📁 Model: {model_file}")
+            
+            # Summary
+            print(f"\n🎯 SUMMARY")
+            print(f"   ROC AUC:  {metrics['roc_auc']:.4f}")
+            print(f"   Avg Precision: {metrics['average_precision']:.4f}")
+            print(f"   Best F1:  {metrics['best_f1']:.4f}")
+            
+        except Exception as e:
+            print(f"❌ Evaluation failed for {log_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
 
 if __name__ == "__main__":
