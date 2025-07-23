@@ -555,7 +555,8 @@ class ModelComparator:
             import traceback
             traceback.print_exc()
             return None
-        """Run transformer evaluation if not available"""
+
+    def run_transformer_evaluation(self, log_type: str) -> Optional[Dict]:
         
         print(f"🚀 Running transformer evaluation for {log_type}...")
         
