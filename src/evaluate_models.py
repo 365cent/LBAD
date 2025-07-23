@@ -24,9 +24,14 @@ Usage:
 import argparse
 import pickle
 import time
+import warnings
+import traceback
+import importlib.util
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
-import warnings
+import numpy as np
+import torch
+import sys
 
 import numpy as np
 import torch
@@ -483,7 +488,73 @@ class ModelComparator:
         
         return loaded_results
     
-    def run_transformer_evaluation(self, log_type: str) -> Optional[Dict]:
+    def run_fanogan_evaluation(self, log_type: str) -> Optional[Dict]:
+        """Run f-AnoGAN evaluation if not available"""
+        
+        print(f"🧠 Running f-AnoGAN evaluation for {log_type}...")
+        
+        try:
+            # Import f-AnoGAN evaluator
+            import importlib.util
+            import sys
+            
+            # Load the f-anogan module with hyphen in filename
+            spec = importlib.util.spec_from_file_location("fanogan_module", "src/f-anogan.py")
+            fanogan_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fanogan_module)
+            
+            FANOGANEvaluator = fanogan_module.FANOGANEvaluator
+            
+            # Initialize f-AnoGAN evaluator
+            fanogan_evaluator = FANOGANEvaluator(self.config)
+            
+            # Load data
+            X, y_true, classes = fanogan_evaluator.load_embeddings_and_labels(log_type)
+            
+            # Train f-AnoGAN model
+            fanogan_model = fanogan_evaluator.train_fanogan(
+                X, y_true, 
+                latent_dim=128, 
+                n_epochs=50,  # Reduced for faster evaluation
+                batch_size=256
+            )
+            
+            # Evaluate
+            metrics, anomaly_scores, y_pred_binary, y_pred_multilabel = fanogan_evaluator.evaluate_anomaly_detection(
+                fanogan_model, X, y_true, classes
+            )
+            
+            # Print results
+            fanogan_evaluator.print_results(metrics, classes, y_true, y_pred_binary, y_pred_multilabel)
+            
+            # Save results
+            results_file, model_file = fanogan_evaluator.save_results(
+                metrics, anomaly_scores, y_pred_binary, y_true, y_pred_multilabel, log_type, fanogan_model, classes
+            )
+            
+            # Create results structure compatible with comparison
+            results = {
+                'metrics': metrics,
+                'predictions': y_pred_multilabel,  # Use multi-label predictions for comparison
+                'predictions_binary': y_pred_binary,
+                'predictions_multilabel': y_pred_multilabel,
+                'probabilities': anomaly_scores,  # Use anomaly scores as "probabilities"
+                'anomaly_scores': anomaly_scores,
+                'true_labels': y_true,
+                'evaluation_type': 'fanogan_anomaly_detection',
+                'config': self.config.__dict__,
+                'timestamp': time.time(),
+                'classes': classes
+            }
+            
+            print(f"✅ f-AnoGAN evaluation completed and saved")
+            return results
+            
+        except Exception as e:
+            print(f"❌ f-AnoGAN evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
         """Run transformer evaluation if not available"""
         
         print(f"🚀 Running transformer evaluation for {log_type}...")
@@ -1140,6 +1211,13 @@ def main():
             if args.force_transformer_only:
                 print(f"🎯 Forced transformer-only evaluation")
                 loaded_results['fanogan'] = None
+            else:
+                # Try to run f-AnoGAN evaluation if missing
+                if not loaded_results.get('fanogan') and not args.compare_only:
+                    print(f"🔄 Running f-AnoGAN evaluation...")
+                    fanogan_results = comparator.run_fanogan_evaluation(log_type)
+                    if fanogan_results:
+                        loaded_results['fanogan'] = fanogan_results
             
             # Determine evaluation mode
             transformer_results = loaded_results['transformer']
