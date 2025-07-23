@@ -33,17 +33,383 @@ import torch
 from sklearn.metrics import (
     precision_recall_fscore_support, f1_score, accuracy_score, 
     hamming_loss, jaccard_score, precision_score, recall_score,
-    classification_report, roc_auc_score, average_precision_score
+    classification_report, roc_auc_score, average_precision_score,
+    precision_recall_curve, balanced_accuracy_score, confusion_matrix
 )
+from sklearn.preprocessing import RobustScaler, normalize
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
-# Import from transformer and f-anogan modules
+# Import from transformer module
 import sys
 sys.path.append('.')
-from src.transformer import detect_system_resources, SystemConfig
-from src.evaluate_transformer import TransformerEvaluator
+from src.transformer import UnsupervisedMultiLabelTransformer, detect_system_resources, SystemConfig
+
+
+class TransformerEvaluator:
+    """Clean transformer model evaluator using direct supervised approach"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.device = torch.device(config.device)
+    
+    def load_model(self, log_type: str, model_path: Optional[str] = None) -> Tuple[UnsupervisedMultiLabelTransformer, List[str], Optional[Any]]:
+        """Load trained transformer model"""
+        
+        if model_path:
+            ckpt_path = Path(model_path)
+        else:
+            # Auto-find model
+            models_dir = Path("models")
+            patterns = [
+                f"transformer_{log_type}_{self.config.node_name}_{self.config.job_id}.pth",
+                f"transformer_{log_type}_*.pth",
+                f"transformer_{log_type}.pth"
+            ]
+            
+            ckpt_path = None
+            for pattern in patterns:
+                matches = list(models_dir.glob(pattern))
+                if matches:
+                    ckpt_path = max(matches, key=lambda p: p.stat().st_mtime)
+                    break
+            
+            if not ckpt_path:
+                raise FileNotFoundError(f"No model found for {log_type}")
+        
+        print(f"📂 Loading model from {ckpt_path}")
+        
+        # Load checkpoint
+        try:
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            print(f"✅ Checkpoint loaded successfully")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint: {e}")
+        
+        # Extract model configuration
+        classes = ckpt['classes']
+        print(f"🔍 Found {len(classes)} classes in checkpoint")
+        
+        # Get input dimension from saved metadata (preferred) or infer from model structure
+        input_dim = ckpt.get('input_dim', None)
+        
+        if input_dim is None:
+            print("⚠️  No input_dim in metadata, inferring from model weights...")
+            # Fallback: try to determine from model state dict
+            for key, tensor in ckpt['model_state_dict'].items():
+                if 'input_proj' in key and 'weight' in key and len(tensor.shape) == 2:
+                    input_dim = tensor.shape[1]
+                    print(f"✅ Inferred input_dim={input_dim} from {key}")
+                    break
+        else:
+            print(f"✅ Using saved input_dim={input_dim}")
+        
+        if input_dim is None:
+            # Show available keys for debugging
+            model_keys = list(ckpt['model_state_dict'].keys())[:10]
+            raise ValueError(f"Could not determine input dimension from model checkpoint. "
+                           f"Available model keys (first 10): {model_keys}")
+        
+        # Rebuild model with same architecture
+        model = UnsupervisedMultiLabelTransformer(
+            input_dim=input_dim,
+            latent_dim=ckpt.get('latent_dim', 512),
+            n_labels=len(classes),
+            n_clusters=min(8, len(classes)),
+            dropout=0.1,
+            transformer_layers=ckpt.get('transformer_layers', 12),
+            attention_heads=ckpt.get('attention_heads', 16)
+        )
+        
+        # Load weights
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.to(self.device).eval()
+        
+        print(f"✅ Model loaded: {input_dim}D → {len(classes)} classes")
+        print(f"🏗️  Architecture: {ckpt.get('transformer_layers', 12)} layers, {ckpt.get('attention_heads', 16)} heads, {ckpt.get('latent_dim', 512)}D latent")
+        print(f"🏷️  Classes: {classes}")
+        
+        # Extract saved scaler if available
+        saved_scaler = ckpt.get('scaler', None)
+        if saved_scaler is not None:
+            print(f"✅ Found saved preprocessing scaler from training")
+        else:
+            print(f"⚠️  No saved scaler found (older model format)")
+        
+        return model, classes, saved_scaler
+    
+    def load_embeddings_and_labels(self, log_type: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Load LogBERT embeddings and true labels"""
+        
+        embeddings_dir = Path("embeddings") / log_type
+        
+        # Load embeddings
+        log_file = embeddings_dir / f"log_{log_type}.pkl"
+        if not log_file.exists():
+            raise FileNotFoundError(f"Embeddings not found: {log_file}")
+        
+        print(f"📂 Loading embeddings from {log_file}")
+        with open(log_file, 'rb') as f:
+            X = pickle.load(f)
+        
+        # Load labels
+        label_file = embeddings_dir / f"label_{log_type}.pkl"
+        if not label_file.exists():
+            raise FileNotFoundError(f"Labels not found: {label_file}")
+        
+        print(f"📂 Loading labels from {label_file}")
+        with open(label_file, 'rb') as f:
+            label_data = pickle.load(f)
+        
+        y_true = label_data["vectors"]
+        classes = label_data["classes"]
+        
+        print(f"✅ Loaded FULL dataset: {len(X):,} samples with {X.shape[1]}D embeddings")
+        print(f"📊 Labels: {y_true.shape} for {len(classes)} classes")
+        print(f"🎯 Evaluating on complete dataset (no sampling)")
+        
+        return X, y_true, classes
+    
+    def preprocess_embeddings(self, X: np.ndarray, saved_scaler=None) -> np.ndarray:
+        """Apply same preprocessing as training using saved scaler"""
+        
+        if saved_scaler is not None:
+            print(f"🔄 Preprocessing embeddings using saved scaler from training...")
+            # Use the same scaler that was used during training
+            X_scaled = saved_scaler.transform(X)
+        else:
+            print(f"⚠️  No saved scaler found, fitting new scaler (may cause inconsistency)...")
+            # Fallback: fit new scaler (not ideal)
+            scaler = RobustScaler()
+            X_scaled = scaler.fit_transform(X)
+        
+        # L2 normalization (same as training)
+        X_normalized = normalize(X_scaled, norm='l2', axis=1).astype(np.float32)
+        
+        print(f"✅ Preprocessing complete")
+        return X_normalized
+    
+    def predict(self, model: UnsupervisedMultiLabelTransformer, X: np.ndarray, 
+                batch_size: int = 64) -> Tuple[np.ndarray, np.ndarray]:
+        """Run forward pass and get predictions"""
+        print(f"🤖 Generating predictions...")
+        
+        predictions = []
+        probs = []
+        
+        model.eval()
+        with torch.no_grad():
+            for i in range(0, len(X), batch_size):
+                batch = torch.from_numpy(X[i:i+batch_size]).float().to(self.device)
+                logits = model(batch)["labels"]
+                batch_probs = torch.sigmoid(logits).cpu().numpy()
+                
+                probs.append(batch_probs)
+        
+        probs = np.vstack(probs)
+        predictions = (probs >= 0.5).astype(int)
+        
+        print(f"✅ Generated predictions for {len(predictions):,} samples")
+        return predictions, probs
+    
+    def optimize_thresholds(self, y_true: np.ndarray, probs: np.ndarray, 
+                          classes: List[str]) -> np.ndarray:
+        """Advanced per-class threshold optimization for highly imbalanced multi-label classification"""
+        from sklearn.metrics import precision_recall_curve, balanced_accuracy_score
+        
+        print(f"🎯 Optimizing advanced per-class thresholds...")
+        
+        n_classes = len(classes)
+        optimized_thresholds = np.zeros(n_classes)
+        
+        for i, cls in enumerate(classes):
+            y_true_class = y_true[:, i]
+            probs_class = probs[:, i]
+            
+            pos_samples = y_true_class.sum()
+            total_samples = len(y_true_class)
+            pos_rate = pos_samples / total_samples
+            
+            # Strategy selection based on class characteristics
+            if pos_samples == 0:
+                # No positive samples - use very high threshold to minimize false positives
+                optimized_thresholds[i] = 0.95
+                print(f"   {cls:<25} NO POS SAMPLES -> threshold: 0.95")
+                continue
+                
+            elif pos_samples < 10:
+                # Extremely rare classes (< 10 samples)
+                # Use precision-recall curve to find best threshold
+                precision, recall, thresholds_pr = precision_recall_curve(y_true_class, probs_class)
+                
+                # Find threshold that maximizes (precision * recall) / (precision + recall) = F1
+                f1_scores_pr = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+                
+                if len(f1_scores_pr) > 0:
+                    best_idx = np.argmax(f1_scores_pr)
+                    best_threshold = thresholds_pr[best_idx]
+                    
+                    # For extremely rare classes, bias towards higher recall (lower threshold)
+                    # to ensure we don't miss the few positive samples
+                    adjusted_threshold = best_threshold * 0.8  # Reduce by 20%
+                    optimized_thresholds[i] = np.clip(adjusted_threshold, 0.05, 0.90)
+                    best_f1 = f1_scores_pr[best_idx]
+                    print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_PR")
+                else:
+                    optimized_thresholds[i] = 0.3  # Conservative for rare classes
+                    print(f"   {cls:<25} threshold: 0.30 (fallback) | pos: {pos_samples} | RARE_FB")
+                    
+            else:
+                # Common classes (>= 10 samples)
+                # Use F1 optimization with fine-grained search
+                best_f1 = 0
+                best_threshold = 0.5
+                
+                for threshold in np.linspace(0.05, 0.95, 50):
+                    pred_class = (probs_class >= threshold).astype(int)
+                    f1 = f1_score(y_true_class, pred_class, zero_division=0)
+                    
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_threshold = threshold
+                
+                optimized_thresholds[i] = best_threshold
+                print(f"   {cls:<25} threshold: {best_threshold:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | COMMON_F1")
+        
+        return optimized_thresholds
+    
+    def compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
+                       probs: np.ndarray, classes: List[str]) -> Dict[str, Any]:
+        """Compute comprehensive supervised metrics"""
+        
+        # Overall multi-label metrics
+        metrics = {
+            'subset_accuracy': float(accuracy_score(y_true, y_pred)),
+            'hamming_loss': float(hamming_loss(y_true, y_pred)),
+            'micro_f1': float(f1_score(y_true, y_pred, average='micro', zero_division=0)),
+            'macro_f1': float(f1_score(y_true, y_pred, average='macro', zero_division=0)),
+            'weighted_f1': float(f1_score(y_true, y_pred, average='weighted', zero_division=0)),
+            'samples_f1': float(f1_score(y_true, y_pred, average='samples', zero_division=0)),
+            'micro_precision': float(precision_score(y_true, y_pred, average='micro', zero_division=0)),
+            'macro_precision': float(precision_score(y_true, y_pred, average='macro', zero_division=0)),
+            'micro_recall': float(recall_score(y_true, y_pred, average='micro', zero_division=0)),
+            'macro_recall': float(recall_score(y_true, y_pred, average='macro', zero_division=0)),
+            'jaccard_micro': float(jaccard_score(y_true, y_pred, average='micro', zero_division=0)),
+            'jaccard_macro': float(jaccard_score(y_true, y_pred, average='macro', zero_division=0)),
+        }
+        
+        # Per-class metrics
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, y_pred, average=None, zero_division=0
+        )
+        
+        metrics.update({
+            'per_class_precision': precision.tolist(),
+            'per_class_recall': recall.tolist(),
+            'per_class_f1': f1.tolist(),
+            'per_class_support': support.tolist(),
+            'classes': classes,
+            'n_samples': len(y_true),
+        })
+        
+        # Sample distribution analysis
+        pred_labels_per_sample = y_pred.sum(axis=1)
+        true_labels_per_sample = y_true.sum(axis=1)
+        
+        metrics.update({
+            'avg_predicted_labels': float(pred_labels_per_sample.mean()),
+            'avg_true_labels': float(true_labels_per_sample.mean()),
+            'samples_no_pred_labels': int((pred_labels_per_sample == 0).sum()),
+            'samples_no_true_labels': int((true_labels_per_sample == 0).sum()),
+            'samples_multi_pred_labels': int((pred_labels_per_sample > 1).sum()),
+            'samples_multi_true_labels': int((true_labels_per_sample > 1).sum()),
+        })
+        
+        return metrics
+    
+    def print_results(self, metrics: Dict[str, Any], classes: List[str], 
+                     y_true: np.ndarray, y_pred: np.ndarray):
+        """Print comprehensive results"""
+        
+        print(f"\n📊 TRANSFORMER EVALUATION RESULTS")
+        print("=" * 60)
+        print(f"Test samples:     {metrics['n_samples']:,}")
+        print(f"Classes:          {len(classes)}")
+        print("")
+        
+        print("OVERALL METRICS:")
+        print("-" * 40)
+        print(f"Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
+        print(f"Hamming Loss:     {metrics['hamming_loss']:.4f}")
+        print(f"Micro F1:         {metrics['micro_f1']:.4f}")
+        print(f"Macro F1:         {metrics['macro_f1']:.4f}")
+        print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
+        print(f"Samples F1:       {metrics['samples_f1']:.4f}")
+        print(f"Micro Precision:  {metrics['micro_precision']:.4f}")
+        print(f"Macro Precision:  {metrics['macro_precision']:.4f}")
+        print(f"Micro Recall:     {metrics['micro_recall']:.4f}")
+        print(f"Macro Recall:     {metrics['macro_recall']:.4f}")
+        print(f"Jaccard (Micro):  {metrics['jaccard_micro']:.4f}")
+        print(f"Jaccard (Macro):  {metrics['jaccard_macro']:.4f}")
+        print("")
+        
+        print("PER-CLASS METRICS:")
+        print("-" * 60)
+        print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+        print("-" * 60)
+        
+        for i, cls in enumerate(classes):
+            f1 = metrics['per_class_f1'][i]
+            precision = metrics['per_class_precision'][i]
+            recall = metrics['per_class_recall'][i]
+            support = metrics['per_class_support'][i]
+            print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8}")
+        
+        print("")
+        print("SAMPLE DISTRIBUTION:")
+        print("-" * 40)
+        print(f"Avg predicted labels/sample: {metrics['avg_predicted_labels']:.3f}")
+        print(f"Avg true labels/sample:      {metrics['avg_true_labels']:.3f}")
+        print(f"Samples with no pred labels: {metrics['samples_no_pred_labels']:,}")
+        print(f"Samples with no true labels: {metrics['samples_no_true_labels']:,}")
+        print(f"Samples with >1 pred labels: {metrics['samples_multi_pred_labels']:,}")
+        print(f"Samples with >1 true labels: {metrics['samples_multi_true_labels']:,}")
+        
+        print("")
+        print("SKLEARN CLASSIFICATION REPORT:")
+        print("-" * 60)
+        report = classification_report(y_true, y_pred, target_names=classes, zero_division=0, digits=3)
+        print(report)
+    
+    def save_results(self, metrics: Dict[str, Any], y_pred: np.ndarray, 
+                    probs: np.ndarray, y_true: np.ndarray, log_type: str, 
+                    thresholds: Optional[np.ndarray] = None):
+        """Save evaluation results"""
+        
+        output_dir = Path("results") / log_type
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save comprehensive results
+        results = {
+            'metrics': metrics,
+            'predictions': y_pred.astype(np.int8),
+            'probabilities': probs.astype(np.float32),
+            'true_labels': y_true.astype(np.int8),
+            'evaluation_type': 'direct_supervised_transformer',
+            'config': self.config.__dict__,
+            'timestamp': time.time()
+        }
+        
+        if thresholds is not None:
+            results['optimized_thresholds'] = thresholds.tolist()
+        
+        results_file = output_dir / f"transformer_evaluation_{log_type}_{self.config.node_name}_{self.config.job_id}.pkl"
+        with open(results_file, 'wb') as f:
+            pickle.dump(results, f)
+        
+        print(f"💾 Results saved to: {results_file}")
+        return results_file
 
 
 class ModelComparator:
@@ -602,10 +968,41 @@ class ModelComparator:
         return results_file
 
 
+def discover_available_log_types() -> List[str]:
+    """Auto-discover available log types from embeddings and models directories"""
+    log_types = set()
+    
+    # Check embeddings directory
+    embeddings_dir = Path("embeddings")
+    if embeddings_dir.exists():
+        for item in embeddings_dir.iterdir():
+            if item.is_dir() and (item / f"log_{item.name}.pkl").exists():
+                log_types.add(item.name)
+    
+    # Check models directory for transformer models
+    models_dir = Path("models")
+    if models_dir.exists():
+        for model_file in models_dir.glob("transformer_*.pth"):
+            # Extract log type from filename: transformer_LOG_TYPE_*.pth
+            parts = model_file.stem.split('_')
+            if len(parts) >= 2:
+                log_type = parts[1]
+                log_types.add(log_type)
+    
+    # Check f-AnoGAN results
+    results_dir = Path("results")
+    if results_dir.exists():
+        for item in results_dir.iterdir():
+            if item.is_dir():
+                log_types.add(item.name)
+    
+    return sorted(list(log_types))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-model evaluation and comparison")
-    parser.add_argument("--log-type", type=str, required=True,
-                       help="Log type to evaluate (e.g., wp-access, wp-error)")
+    parser.add_argument("--log-type", type=str, 
+                       help="Log type to evaluate (e.g., wp-access, wp-error). If not provided, runs on all available log types.")
     parser.add_argument("--compare-only", action="store_true",
                        help="Only compare existing results, don't run new evaluations")
     parser.add_argument("--force-transformer-only", action="store_true",
@@ -618,95 +1015,112 @@ def main():
     
     print("🚀 Multi-Model Evaluation and Comparison")
     print("=" * 60)
-    print(f"Log type: {args.log_type}")
     print(f"Device: {config.device}")
     print(f"Node: {config.node_name} | Job: {config.job_id}")
     print(f"Mode: {'Compare only' if args.compare_only else 'Full evaluation'}")
+    
+    # Auto-discover log types if not specified
+    if args.log_type:
+        log_types = [args.log_type]
+        print(f"Log type: {args.log_type}")
+    else:
+        log_types = discover_available_log_types()
+        print(f"🔍 Auto-detected log types: {log_types}")
+        if not log_types:
+            print("❌ No log types found. Please ensure embeddings and/or models are available.")
+            return
+    
     print("")
     
-    try:
-        # Initialize comparator
-        comparator = ModelComparator(config)
+    # Process each log type
+    for i, log_type in enumerate(log_types):
+        if len(log_types) > 1:
+            print(f"\n{'='*20} Processing {log_type} ({i+1}/{len(log_types)}) {'='*20}")
         
-        # Find available results
-        available_results = comparator.find_model_results(args.log_type)
-        print(f"📂 Available results:")
-        for model_type, results_file in available_results.items():
-            status = f"✅ {results_file}" if results_file else "❌ Not found"
-            print(f"   {model_type}: {status}")
-        print("")
-        
-        # Load existing results
-        loaded_results = comparator.load_model_results(available_results)
-        
-        # Handle missing transformer results
-        if not loaded_results.get('transformer') and not args.compare_only:
-            print(f"🔄 Running transformer evaluation...")
-            transformer_results = comparator.run_transformer_evaluation(args.log_type)
-            if transformer_results:
-                loaded_results['transformer'] = transformer_results
-        
-        # Check if we have transformer results
-        if not loaded_results.get('transformer'):
-            print(f"❌ No transformer results available and evaluation failed")
-            return
-        
-        # Handle f-AnoGAN results
-        if args.force_transformer_only:
-            print(f"🎯 Forced transformer-only evaluation")
-            loaded_results['fanogan'] = None
-        
-        # Determine evaluation mode
-        transformer_results = loaded_results['transformer']
-        fanogan_results = loaded_results.get('fanogan')
-        
-        if fanogan_results:
-            print(f"🔄 Running comparative evaluation...")
-            mode = "comparative"
-        else:
-            print(f"🔄 Running transformer-only evaluation...")
-            mode = "transformer_only"
-        
-        # Get classes from transformer results
-        classes = transformer_results['metrics']['classes']
-        
-        # Compute comparison metrics
-        comparison_metrics = comparator.compute_comparative_metrics(
-            transformer_results, fanogan_results, classes
-        )
-        
-        # Print results
-        comparator.print_comparison_results(comparison_metrics)
-        
-        # Save results
-        saved_files = comparator.save_comparison_results(comparison_metrics, args.log_type)
-        
-        print(f"\n✅ Evaluation completed for {args.log_type}")
-        print(f"📁 Results saved to:")
-        for file_path in saved_files:
-            print(f"   {file_path}")
-        
-        # Summary
-        t_f1 = comparison_metrics['transformer']['metrics']['macro_f1']
-        print(f"\n🎯 SUMMARY")
-        print(f"   Transformer F1: {t_f1:.4f}")
-        
-        if comparison_metrics.get('fanogan', {}).get('available', False):
-            f_f1 = comparison_metrics['fanogan']['metrics']['macro_f1']
-            print(f"   f-AnoGAN F1:    {f_f1:.4f}")
+        try:
+            # Initialize comparator
+            comparator = ModelComparator(config)
             
-            if comparison_metrics.get('comparison', {}).get('available', False):
-                agreement = comparison_metrics['comparison']['agreement_rate']
-                print(f"   Agreement:      {agreement:.4f}")
+            # Find available results
+            available_results = comparator.find_model_results(log_type)
+            print(f"📂 Available results for {log_type}:")
+            for model_type, results_file in available_results.items():
+                status = f"✅ {results_file}" if results_file else "❌ Not found"
+                print(f"   {model_type}: {status}")
+            print("")
+            
+            # Load existing results
+            loaded_results = comparator.load_model_results(available_results)
+            
+            # Handle missing transformer results
+            if not loaded_results.get('transformer') and not args.compare_only:
+                print(f"🔄 Running transformer evaluation...")
+                transformer_results = comparator.run_transformer_evaluation(log_type)
+                if transformer_results:
+                    loaded_results['transformer'] = transformer_results
+            
+            # Check if we have transformer results
+            if not loaded_results.get('transformer'):
+                print(f"❌ No transformer results available and evaluation failed for {log_type}")
+                continue
+            
+            # Handle f-AnoGAN results
+            if args.force_transformer_only:
+                print(f"🎯 Forced transformer-only evaluation")
+                loaded_results['fanogan'] = None
+            
+            # Determine evaluation mode
+            transformer_results = loaded_results['transformer']
+            fanogan_results = loaded_results.get('fanogan')
+            
+            if fanogan_results:
+                print(f"🔄 Running comparative evaluation...")
+                mode = "comparative"
+            else:
+                print(f"🔄 Running transformer-only evaluation...")
+                mode = "transformer_only"
+            
+            # Get classes from transformer results
+            classes = transformer_results['metrics']['classes']
+            
+            # Compute comparison metrics
+            comparison_metrics = comparator.compute_comparative_metrics(
+                transformer_results, fanogan_results, classes
+            )
+            
+            # Print results
+            comparator.print_comparison_results(comparison_metrics)
+            
+            # Save results
+            saved_files = comparator.save_comparison_results(comparison_metrics, log_type)
+            
+            print(f"\n✅ Evaluation completed for {log_type}")
+            print(f"📁 Results saved to:")
+            for file_path in saved_files:
+                print(f"   {file_path}")
+            
+            # Summary
+            t_f1 = comparison_metrics['transformer']['metrics']['macro_f1']
+            print(f"\n🎯 SUMMARY")
+            print(f"   Transformer F1: {t_f1:.4f}")
+            
+            if comparison_metrics.get('fanogan', {}).get('available', False):
+                f_f1 = comparison_metrics['fanogan']['metrics']['macro_f1']
+                print(f"   f-AnoGAN F1:    {f_f1:.4f}")
                 
-                if comparison_metrics['comparison']['ensemble_performance']['ensemble_improves_over_transformer']:
-                    ens_f1 = comparison_metrics['comparison']['ensemble_performance']['majority_vote_macro_f1']
-                    print(f"   Best Ensemble:  {ens_f1:.4f}")
-        
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+                if comparison_metrics.get('comparison', {}).get('available', False):
+                    agreement = comparison_metrics['comparison']['agreement_rate']
+                    print(f"   Agreement:      {agreement:.4f}")
+                    
+                    if comparison_metrics['comparison']['ensemble_performance']['ensemble_improves_over_transformer']:
+                        ens_f1 = comparison_metrics['comparison']['ensemble_performance']['majority_vote_macro_f1']
+                        print(f"   Best Ensemble:  {ens_f1:.4f}")
+            
+        except Exception as e:
+            print(f"❌ Evaluation failed for {log_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
 
 if __name__ == "__main__":

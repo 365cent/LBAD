@@ -3,29 +3,51 @@
 Universal Model Evaluation Pipeline
 ==================================
 
-Unified evaluation system that can evaluate:
-1. Transformer models (direct supervised multi-label classification)
-2. f-AnoGAN models (anomaly detection with multi-label conversion)
-3. Comparative analysis between different model types
-4. Ensemble methods combining multiple approaches
-
-Features:
-- Automatic model detection and loading
-- Standardized evaluation metrics across model types
-- Advanced threshold optimization for multi-label classification
-- Model comparison and ensemble evaluation
-- Backward compatibility with original evaluate_transformer.py usage
+This is a compatibility wrapper that redirects to the unified evaluate_models.py
+Maintains backward compatibility with original evaluate_transformer.py usage.
 
 Usage:
-    # Transformer-only evaluation (original behavior)
     python src/evaluate_transformer.py --log-type wp-error
     
-    # Multi-model comparison (new behavior)
-    python src/evaluate_transformer.py --log-type wp-error --compare-models
-    
-    # Force transformer-only even if other models exist
-    python src/evaluate_transformer.py --log-type wp-error --transformer-only
+All functionality has been moved to evaluate_models.py for better organization
+and to avoid circular import issues.
 """
+
+import sys
+import subprocess
+from pathlib import Path
+
+def main():
+    """Redirect to evaluate_models.py with transformer-only flag"""
+    
+    # Get command line arguments (excluding script name)
+    args = sys.argv[1:]
+    
+    # Add transformer-only flag to maintain original behavior
+    if '--compare-models' not in args and '--force-transformer-only' not in args:
+        args.append('--force-transformer-only')
+    
+    # Build command to run evaluate_models.py
+    script_path = Path(__file__).parent / 'evaluate_models.py'
+    cmd = [sys.executable, str(script_path)] + args
+    
+    print("🔄 Redirecting to unified evaluation system...")
+    print(f"Running: {' '.join(cmd)}")
+    print("")
+    
+    # Execute the command
+    try:
+        result = subprocess.run(cmd, check=True)
+        return result.returncode
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Evaluation failed with exit code {e.returncode}")
+        return e.returncode
+    except KeyboardInterrupt:
+        print("⚠️  Evaluation interrupted by user")
+        return 130
+
+if __name__ == "__main__":
+    exit(main())
 
 import argparse
 import pickle
