@@ -349,8 +349,8 @@ class FANOGANEvaluator:
         return fanogan
     
     def evaluate_anomaly_detection(self, fanogan: FANOGAN, X: np.ndarray, 
-                                  y_true: np.ndarray) -> Dict[str, Any]:
-        """Evaluate anomaly detection performance"""
+                                  y_true: np.ndarray, classes: List[str]) -> Dict[str, Any]:
+        """Evaluate anomaly detection performance and generate multi-label predictions"""
         from sklearn.metrics import (
             roc_auc_score, average_precision_score, precision_recall_curve,
             roc_curve, accuracy_score, precision_score, recall_score, f1_score
@@ -359,13 +359,63 @@ class FANOGANEvaluator:
         print(f"🔍 Computing anomaly scores...")
         anomaly_scores = fanogan.score(X)
         
+        # Convert anomaly scores to multi-label predictions for comparison
+        # Strategy: Use anomaly score as probability that ALL attack types are present
+        # This is a simplified approach for f-AnoGAN multi-label compatibility
+        print(f"🔄 Converting anomaly scores to multi-label predictions...")
+        
+        # Create multi-label predictions based on anomaly scores
+        # High anomaly score -> likely to have multiple attack types
+        # Low anomaly score -> likely normal (no attack types)
+        
+        # Method 1: Threshold-based multi-label prediction
+        # Use percentile-based thresholds for different attack types
+        y_multilabel_pred = np.zeros((len(X), len(classes)), dtype=int)
+        
+        # Sort classes by frequency in training data to assign different thresholds
+        if hasattr(y_true, 'shape') and len(y_true.shape) > 1:
+            # Original multi-label format available
+            class_frequencies = y_true.sum(axis=0)
+            # For anomaly detection compatibility, convert to binary
+            y_binary = (y_true.sum(axis=1) > 0).astype(int)
+        else:
+            # Already binary anomaly labels
+            y_binary = y_true
+            class_frequencies = np.ones(len(classes))  # Equal weighting
+        
+        # Assign predictions based on anomaly score percentiles
+        # Higher frequency classes get lower thresholds (more likely to be predicted)
+        score_percentiles = [99, 95, 90, 85, 80, 75, 70, 65]  # Descending thresholds
+        
+        for i, cls in enumerate(classes):
+            if i < len(score_percentiles):
+                threshold_percentile = score_percentiles[i]
+                threshold = np.percentile(anomaly_scores, threshold_percentile)
+                y_multilabel_pred[:, i] = (anomaly_scores >= threshold).astype(int)
+            else:
+                # For additional classes, use high threshold
+                threshold = np.percentile(anomaly_scores, 95)
+                y_multilabel_pred[:, i] = (anomaly_scores >= threshold).astype(int)
+        
+        print(f"✅ Generated multi-label predictions: {y_multilabel_pred.shape}")
+        print(f"   Prediction rate per class: {y_multilabel_pred.mean(axis=0)}")
+        
+        # Continue with binary anomaly detection evaluation
+        # Continue with binary anomaly detection evaluation
+        
+        # For binary anomaly detection, use original labels
+        if hasattr(y_true, 'shape') and len(y_true.shape) > 1:
+            y_binary = (y_true.sum(axis=1) > 0).astype(int)
+        else:
+            y_binary = y_true
+        
         # ROC curve and AUC
-        fpr, tpr, roc_thresholds = roc_curve(y_true, anomaly_scores)
-        roc_auc = roc_auc_score(y_true, anomaly_scores)
+        fpr, tpr, roc_thresholds = roc_curve(y_binary, anomaly_scores)
+        roc_auc = roc_auc_score(y_binary, anomaly_scores)
         
         # Precision-Recall curve and AP
-        precision, recall, pr_thresholds = precision_recall_curve(y_true, anomaly_scores)
-        avg_precision = average_precision_score(y_true, anomaly_scores)
+        precision, recall, pr_thresholds = precision_recall_curve(y_binary, anomaly_scores)
+        avg_precision = average_precision_score(y_binary, anomaly_scores)
         
         # Find optimal threshold using F1 score
         f1_scores = []
@@ -373,7 +423,7 @@ class FANOGANEvaluator:
         
         for threshold in thresholds_f1:
             y_pred = (anomaly_scores >= threshold).astype(int)
-            f1 = f1_score(y_true, y_pred, zero_division=0)
+            f1 = f1_score(y_binary, y_pred, zero_division=0)
             f1_scores.append(f1)
         
         best_f1_idx = np.argmax(f1_scores)
@@ -389,13 +439,13 @@ class FANOGANEvaluator:
             'average_precision': float(avg_precision),
             'best_threshold': float(best_threshold),
             'best_f1': float(best_f1),
-            'accuracy': float(accuracy_score(y_true, y_pred_optimal)),
-            'precision': float(precision_score(y_true, y_pred_optimal, zero_division=0)),
-            'recall': float(recall_score(y_true, y_pred_optimal, zero_division=0)),
-            'f1_score': float(f1_score(y_true, y_pred_optimal, zero_division=0)),
-            'anomaly_rate_true': float(y_true.mean()),
+            'accuracy': float(accuracy_score(y_binary, y_pred_optimal)),
+            'precision': float(precision_score(y_binary, y_pred_optimal, zero_division=0)),
+            'recall': float(recall_score(y_binary, y_pred_optimal, zero_division=0)),
+            'f1_score': float(f1_score(y_binary, y_pred_optimal, zero_division=0)),
+            'anomaly_rate_true': float(y_binary.mean()),
             'anomaly_rate_pred': float(y_pred_optimal.mean()),
-            'n_samples': len(y_true),
+            'n_samples': len(y_binary),
             'score_mean': float(anomaly_scores.mean()),
             'score_std': float(anomaly_scores.std()),
             'score_min': float(anomaly_scores.min()),
@@ -408,11 +458,11 @@ class FANOGANEvaluator:
             threshold_p = np.percentile(anomaly_scores, p)
             y_pred_p = (anomaly_scores >= threshold_p).astype(int)
             metrics[f'threshold_p{p}'] = float(threshold_p)
-            metrics[f'precision_p{p}'] = float(precision_score(y_true, y_pred_p, zero_division=0))
-            metrics[f'recall_p{p}'] = float(recall_score(y_true, y_pred_p, zero_division=0))
-            metrics[f'f1_p{p}'] = float(f1_score(y_true, y_pred_p, zero_division=0))
+            metrics[f'precision_p{p}'] = float(precision_score(y_binary, y_pred_p, zero_division=0))
+            metrics[f'recall_p{p}'] = float(recall_score(y_binary, y_pred_p, zero_division=0))
+            metrics[f'f1_p{p}'] = float(f1_score(y_binary, y_pred_p, zero_division=0))
         
-        return metrics, anomaly_scores, y_pred_optimal
+        return metrics, anomaly_scores, y_pred_optimal, y_multilabel_pred
     
     def print_results(self, metrics: Dict[str, Any]):
         """Print comprehensive anomaly detection results"""
@@ -460,8 +510,8 @@ class FANOGANEvaluator:
             print(f"{p}%{'':<7} {thresh:<12.4f} {prec:<10.3f} {rec:<8.3f} {f1:<8.3f}")
     
     def save_results(self, metrics: Dict[str, Any], anomaly_scores: np.ndarray,
-                    y_pred: np.ndarray, y_true: np.ndarray, log_type: str,
-                    fanogan_model: FANOGAN):
+                    y_pred: np.ndarray, y_true: np.ndarray, y_multilabel_pred: np.ndarray, 
+                    log_type: str, fanogan_model: FANOGAN):
         """Save evaluation results and trained model"""
         
         output_dir = Path("results") / log_type
@@ -471,8 +521,9 @@ class FANOGANEvaluator:
         results = {
             'metrics': metrics,
             'anomaly_scores': anomaly_scores.astype(np.float32),
-            'predictions': y_pred.astype(np.int8),
-            'true_labels': y_true.astype(np.int8),
+            'predictions_binary': y_pred.astype(np.int8),
+            'predictions_multilabel': y_multilabel_pred.astype(np.int8),
+            'true_labels': y_true.astype(np.int8) if hasattr(y_true, 'shape') and len(y_true.shape) == 1 else y_true.astype(np.int8),
             'evaluation_type': 'fanogan_anomaly_detection',
             'config': self.config.__dict__,
             'model_config': fanogan_model.cfg.__dict__,
@@ -489,6 +540,7 @@ class FANOGANEvaluator:
         
         print(f"💾 Results saved to: {results_file}")
         print(f"💾 Model saved to: {model_file}")
+        print(f"📊 Saved both binary and multi-label predictions for comparison")
         
         return results_file, model_file
 
@@ -545,8 +597,8 @@ def main():
         fanogan_model.cfg.lambda_recon = args.lambda_recon
         
         # 3. Evaluate anomaly detection
-        metrics, anomaly_scores, y_pred = evaluator.evaluate_anomaly_detection(
-            fanogan_model, X, y_true
+        metrics, anomaly_scores, y_pred, y_multilabel_pred = evaluator.evaluate_anomaly_detection(
+            fanogan_model, X, y_true, classes
         )
         
         # 4. Print results
@@ -554,7 +606,7 @@ def main():
         
         # 5. Save results and model
         results_file, model_file = evaluator.save_results(
-            metrics, anomaly_scores, y_pred, y_true, args.log_type, fanogan_model
+            metrics, anomaly_scores, y_pred, y_true, y_multilabel_pred, args.log_type, fanogan_model
         )
         
         print(f"\n✅ Evaluation completed for {args.log_type}")
