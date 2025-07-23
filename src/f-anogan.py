@@ -147,16 +147,32 @@ class FANOGAN:
     # -------------------------- TRAIN ------------------------------------
     def fit(self, embeddings: np.ndarray):
         x = torch.from_numpy(embeddings).float()
-        ds = DataLoader(TensorDataset(x), batch_size=self.cfg.batch_size, shuffle=True, drop_last=True)
+        
+        # Adjust batch size if dataset is too small
+        effective_batch_size = min(self.cfg.batch_size, len(embeddings))
+        if len(embeddings) < self.cfg.batch_size:
+            print(f"⚠️  Dataset too small ({len(embeddings)} samples), adjusting batch size to {effective_batch_size}")
+        
+        ds = DataLoader(TensorDataset(x), batch_size=effective_batch_size, shuffle=True, drop_last=False)
         opt_G = optim.Adam(self.G.parameters(), lr=self.cfg.lr, betas=(0.5, 0.9))
         opt_D = optim.Adam(self.D.parameters(), lr=self.cfg.lr, betas=(0.5, 0.9))
         opt_E = optim.Adam(self.E.parameters(), lr=self.cfg.lr, betas=(0.5, 0.9))
-        one = torch.tensor(1.0, device=self.cfg.device)
-        mone = -one
+        
+        # Initialize loss variables
+        loss_D = loss_G = loss_E = torch.tensor(0.0, device=self.cfg.device)
+        
         start = time.time()
         for epoch in range(self.cfg.n_epochs):
+            epoch_has_batches = False
             for i, (x_real,) in enumerate(ds):
+                epoch_has_batches = True
                 x_real = x_real.to(self.cfg.device)
+                
+                # Skip if batch is too small for BatchNorm
+                if x_real.size(0) < 2:
+                    print(f"⚠️  Skipping batch with size {x_real.size(0)} (too small for BatchNorm)")
+                    continue
+                
                 # ----------------- Train D ---------------------
                 for _ in range(self.cfg.n_critic):
                     z = torch.randn(x_real.size(0), self.cfg.latent_dim, device=self.cfg.device)
@@ -186,6 +202,11 @@ class FANOGAN:
                 if self.cfg.joint_training:
                     # back‑propagate into G as well
                     opt_G.step()
+            
+            if not epoch_has_batches:
+                print(f"⚠️  No valid batches in epoch {epoch+1}, dataset too small for training")
+                break
+                
             if (epoch + 1) % 20 == 0:
                 print(f"[f‑AnoGAN] epoch {epoch+1}/{self.cfg.n_epochs} | D {loss_D.item():.3f} | G {loss_G.item():.3f} | E {loss_E.item():.3f}")
         print(f"Training finished in {(time.time()-start)/60:.1f} min.")
@@ -273,7 +294,18 @@ class FANOGANEvaluator:
             anomaly_labels = y_true.flatten()
         
         print(f"✅ Loaded dataset: {len(X):,} samples with {X.shape[1]}D embeddings")
-        print(f"�� Anomaly rate: {anomaly_labels.mean():.3f}")
+        print(f"📊 Anomaly rate: {anomaly_labels.mean():.3f}")
+        
+        # Check for extreme imbalance
+        normal_count = (anomaly_labels == 0).sum()
+        total_count = len(anomaly_labels)
+        
+        # Warning for extreme imbalance
+        if normal_count < 50:
+            print(f"⚠️  EXTREME IMBALANCE DETECTED!")
+            print(f"   Only {normal_count} normal samples out of {total_count} total")
+            print(f"   This dataset may not be suitable for unsupervised anomaly detection")
+            print(f"   Consider using supervised classification instead")
         
         return X, anomaly_labels, classes
     
@@ -291,6 +323,18 @@ class FANOGANEvaluator:
         print(f"   Latent dimension: {latent_dim}")
         print(f"   Epochs: {n_epochs}")
         print(f"   Batch size: {batch_size}")
+        
+        # Check if we have enough normal samples
+        if len(X_normal) < 2:
+            raise ValueError(f"Insufficient normal samples for training: {len(X_normal)} < 2. "
+                           "f-AnoGAN requires at least 2 normal samples for BatchNorm layers.")
+        
+        if len(X_normal) < 10:
+            print(f"⚠️  Very few normal samples ({len(X_normal)}). Consider:")
+            print(f"   - Using a different anomaly detection method")
+            print(f"   - Rebalancing your dataset") 
+            print(f"   - Using data augmentation")
+            print(f"   Proceeding with training but results may be unreliable...")
         
         # Initialize and train f-AnoGAN
         fanogan = FANOGAN(
