@@ -549,6 +549,54 @@ def auto_detect_log_types() -> List[str]:
     return sorted(log_types)
 
 
+def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]]:
+    """
+    Load existing transformer predictions from results directory if available
+    
+    Returns:
+        Tuple of (predictions, probabilities, true_labels, classes) or None if not found
+    """
+    results_dir = Path("results") / log_type
+    predictions_file = results_dir / "predictions.pkl"
+    
+    if not predictions_file.exists():
+        print(f"🔍 No existing predictions found at {predictions_file}")
+        return None
+    
+    try:
+        print(f"📂 Loading existing predictions from {predictions_file}")
+        with open(predictions_file, 'rb') as f:
+            pred_data = pickle.load(f)
+        
+        # Extract data based on transformer.py output format
+        if isinstance(pred_data, dict):
+            predictions = pred_data.get('predictions', pred_data.get('binary_predictions'))
+            probabilities = pred_data.get('probabilities', pred_data.get('probs'))
+            true_labels = pred_data.get('true_labels', pred_data.get('y_true'))
+            classes = pred_data.get('classes', [])
+            
+            if predictions is not None and true_labels is not None and classes:
+                print(f"✅ Loaded existing predictions: {predictions.shape} predictions for {len(classes)} classes")
+                print(f"📊 True labels: {true_labels.shape}")
+                
+                # Convert to expected format
+                predictions = np.array(predictions)
+                probabilities = np.array(probabilities) if probabilities is not None else (predictions.astype(float) + 0.1)
+                true_labels = np.array(true_labels)
+                
+                return predictions, probabilities, true_labels, classes
+            else:
+                print(f"⚠️  Predictions file exists but missing required fields")
+                return None
+        else:
+            print(f"⚠️  Predictions file format not recognized")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error loading predictions: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained transformer model(s)")
     parser.add_argument("--log-type", type=str, 
@@ -590,56 +638,92 @@ def main():
         print(f"{'='*60}")
         
         try:
-            # Initialize evaluator
-            evaluator = TransformerEvaluator(config)
+            # First, try to load existing predictions from transformer.py output
+            existing_predictions = load_transformer_predictions(log_type)
             
-            # 1. Load trained model
-            model, model_classes, saved_scaler = evaluator.load_model(log_type, args.model_path)
-            
-            # 2. Load embeddings and true labels
-            X, y_true, data_classes = evaluator.load_embeddings_and_labels(log_type)
-            
-            # Verify class compatibility
-            if model_classes != data_classes:
-                print(f"⚠️  Class mismatch between model and data")
-                print(f"   Model classes: {model_classes}")
-                print(f"   Data classes: {data_classes}")
-                print(f"   Using model classes for evaluation")
-                classes = model_classes
+            if existing_predictions is not None:
+                print(f"✅ Using existing transformer predictions for {log_type}")
+                y_pred, probs, y_true, classes = existing_predictions
                 
-                # Adjust true labels to match model classes if needed
-                if len(model_classes) != len(data_classes):
-                    print(f"⚠️  Different number of classes, this may cause issues")
+                # Load additional embeddings info for model architecture details if needed
+                try:
+                    embeddings_dir = Path("embeddings") / log_type
+                    label_file = embeddings_dir / f"label_{log_type}.pkl"
+                    with open(label_file, 'rb') as f:
+                        label_data = pickle.load(f)
+                    data_classes = label_data.get("classes", classes)
+                    
+                    if data_classes != classes:
+                        print(f"⚠️  Class mismatch between predictions and data")
+                        print(f"   Prediction classes: {classes}")
+                        print(f"   Data classes: {data_classes}")
+                        print(f"   Using prediction classes for evaluation")
+                except Exception as e:
+                    print(f"⚠️  Could not load additional class info: {e}")
+                    data_classes = classes
+                
+                optimized_thresholds = None  # Will be computed in metrics
+                
             else:
-                print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
-                classes = model_classes
-            
-            # 3. Preprocess embeddings (same as training)
-            X_processed = evaluator.preprocess_embeddings(X, saved_scaler)
-            
-            # 4. Generate predictions
-            y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)
-            
-            # 5. Always optimize thresholds (default behavior)
-            optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
-            y_pred_optimized = (probs >= optimized_thresholds).astype(int)
-            
-            print(f"\n🎯 Using advanced optimized thresholds")
-            y_pred = y_pred_optimized
+                print(f"🤖 No existing predictions found, running full model evaluation for {log_type}")
+                
+                # Initialize evaluator
+                evaluator = TransformerEvaluator(config)
+                
+                # 1. Load trained model
+                model, model_classes, saved_scaler = evaluator.load_model(log_type, args.model_path)
+                
+                # 2. Load embeddings and true labels
+                X, y_true, data_classes = evaluator.load_embeddings_and_labels(log_type)
+                
+                # Verify class compatibility
+                if model_classes != data_classes:
+                    print(f"⚠️  Class mismatch between model and data")
+                    print(f"   Model classes: {model_classes}")
+                    print(f"   Data classes: {data_classes}")
+                    print(f"   Using model classes for evaluation")
+                    classes = model_classes
+                    
+                    # Adjust true labels to match model classes if needed
+                    if len(model_classes) != len(data_classes):
+                        print(f"⚠️  Different number of classes, this may cause issues")
+                else:
+                    print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
+                    classes = model_classes
+                
+                # 3. Preprocess embeddings (same as training)
+                X_processed = evaluator.preprocess_embeddings(X, saved_scaler)
+                
+                # 4. Generate predictions
+                y_pred, probs = evaluator.predict(model, X_processed, args.batch_size)
+                
+                # 5. Always optimize thresholds (default behavior)
+                optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
+                y_pred_optimized = (probs >= optimized_thresholds).astype(int)
+                
+                print(f"\n🎯 Using advanced optimized thresholds")
+                y_pred = y_pred_optimized
             
             # 6. Compute metrics
+            if existing_predictions is not None:
+                # Create a temporary evaluator just for metrics computation
+                evaluator = TransformerEvaluator(config)
+            
             metrics = evaluator.compute_metrics(y_true, y_pred, probs, classes)
             
             # 7. Print results
             evaluator.print_results(metrics, classes, y_true, y_pred)
             
-            # 8. Save results
-            results_file = evaluator.save_results(
-                metrics, y_pred, probs, y_true, log_type, optimized_thresholds
-            )
-            
-            print(f"\n✅ Evaluation completed for {log_type}")
-            print(f"📁 Results saved to: {results_file}")
+            # 8. Save results (only if we ran full evaluation)
+            if existing_predictions is None:
+                results_file = evaluator.save_results(
+                    metrics, y_pred, probs, y_true, log_type, optimized_thresholds
+                )
+                print(f"\n✅ Evaluation completed for {log_type}")
+                print(f"📁 Results saved to: {results_file}")
+            else:
+                print(f"\n✅ Evaluation completed for {log_type} using existing predictions")
+                results_file = f"existing predictions from results/{log_type}/predictions.pkl"
             
             # Store results for summary
             all_results[log_type] = {
