@@ -74,39 +74,28 @@ class TransformerEvaluator:
             if not ckpt_path:
                 raise FileNotFoundError(f"No model found for {log_type}")
         
-        print(f"📂 Loading model from {ckpt_path}")
+        print(f"Loading model: {ckpt_path}")
         
         # Load checkpoint
         try:
             ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-            print(f"✅ Checkpoint loaded successfully")
         except Exception as e:
             raise RuntimeError(f"Failed to load checkpoint: {e}")
         
         # Extract model configuration
         classes = ckpt['classes']
-        print(f"🔍 Found {len(classes)} classes in checkpoint")
-        
-        # Debug: show available metadata
-        metadata_keys = [k for k in ckpt.keys() if k != 'model_state_dict']
-        print(f"📋 Checkpoint metadata: {metadata_keys}")
         
         # Get input dimension from saved metadata (preferred) or infer from model structure
         input_dim = ckpt.get('input_dim', None)
         
         if input_dim is None:
-            print("⚠️  No input_dim in metadata, inferring from model weights...")
             # Fallback: try to determine from model state dict
             for key, tensor in ckpt['model_state_dict'].items():
                 if 'input_proj' in key and 'weight' in key and len(tensor.shape) == 2:
                     input_dim = tensor.shape[1]
-                    print(f"✅ Inferred input_dim={input_dim} from {key}")
                     break
-        else:
-            print(f"✅ Using saved input_dim={input_dim}")
         
         if input_dim is None:
-            # Show available keys for debugging
             model_keys = list(ckpt['model_state_dict'].keys())[:10]
             raise ValueError(f"Could not determine input dimension from model checkpoint. "
                            f"Available model keys (first 10): {model_keys}")
@@ -126,16 +115,10 @@ class TransformerEvaluator:
         model.load_state_dict(ckpt['model_state_dict'])
         model.to(self.device).eval()
         
-        print(f"✅ Model loaded: {input_dim}D → {len(classes)} classes")
-        print(f"🏗️  Architecture: {ckpt.get('transformer_layers', 12)} layers, {ckpt.get('attention_heads', 16)} heads, {ckpt.get('latent_dim', 512)}D latent")
-        print(f"🏷️  Classes: {classes}")
+        print(f"Model loaded: {input_dim}D → {len(classes)} classes")
         
         # Extract saved scaler if available
         saved_scaler = ckpt.get('scaler', None)
-        if saved_scaler is not None:
-            print(f"✅ Found saved preprocessing scaler from training")
-        else:
-            print(f"⚠️  No saved scaler found (older model format)")
         
         return model, classes, saved_scaler
     
@@ -149,7 +132,7 @@ class TransformerEvaluator:
         if not log_file.exists():
             raise FileNotFoundError(f"Embeddings not found: {log_file}")
         
-        print(f"📂 Loading embeddings from {log_file}")
+        print(f"Loading embeddings: {log_file}")
         with open(log_file, 'rb') as f:
             X = pickle.load(f)
         
@@ -158,16 +141,13 @@ class TransformerEvaluator:
         if not label_file.exists():
             raise FileNotFoundError(f"Labels not found: {label_file}")
         
-        print(f"📂 Loading labels from {label_file}")
         with open(label_file, 'rb') as f:
             label_data = pickle.load(f)
         
         y_true = label_data["vectors"]
         classes = label_data["classes"]
         
-        print(f"✅ Loaded FULL dataset: {len(X):,} samples with {X.shape[1]}D embeddings")
-        print(f"📊 Labels: {y_true.shape} for {len(classes)} classes")
-        print(f"🎯 Evaluating on complete dataset (no sampling)")
+        print(f"Loaded dataset: {len(X):,} samples, {X.shape[1]}D embeddings, {len(classes)} classes")
         
         return X, y_true, classes
     
@@ -443,34 +423,22 @@ class TransformerEvaluator:
                      y_true: np.ndarray, y_pred: np.ndarray):
         """Print comprehensive results"""
         
-        print(f"\n📊 TRANSFORMER EVALUATION RESULTS")
-        print("=" * 60)
-        print(f"Test samples:     {metrics['n_samples']:,}")
-        print(f"Classes:          {len(classes)}")
+        print(f"\nEVALUATION RESULTS")
+        print("-" * 40)
+        print(f"Test samples: {metrics['n_samples']:,} | Classes: {len(classes)}")
         print("")
         
-        print("OVERALL METRICS:")
-        print("-" * 40)
-        print(f"Subset Accuracy:  {metrics['subset_accuracy']:.4f} (exact match - very strict!)")
-        print(f"Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f} (more intuitive)")
-        print(f"Overall Correct:  {metrics['overall_correct_labels']:.4f} (1 - Hamming Loss)")
+        print("PERFORMANCE METRICS:")
+        print(f"Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
+        print(f"Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f}")
         print(f"Hamming Loss:     {metrics['hamming_loss']:.4f}")
         print(f"Micro F1:         {metrics['micro_f1']:.4f}")
         print(f"Macro F1:         {metrics['macro_f1']:.4f}")
         print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
-        print(f"Samples F1:       {metrics['samples_f1']:.4f}")
         print(f"Micro Precision:  {metrics['micro_precision']:.4f}")
         print(f"Macro Precision:  {metrics['macro_precision']:.4f}")
         print(f"Micro Recall:     {metrics['micro_recall']:.4f}")
         print(f"Macro Recall:     {metrics['macro_recall']:.4f}")
-        print(f"Jaccard (Micro):  {metrics['jaccard_micro']:.4f}")
-        print(f"Jaccard (Macro):  {metrics['jaccard_macro']:.4f}")
-        print("")
-        
-        print("PER-LABEL ACCURACIES:")
-        print("-" * 50)
-        for i, (cls, acc) in enumerate(zip(classes, metrics['per_label_accuracies'])):
-            print(f"   {cls:<20} {acc:.4f} ({acc*100:.1f}%)")
         print("")
         
         print("PER-CLASS METRICS:")
@@ -486,17 +454,7 @@ class TransformerEvaluator:
             print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8}")
         
         print("")
-        print("SAMPLE DISTRIBUTION:")
-        print("-" * 40)
-        print(f"Avg predicted labels/sample: {metrics['avg_predicted_labels']:.3f}")
-        print(f"Avg true labels/sample:      {metrics['avg_true_labels']:.3f}")
-        print(f"Samples with no pred labels: {metrics['samples_no_pred_labels']:,}")
-        print(f"Samples with no true labels: {metrics['samples_no_true_labels']:,}")
-        print(f"Samples with >1 pred labels: {metrics['samples_multi_pred_labels']:,}")
-        print(f"Samples with >1 true labels: {metrics['samples_multi_true_labels']:,}")
-        
-        print("")
-        print("SKLEARN CLASSIFICATION REPORT:")
+        print("CLASSIFICATION REPORT:")
         print("-" * 60)
         report = classification_report(y_true, y_pred, target_names=classes, zero_division=0, digits=3)
         print(report)
@@ -560,11 +518,9 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
     predictions_file = results_dir / "predictions.pkl"
     
     if not predictions_file.exists():
-        print(f"🔍 No existing predictions found at {predictions_file}")
         return None
     
     try:
-        print(f"📂 Loading existing predictions from {predictions_file}")
         with open(predictions_file, 'rb') as f:
             pred_data = pickle.load(f)
         
@@ -585,40 +541,23 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
                 true_labels = pred_data.get('y_true')
             
             if predictions is not None and true_labels is not None and classes:
-                print(f"✅ Loaded existing predictions: {predictions.shape} predictions for {len(classes)} classes")
-                print(f"📊 True labels: {true_labels.shape}")
-                print(f"🏷️  Classes: {classes}")
+                print(f"Loading cached predictions for {log_type}: {predictions.shape[0]:,} samples, {len(classes)} classes")
                 
                 # Convert to expected format
                 predictions = np.array(predictions)
                 probabilities = np.array(probabilities) if probabilities is not None else (predictions.astype(float) + 0.1)
                 true_labels = np.array(true_labels)
                 
-                # Show some statistics
-                pred_pos = predictions.sum()
-                true_pos = true_labels.sum()
-                print(f"📈 Prediction stats: {pred_pos:,} predicted positives, {true_pos:,} true positives")
-                
                 return predictions, probabilities, true_labels, classes
             else:
-                missing_fields = []
-                if predictions is None:
-                    missing_fields.append("predictions/preds")
-                if true_labels is None:
-                    missing_fields.append("true_labels")
-                if not classes:
-                    missing_fields.append("classes")
-                print(f"⚠️  Predictions file exists but missing required fields: {missing_fields}")
-                print(f"   Available keys: {list(pred_data.keys())}")
+                print(f"Warning: Predictions file for {log_type} missing required fields. Running full evaluation.")
                 return None
         else:
-            print(f"⚠️  Predictions file format not recognized - expected dict, got {type(pred_data)}")
+            print(f"Warning: Invalid predictions file format for {log_type}. Running full evaluation.")
             return None
             
     except Exception as e:
-        print(f"❌ Error loading predictions: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error loading predictions for {log_type}: {e}. Running full evaluation.")
         return None
 
 
@@ -642,32 +581,27 @@ def main():
     else:
         log_types = auto_detect_log_types()
         if not log_types:
-            print("❌ No valid log types found in embeddings directory!")
-            print("   Expected structure: embeddings/<log-type>/log_<log-type>.pkl and label_<log-type>.pkl")
+            print("No valid log types found in embeddings directory!")
+            print("Expected structure: embeddings/<log-type>/log_<log-type>.pkl and label_<log-type>.pkl")
             return
     
-    print("🚀 Transformer Model Evaluation (Direct Supervised)")
+    print("Transformer Model Evaluation")
     print("=" * 60)
-    print(f"Log types to evaluate: {', '.join(log_types)}")
-    print(f"Device: {config.device}")
-    print(f"Node: {config.node_name} | Job: {config.job_id}")
-    print(f"Advanced threshold optimization: ENABLED (default)")
-    print(f"📊 Dataset: Using FULL LogBERT embeddings (no sampling)")
+    print(f"Log types: {', '.join(log_types)}")
+    print(f"Device: {config.device} | Node: {config.node_name}")
     print("")
     
     all_results = {}
     
     for log_type in log_types:
-        print(f"\n{'='*60}")
-        print(f"🔍 EVALUATING: {log_type.upper()}")
-        print(f"{'='*60}")
+        print(f"\n{log_type.upper()}")
+        print("-" * 30)
         
         try:
             # First, try to load existing predictions from transformer.py output
             existing_predictions = load_transformer_predictions(log_type)
             
             if existing_predictions is not None:
-                print(f"✅ Using existing transformer predictions for {log_type}")
                 y_pred, probs, y_true, classes = existing_predictions
                 
                 # Load additional embeddings info for model architecture details if needed
@@ -679,18 +613,14 @@ def main():
                     data_classes = label_data.get("classes", classes)
                     
                     if data_classes != classes:
-                        print(f"⚠️  Class mismatch between predictions and data")
-                        print(f"   Prediction classes: {classes}")
-                        print(f"   Data classes: {data_classes}")
-                        print(f"   Using prediction classes for evaluation")
+                        print(f"Warning: Class mismatch between predictions and data. Using prediction classes.")
                 except Exception as e:
-                    print(f"⚠️  Could not load additional class info: {e}")
                     data_classes = classes
                 
-                optimized_thresholds = None  # Will be computed in metrics
+                optimized_thresholds = None
                 
             else:
-                print(f"🤖 No existing predictions found, running full model evaluation for {log_type}")
+                print(f"Running full model evaluation for {log_type}")
                 
                 # Initialize evaluator
                 evaluator = TransformerEvaluator(config)
@@ -703,17 +633,12 @@ def main():
                 
                 # Verify class compatibility
                 if model_classes != data_classes:
-                    print(f"⚠️  Class mismatch between model and data")
-                    print(f"   Model classes: {model_classes}")
-                    print(f"   Data classes: {data_classes}")
-                    print(f"   Using model classes for evaluation")
+                    print(f"Warning: Class mismatch between model and data. Using model classes.")
                     classes = model_classes
                     
-                    # Adjust true labels to match model classes if needed
                     if len(model_classes) != len(data_classes):
-                        print(f"⚠️  Different number of classes, this may cause issues")
+                        print(f"Warning: Different number of classes may cause issues.")
                 else:
-                    print(f"✅ Class compatibility verified: {len(model_classes)} classes match")
                     classes = model_classes
                 
                 # 3. Preprocess embeddings (same as training)
@@ -726,7 +651,7 @@ def main():
                 optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
                 y_pred_optimized = (probs >= optimized_thresholds).astype(int)
                 
-                print(f"\n🎯 Using advanced optimized thresholds")
+                print(f"Using optimized thresholds")
                 y_pred = y_pred_optimized
             
             # 6. Compute metrics
@@ -744,59 +669,39 @@ def main():
                 results_file = evaluator.save_results(
                     metrics, y_pred, probs, y_true, log_type, optimized_thresholds
                 )
-                print(f"\n✅ Evaluation completed for {log_type}")
-                print(f"📁 Results saved to: {results_file}")
-            else:
-                print(f"\n✅ Evaluation completed for {log_type} using existing predictions")
-                results_file = f"existing predictions from results/{log_type}/predictions.pkl"
+                print(f"Results saved to: {results_file}")
             
             # Store results for summary
             all_results[log_type] = {
                 'metrics': metrics,
                 'classes': classes,
-                'results_file': results_file
+                'results_file': f"results/{log_type}/predictions.pkl" if existing_predictions else results_file
             }
             
-            # Summary for this log type
-            print(f"\n🎯 SUMMARY FOR {log_type.upper()}")
-            print(f"   Macro F1:        {metrics['macro_f1']:.4f}")
-            print(f"   Micro F1:        {metrics['micro_f1']:.4f}")
-            print(f"   Label-wise Acc:  {metrics['label_wise_accuracy_micro']:.4f} (meaningful accuracy)")
-            print(f"   Subset Accuracy: {metrics['subset_accuracy']:.4f} (strict exact match)")
-            print(f"   Overall Correct: {metrics['overall_correct_labels']:.4f} (% labels correct)")
-            print("")
-            print(f"📈 INTERPRETATION:")
-            print(f"   • Your model correctly predicts ~{metrics['label_wise_accuracy_micro']*100:.1f}% of individual labels")
-            print(f"   • Only {metrics['subset_accuracy']*100:.1f}% of samples have ALL labels exactly right")
-            print(f"   • This is normal for multi-label problems - focus on F1 scores!")
-            
         except Exception as e:
-            print(f"❌ Evaluation failed for {log_type}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Evaluation failed for {log_type}: {e}")
             continue
     
     # Final summary across all log types
     if len(all_results) > 1:
         print(f"\n{'='*60}")
-        print(f"🎉 FINAL SUMMARY - ALL LOG TYPES")
+        print(f"EVALUATION SUMMARY")
         print(f"{'='*60}")
         
         for log_type, result in all_results.items():
             metrics = result['metrics']
-            print(f"\n📊 {log_type.upper()}:")
+            print(f"\n{log_type.upper()}:")
             print(f"   Macro F1: {metrics['macro_f1']:.4f} | Micro F1: {metrics['micro_f1']:.4f}")
             print(f"   Label-wise Accuracy: {metrics['label_wise_accuracy_micro']:.4f}")
             print(f"   Classes: {len(result['classes'])}")
         
-        print(f"\n✅ Evaluated {len(all_results)} log types successfully!")
-        print(f"📁 All results saved to respective results/ subdirectories")
+        print(f"\nEvaluated {len(all_results)} log types successfully.")
     
     elif len(all_results) == 1:
         log_type = list(all_results.keys())[0]
-        print(f"\n✅ Successfully evaluated {log_type}")
+        print(f"\nEvaluation completed for {log_type}")
     else:
-        print(f"\n❌ No evaluations completed successfully")
+        print(f"\nNo evaluations completed successfully")
 
 
 if __name__ == "__main__":
