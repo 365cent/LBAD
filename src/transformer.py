@@ -3839,7 +3839,7 @@ def evaluate_transformer_model(model: UnsupervisedMultiLabelTransformer,
                               true_labels: Optional[np.ndarray],
                               classes: List[str],
                               device: torch.device,
-                              val_split: float = 0.3) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
+                              val_split: float = 0.0) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
     """
     Comprehensive evaluation of transformer model with multi-label metrics
     Similar to ml_models.py but for unsupervised transformer
@@ -3850,7 +3850,7 @@ def evaluate_transformer_model(model: UnsupervisedMultiLabelTransformer,
         true_labels: True labels if available
         classes: List of class names
         device: Device to use for evaluation
-        val_split: Validation split fraction for threshold optimization
+        val_split: Validation split fraction for threshold optimization (0.0 = use all data)
     
     Returns:
         results: Dictionary of evaluation metrics
@@ -3877,6 +3877,7 @@ def evaluate_transformer_model(model: UnsupervisedMultiLabelTransformer,
     
     # Evaluate with true labels if available
     if true_labels is not None and n_val > 0:
+        # Use validation split for threshold optimization
         embeddings_val = embeddings[:n_val]
         embeddings_test = embeddings[n_val:]
         labels_val = true_labels[:n_val]
@@ -3903,6 +3904,25 @@ def evaluate_transformer_model(model: UnsupervisedMultiLabelTransformer,
         # Use test set predictions for return values
         predictions = predictions_test
         binary_predictions = binary_predictions
+        
+    elif true_labels is not None:
+        # Use all data for evaluation with default thresholding (no validation split)
+        print("Using all data for evaluation with default thresholding...")
+        
+        # Use simple threshold of 0.5 or class-balanced thresholds
+        class_frequencies = true_labels.mean(axis=0)
+        optimal_thresholds = np.clip(class_frequencies, 0.2, 0.8)  # Balance based on class frequency
+        binary_predictions = (predictions >= optimal_thresholds).astype(int)
+        
+        # Calculate comprehensive supervised metrics
+        results = calculate_supervised_metrics(
+            true_labels, binary_predictions, predictions, classes, optimal_thresholds
+        )
+        results.update({
+            'n_test_samples': len(true_labels),
+            'n_val_samples': 0,
+            'evaluation_type': 'supervised_no_split'
+        })
         
     else:
         # Unsupervised evaluation
@@ -4296,9 +4316,8 @@ def generate_per_class_accuracy_report(results_dir: Path, log_type: str,
     report_lines.append("")
     
     if true_labels is not None and len(true_labels) > 0:
-        # Use same validation split as training
-        val_size = int(len(true_labels) * 0.3)
-        test_labels = true_labels[val_size:]
+        # Use all data for evaluation (no validation split for reporting)
+        test_labels = true_labels
         test_predictions = binary_predictions
         
         # Adjust sizes if needed
