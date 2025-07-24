@@ -1337,11 +1337,11 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
         else:
             samples_per_gb = 150
     
-    # Only apply automatic memory-based subsampling if no explicit sample_size is provided
-    # AND the dataset is extremely large (>100k samples)
-    apply_auto_subsampling = (sample_size is None and len(embeddings) > 100000)
+    # Disable automatic memory-based subsampling to use all data
+    # Only apply if explicitly requested via sample_size parameter
+    apply_auto_subsampling = False  # Disabled to use full dataset
     
-    if apply_auto_subsampling:
+    if apply_auto_subsampling and sample_size is None and len(embeddings) > 100000:
         # Apply more conservative limits for CUDA to prevent OOM - but only for very large datasets
         if config.device == "cuda":
             max_samples = min(50000, int(config.gpu_memory_gb * samples_per_gb))  # Increased max
