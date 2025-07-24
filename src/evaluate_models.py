@@ -570,30 +570,55 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
         
         # Extract data based on transformer.py output format
         if isinstance(pred_data, dict):
-            predictions = pred_data.get('predictions', pred_data.get('binary_predictions'))
-            probabilities = pred_data.get('probabilities', pred_data.get('probs'))
-            true_labels = pred_data.get('true_labels', pred_data.get('y_true'))
+            # Check for transformer.py output format (actual structure)
+            predictions = pred_data.get('preds')  # Note: 'preds' not 'predictions'
+            probabilities = pred_data.get('probs')  # Note: 'probs' not 'probabilities'
+            true_labels = pred_data.get('true_labels')
             classes = pred_data.get('classes', [])
+            
+            # Fallback to alternative key names if the above don't exist
+            if predictions is None:
+                predictions = pred_data.get('predictions', pred_data.get('binary_predictions'))
+            if probabilities is None:
+                probabilities = pred_data.get('probabilities')
+            if true_labels is None:
+                true_labels = pred_data.get('y_true')
             
             if predictions is not None and true_labels is not None and classes:
                 print(f"✅ Loaded existing predictions: {predictions.shape} predictions for {len(classes)} classes")
                 print(f"📊 True labels: {true_labels.shape}")
+                print(f"🏷️  Classes: {classes}")
                 
                 # Convert to expected format
                 predictions = np.array(predictions)
                 probabilities = np.array(probabilities) if probabilities is not None else (predictions.astype(float) + 0.1)
                 true_labels = np.array(true_labels)
                 
+                # Show some statistics
+                pred_pos = predictions.sum()
+                true_pos = true_labels.sum()
+                print(f"📈 Prediction stats: {pred_pos:,} predicted positives, {true_pos:,} true positives")
+                
                 return predictions, probabilities, true_labels, classes
             else:
-                print(f"⚠️  Predictions file exists but missing required fields")
+                missing_fields = []
+                if predictions is None:
+                    missing_fields.append("predictions/preds")
+                if true_labels is None:
+                    missing_fields.append("true_labels")
+                if not classes:
+                    missing_fields.append("classes")
+                print(f"⚠️  Predictions file exists but missing required fields: {missing_fields}")
+                print(f"   Available keys: {list(pred_data.keys())}")
                 return None
         else:
-            print(f"⚠️  Predictions file format not recognized")
+            print(f"⚠️  Predictions file format not recognized - expected dict, got {type(pred_data)}")
             return None
             
     except Exception as e:
         print(f"❌ Error loading predictions: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
