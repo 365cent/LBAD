@@ -3,14 +3,14 @@
 """
 Transformer-based Unsupervised Anomaly Detection for Log Analysis
 
-This model trains ONLY on normal logs (unsupervised) and detects anomalies based on 
+This model handles extreme data imbalance and detects anomalies based on 
 reconstruction error and latent space deviation. The approach is inspired by:
 - One-class classification paradigms
 - Autoencoder-based anomaly detection
 - Transformer reconstruction capabilities
 
 Key Innovation:
-- Train exclusively on normal logs (attack_flag = 0)
+- Adaptive training strategy for extreme imbalance (99%+ attacks)
 - Use reconstruction error as anomaly score
 - Add binary anomaly flag to output embeddings
 - Maintain compatibility with downstream supervised models
@@ -19,7 +19,7 @@ Key Innovation:
 Architecture:
 - Input: Original embeddings (FastText/BERT/LogBERT)
 - Output: Enhanced embeddings + anomaly_flag (0=normal, 1=anomaly)
-- Training: Only normal logs (unsupervised reconstruction)
+- Training: Adaptive (normal logs or all data for extreme imbalance)
 - Inference: All logs with anomaly scoring
 
 Optimized for Research Alliance of Canada infrastructure:
@@ -27,6 +27,7 @@ Optimized for Research Alliance of Canada infrastructure:
 - Automatic embedding type detection
 - Conservative memory usage for large datasets
 - Comprehensive anomaly scoring metrics
+- M2/MPS compatibility for Apple Silicon
 """
 
 import os
@@ -64,7 +65,8 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import (
     classification_report, precision_recall_fscore_support,
     f1_score, accuracy_score, roc_auc_score, average_precision_score,
-    precision_recall_curve, roc_curve, confusion_matrix
+    precision_recall_curve, roc_curve, confusion_matrix,
+    precision_score, recall_score
 )
 from sklearn.neighbors import NearestNeighbors
 
@@ -78,6 +80,228 @@ torch.cuda.manual_seed_all(42)
 np.random.seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+# =============================================================================
+# Log Type Discovery and Grouping
+# =============================================================================
+
+@dataclass
+class LogFamily:
+    """Represents a family of related log types"""
+    name: str
+    log_types: List[str]
+    description: str
+    category: str  # 'web', 'infrastructure', 'company', 'monitoring', etc.
+
+def discover_available_log_types() -> List[str]:
+    """Discover all available log types from the embeddings directory"""
+    embeddings_dir = Path("embeddings")
+    
+    if not embeddings_dir.exists():
+        print("⚠️  Embeddings directory not found")
+        return []
+    
+    log_types = []
+    for item in embeddings_dir.iterdir():
+        if item.is_dir():
+            # Check if it contains the required files
+            log_file = item / f"log_{item.name}.pkl"
+            label_file = item / f"label_{item.name}.pkl"
+            
+            if log_file.exists() and label_file.exists():
+                log_types.append(item.name)
+    
+    return sorted(log_types)
+
+def analyze_log_type_patterns(log_types: List[str]) -> Dict[str, List[str]]:
+    """Analyze log types to find patterns and group them"""
+    
+    # Define known patterns and their families
+    patterns = {
+        # Web server logs
+        r'^wp-': 'wp',  # wp-access, wp-error
+        r'^apache': 'apache',  # apache logs
+        r'^nginx': 'nginx',  # nginx logs
+        
+        # Company/organization logs
+        r'^(fox|harrison|russellmitchell|santos|shaw|wardbeck|wheeler|wilson)$': 'company',
+        
+        # Infrastructure logs
+        r'^inet-firewall': 'firewall',
+        r'^intranet_server': 'intranet',
+        r'^vpn': 'vpn',
+        r'^monitoring': 'monitoring',
+        r'^internal_share': 'internal',
+        
+        # Generic patterns
+        r'-access$': 'access_logs',
+        r'-error$': 'error_logs',
+        r'-log$': 'generic_logs',
+    }
+    
+    # Group log types by patterns
+    grouped = {}
+    ungrouped = []
+    
+    for log_type in log_types:
+        matched = False
+        
+        for pattern, family in patterns.items():
+            if re.match(pattern, log_type):
+                if family not in grouped:
+                    grouped[family] = []
+                grouped[family].append(log_type)
+                matched = True
+                break
+        
+        if not matched:
+            ungrouped.append(log_type)
+    
+    # Handle ungrouped log types
+    if ungrouped:
+        for log_type in ungrouped:
+            # Try to extract a prefix
+            if '-' in log_type:
+                prefix = log_type.split('-')[0]
+                family = f"{prefix}_logs"
+                if family not in grouped:
+                    grouped[family] = []
+                grouped[family].append(log_type)
+            else:
+                # Single word log types get their own family
+                family = f"{log_type}_logs"
+                grouped[family] = [log_type]
+    
+    return grouped
+
+def create_log_families(grouped_logs: Dict[str, List[str]]) -> List[LogFamily]:
+    """Create LogFamily objects from grouped log types"""
+    
+    families = []
+    
+    # Define family descriptions and categories
+    family_info = {
+        'wp': ('Web Server Logs', 'web'),
+        'apache': ('Apache Server Logs', 'web'),
+        'nginx': ('Nginx Server Logs', 'web'),
+        'company': ('Company/Organization Logs', 'company'),
+        'firewall': ('Firewall Logs', 'infrastructure'),
+        'intranet': ('Intranet Server Logs', 'infrastructure'),
+        'vpn': ('VPN Logs', 'infrastructure'),
+        'monitoring': ('Monitoring System Logs', 'monitoring'),
+        'internal': ('Internal Share Logs', 'infrastructure'),
+        'access_logs': ('Access Logs', 'web'),
+        'error_logs': ('Error Logs', 'web'),
+        'generic_logs': ('Generic Logs', 'system'),
+    }
+    
+    for family_name, log_types in grouped_logs.items():
+        # Get description and category
+        if family_name in family_info:
+            description, category = family_info[family_name]
+        else:
+            # Generate description for unknown families
+            if family_name.endswith('_logs'):
+                base_name = family_name[:-5]
+                description = f"{base_name.title()} Logs"
+                category = 'system'
+            else:
+                description = f"{family_name.title()} Logs"
+                category = 'system'
+        
+        families.append(LogFamily(
+            name=family_name,
+            log_types=sorted(log_types),
+            description=description,
+            category=category
+        ))
+    
+    return sorted(families, key=lambda x: x.name)
+
+def get_log_family_stats(family: LogFamily) -> Dict[str, any]:
+    """Get statistics for a log family"""
+    total_samples = 0
+    total_attack_samples = 0
+    total_normal_samples = 0
+    all_classes = set()
+    
+    for log_type in family.log_types:
+        try:
+            # Load embeddings
+            log_file = Path("embeddings") / log_type / f"log_{log_type}.pkl"
+            label_file = Path("embeddings") / log_type / f"label_{log_type}.pkl"
+            
+            if log_file.exists() and label_file.exists():
+                with open(log_file, 'rb') as f:
+                    embeddings = pickle.load(f)
+                
+                with open(label_file, 'rb') as f:
+                    label_data = pickle.load(f)
+                
+                if isinstance(label_data, dict) and 'vectors' in label_data:
+                    vectors = label_data['vectors']
+                    classes = label_data.get('classes', [])
+                    
+                    # Calculate statistics
+                    total_samples += len(embeddings)
+                    attack_flags = (vectors.sum(axis=1) > 0).astype(int)
+                    total_attack_samples += attack_flags.sum()
+                    total_normal_samples += (attack_flags == 0).sum()
+                    all_classes.update(classes)
+        
+        except Exception as e:
+            print(f"⚠️  Error processing {log_type}: {e}")
+    
+    return {
+        'total_samples': total_samples,
+        'total_attack_samples': total_attack_samples,
+        'total_normal_samples': total_normal_samples,
+        'attack_rate': total_attack_samples / total_samples if total_samples > 0 else 0,
+        'unique_classes': list(all_classes),
+        'log_types': family.log_types
+    }
+
+def discover_and_group_logs() -> Tuple[List[LogFamily], Dict[str, any]]:
+    """Main function to discover and group log types"""
+    
+    print("🔍 Discovering available log types...")
+    log_types = discover_available_log_types()
+    
+    if not log_types:
+        print("❌ No log types found in embeddings directory")
+        return [], {}
+    
+    print(f"📊 Found {len(log_types)} log types: {log_types}")
+    
+    # Group log types
+    grouped = analyze_log_type_patterns(log_types)
+    
+    # Create log families
+    families = create_log_families(grouped)
+    
+    # Get statistics for each family
+    family_stats = {}
+    for family in families:
+        stats = get_log_family_stats(family)
+        family_stats[family.name] = stats
+    
+    # Print summary
+    print(f"\n📋 Log Family Summary:")
+    print("=" * 60)
+    
+    for family in families:
+        stats = family_stats[family.name]
+        print(f"\n🏷️  {family.name.upper()} ({family.description})")
+        print(f"   Category: {family.category}")
+        print(f"   Log types: {', '.join(family.log_types)}")
+        print(f"   Total samples: {stats['total_samples']:,}")
+        print(f"   Attack samples: {stats['total_attack_samples']:,} ({stats['attack_rate']:.1f}%)")
+        print(f"   Normal samples: {stats['total_normal_samples']:,}")
+        print(f"   Unique classes: {len(stats['unique_classes'])}")
+        if stats['unique_classes']:
+            print(f"   Classes: {', '.join(stats['unique_classes'][:5])}{'...' if len(stats['unique_classes']) > 5 else ''}")
+    
+    return families, family_stats
 
 # Configuration paths
 CHECKPOINT_DIR = Path("checkpoints") / "transformer_anomaly"
@@ -101,6 +325,7 @@ class SystemConfig:
     world_size: int
     node_name: str
     job_id: str
+    supports_multiprocessing: bool
 
 def detect_system_resources() -> SystemConfig:
     """Comprehensive system resource detection"""
@@ -139,11 +364,15 @@ def detect_system_resources() -> SystemConfig:
     node_name = os.environ.get('SLURM_NODELIST', 'unknown')
     job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
 
+    # Determine if multiprocessing is safe
+    # MPS doesn't support multiprocessing with tensors, so we need to disable it
+    supports_multiprocessing = device != "mps"
+
     return SystemConfig(
         device=device, n_gpus=n_gpus, total_memory_gb=total_memory_gb,
         gpu_memory_gb=gpu_memory_gb, n_cpus=n_cpus, 
         is_distributed=is_distributed, rank=rank, world_size=world_size,
-        node_name=node_name, job_id=job_id
+        node_name=node_name, job_id=job_id, supports_multiprocessing=supports_multiprocessing
     )
 
 def setup_distributed_training(rank: int, world_size: int):
@@ -415,6 +644,126 @@ class ProgressTracker:
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=2)
 
+def load_family_data(family: LogFamily, config: SystemConfig, tracker: ProgressTracker, 
+                    sample_size: int = None) -> Tuple[np.ndarray, np.ndarray, List[str], StandardScaler]:
+    """Load and combine data from all log types in a family"""
+    print(f"🔄 Loading data for family: {family.name}")
+    print(f"   Log types: {', '.join(family.log_types)}")
+    
+    all_embeddings = []
+    all_labels = []
+    all_classes = set()
+    
+    for log_type in family.log_types:
+        log_file = Path("embeddings") / log_type / f"log_{log_type}.pkl"
+        label_file = Path("embeddings") / log_type / f"label_{log_type}.pkl"
+        
+        if not log_file.exists() or not label_file.exists():
+            print(f"⚠️  Skipping {log_type} - files not found")
+            continue
+        
+        # Load embeddings
+        with open(log_file, 'rb') as f:
+            embeddings = pickle.load(f)
+        
+        # Load labels
+        with open(label_file, 'rb') as f:
+            label_data = pickle.load(f)
+        
+        if isinstance(label_data, dict) and 'vectors' in label_data:
+            labels = label_data['vectors']
+            classes = label_data.get('classes', [])
+            all_classes.update(classes)
+        else:
+            labels = np.zeros((len(embeddings), 1), dtype=np.int32)
+            classes = ['normal']
+        
+        print(f"   {log_type}: {len(embeddings):,} samples, {len(classes)} classes")
+        
+        all_embeddings.append(embeddings)
+        all_labels.append(labels)
+    
+    if not all_embeddings:
+        raise ValueError(f"No valid data found for family {family.name}")
+    
+    # Combine all data
+    combined_embeddings = np.vstack(all_embeddings)
+    combined_labels = np.vstack(all_labels)
+    
+    # Create anomaly flags
+    anomaly_flags = (combined_labels.sum(axis=1) > 0).astype(np.int32)
+    
+    print(f"📊 Combined Family Data:")
+    print(f"   Total samples: {len(combined_embeddings):,}")
+    print(f"   Normal samples: {(anomaly_flags == 0).sum():,} ({(anomaly_flags == 0).sum()/len(anomaly_flags)*100:.1f}%)")
+    print(f"   Attack samples: {(anomaly_flags == 1).sum():,} ({(anomaly_flags == 1).sum()/len(anomaly_flags)*100:.1f}%)")
+    print(f"   Unique classes: {len(all_classes)}")
+    
+    # Check for extreme imbalance
+    normal_ratio = (anomaly_flags == 0).sum() / len(anomaly_flags)
+    if normal_ratio < 0.01:  # Less than 1% normal
+        print(f"⚠️  EXTREME IMBALANCE DETECTED!")
+        print(f"   Only {normal_ratio:.1%} normal samples")
+        print(f"   Using all data for training with adaptive thresholding")
+        
+        # For extreme imbalance, use all data but with different strategy
+        training_embeddings = combined_embeddings
+        training_flags = anomaly_flags
+    else:
+        # Use only normal samples for training
+        normal_mask = (anomaly_flags == 0)
+        training_embeddings = combined_embeddings[normal_mask]
+        training_flags = anomaly_flags[normal_mask]
+        print(f"✅ Using {len(training_embeddings):,} normal samples for training")
+    
+    print(f"📊 Data split:")
+    print(f"   Total samples: {len(combined_embeddings):,}")
+    print(f"   Training samples: {len(training_embeddings):,}")
+    print(f"   Anomaly samples: {(anomaly_flags == 1).sum():,}")
+    print(f"   Anomaly rate: {anomaly_flags.mean():.1%}")
+    
+    # Apply sample size limit if specified
+    if sample_size is not None and sample_size < len(combined_embeddings):
+        # Maintain the same normal/anomaly ratio
+        training_ratio = len(training_embeddings) / len(combined_embeddings)
+        training_sample_size = int(sample_size * training_ratio)
+        
+        # Sample training logs
+        if training_sample_size < len(training_embeddings):
+            training_indices = np.random.choice(len(training_embeddings), size=training_sample_size, replace=False)
+            training_embeddings = training_embeddings[training_indices]
+        
+        # Sample all logs (maintaining ratio)
+        indices = np.random.choice(len(combined_embeddings), size=sample_size, replace=False)
+        combined_embeddings = combined_embeddings[indices]
+        anomaly_flags = anomaly_flags[indices]
+        
+        print(f"🎯 Dataset limited to {sample_size:,} samples")
+        print(f"   Training samples: {len(training_embeddings):,}")
+    
+    # Normalize embeddings using training data
+    scaler = RobustScaler()
+    training_embeddings = scaler.fit_transform(training_embeddings).astype(np.float32)
+    
+    # Apply same normalization to all embeddings
+    all_embeddings = scaler.transform(combined_embeddings).astype(np.float32)
+    
+    # Additional L2 normalization
+    from sklearn.preprocessing import normalize
+    training_embeddings = normalize(training_embeddings, norm='l2', axis=1)
+    all_embeddings = normalize(all_embeddings, norm='l2', axis=1)
+    
+    tracker.log_step("Family Data Preprocessing", {
+        "family": family.name,
+        "log_types": family.log_types,
+        "training_embeddings_shape": training_embeddings.shape,
+        "all_embeddings_shape": all_embeddings.shape,
+        "classes": list(all_classes),
+        "training_ratio": float(len(training_embeddings) / len(all_embeddings))
+    })
+    
+    return training_embeddings, all_embeddings, anomaly_flags, list(all_classes), scaler
+
 def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: ProgressTracker, 
                            sample_size: int = None) -> Tuple[np.ndarray, np.ndarray, List[str], StandardScaler]:
     """
@@ -481,26 +830,39 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
         classes = ['normal']
         print("⚠️  No attack labels found - treating all logs as normal")
     
-    # Filter normal logs for training
-    normal_mask = (anomaly_flags == 0)
-    normal_embeddings = embeddings[normal_mask]
+    # Check for extreme imbalance
+    normal_ratio = (anomaly_flags == 0).sum() / len(anomaly_flags)
+    if normal_ratio < 0.01:  # Less than 1% normal
+        print(f"⚠️  EXTREME IMBALANCE DETECTED!")
+        print(f"   Only {normal_ratio:.1%} normal samples")
+        print(f"   Using all data for training with adaptive thresholding")
+        
+        # For extreme imbalance, use all data but with different strategy
+        training_embeddings = embeddings
+        training_flags = anomaly_flags
+    else:
+        # Filter normal logs for training
+        normal_mask = (anomaly_flags == 0)
+        training_embeddings = embeddings[normal_mask]
+        training_flags = anomaly_flags[normal_mask]
+        print(f"✅ Using {len(training_embeddings):,} normal samples for training")
     
     print(f"📊 Data split:")
     print(f"   Total samples: {len(embeddings):,}")
-    print(f"   Normal samples (for training): {len(normal_embeddings):,}")
+    print(f"   Training samples: {len(training_embeddings):,}")
     print(f"   Anomaly samples: {(anomaly_flags == 1).sum():,}")
     print(f"   Anomaly rate: {anomaly_flags.mean():.1%}")
     
     # Apply sample size limit if specified
     if sample_size is not None and sample_size < len(embeddings):
         # Maintain the same normal/anomaly ratio
-        normal_ratio = len(normal_embeddings) / len(embeddings)
-        normal_sample_size = int(sample_size * normal_ratio)
+        training_ratio = len(training_embeddings) / len(embeddings)
+        training_sample_size = int(sample_size * training_ratio)
         
-        # Sample normal logs
-        if normal_sample_size < len(normal_embeddings):
-            normal_indices = np.random.choice(len(normal_embeddings), size=normal_sample_size, replace=False)
-            normal_embeddings = normal_embeddings[normal_indices]
+        # Sample training logs
+        if training_sample_size < len(training_embeddings):
+            training_indices = np.random.choice(len(training_embeddings), size=training_sample_size, replace=False)
+            training_embeddings = training_embeddings[training_indices]
         
         # Sample all logs (maintaining ratio)
         indices = np.random.choice(len(embeddings), size=sample_size, replace=False)
@@ -508,67 +870,87 @@ def load_and_preprocess_data(log_type: str, config: SystemConfig, tracker: Progr
         anomaly_flags = anomaly_flags[indices]
         
         print(f"🎯 Dataset limited to {sample_size:,} samples")
-        print(f"   Normal samples for training: {len(normal_embeddings):,}")
+        print(f"   Training samples: {len(training_embeddings):,}")
     
-    # Normalize embeddings using only normal data
+    # Normalize embeddings using training data
     scaler = RobustScaler()
-    normal_embeddings = scaler.fit_transform(normal_embeddings).astype(np.float32)
+    training_embeddings = scaler.fit_transform(training_embeddings).astype(np.float32)
     
     # Apply same normalization to all embeddings
     all_embeddings = scaler.transform(embeddings).astype(np.float32)
     
     # Additional L2 normalization
     from sklearn.preprocessing import normalize
-    normal_embeddings = normalize(normal_embeddings, norm='l2', axis=1)
+    training_embeddings = normalize(training_embeddings, norm='l2', axis=1)
     all_embeddings = normalize(all_embeddings, norm='l2', axis=1)
     
     tracker.log_step("Data Preprocessing", {
         "embedding_type": embedding_type,
         "embedding_dim": embedding_dim,
-        "normal_embeddings_shape": normal_embeddings.shape,
+        "training_embeddings_shape": training_embeddings.shape,
         "all_embeddings_shape": all_embeddings.shape,
         "classes": classes,
-        "normal_ratio": float(len(normal_embeddings) / len(all_embeddings))
+        "training_ratio": float(len(training_embeddings) / len(all_embeddings))
     })
     
-    return normal_embeddings, all_embeddings, anomaly_flags, classes, scaler
+    return training_embeddings, all_embeddings, anomaly_flags, classes, scaler
 
 def clear_gpu_memory():
     """Clear GPU memory"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        # MPS doesn't have explicit memory management like CUDA
+        # But we can still collect Python garbage
+        pass
     gc.collect()
 
-def train_anomaly_model(normal_embeddings: np.ndarray, config: SystemConfig, 
+def train_anomaly_model(training_embeddings: np.ndarray, config: SystemConfig, 
                        tracker: ProgressTracker, log_type: str) -> AnomalyDetectionTransformer:
-    """Train the anomaly detection model on normal logs only"""
+    """Train the anomaly detection model on training data (normal logs or all data for extreme imbalance)"""
     
     device = torch.device(config.device)
-    embedding_dim = normal_embeddings.shape[1]
+    embedding_dim = training_embeddings.shape[1]
     
-    # Model configuration based on embedding dimension
+    # Model configuration based on embedding dimension and device
     if embedding_dim <= 300:
         latent_dim = 256
-        batch_size = 256 if config.device != "cuda" else 128
+        if config.device == "cuda":
+            batch_size = 128
+        elif config.device == "mps":
+            batch_size = 64  # Conservative for MPS memory
+        else:
+            batch_size = 256
         transformer_layers = 6
         attention_heads = 8
     elif embedding_dim <= 768:
         latent_dim = 384
-        batch_size = 128 if config.device != "cuda" else 64
+        if config.device == "cuda":
+            batch_size = 64
+        elif config.device == "mps":
+            batch_size = 32  # Conservative for MPS memory
+        else:
+            batch_size = 128
         transformer_layers = 8
         attention_heads = 12
     else:
         latent_dim = 512
-        batch_size = 64 if config.device != "cuda" else 32
+        if config.device == "cuda":
+            batch_size = 32
+        elif config.device == "mps":
+            batch_size = 16  # Conservative for MPS memory
+        else:
+            batch_size = 64
         transformer_layers = 10
         attention_heads = 16
     
     print(f"🏗️  Anomaly Detection Architecture:")
+    print(f"   Device: {config.device}")
     print(f"   Input dim: {embedding_dim}, Latent dim: {latent_dim}")
     print(f"   Layers: {transformer_layers}, Heads: {attention_heads}")
     print(f"   Batch size: {batch_size}")
-    print(f"   Training samples: {len(normal_embeddings):,} (normal only)")
+    print(f"   Training samples: {len(training_embeddings):,}")
     
     # Initialize model
     model = AnomalyDetectionTransformer(
@@ -578,21 +960,39 @@ def train_anomaly_model(normal_embeddings: np.ndarray, config: SystemConfig,
         attention_heads=attention_heads
     ).to(device)
     
+    # Ensure model is on the correct device
+    print(f"📱 Model moved to device: {next(model.parameters()).device}")
+    
     # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     
     # Data preparation
-    normal_tensor = torch.FloatTensor(normal_embeddings).to(device)
-    dataset = TensorDataset(normal_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    training_tensor = torch.FloatTensor(training_embeddings).to(device)
+    dataset = TensorDataset(training_tensor)
+    
+    # Configure DataLoader based on device compatibility
+    if config.supports_multiprocessing:
+        num_workers = min(2, config.n_cpus // 2)  # Conservative multiprocessing
+        print(f"🔧 Using multiprocessing with {num_workers} workers")
+    else:
+        num_workers = 0  # Disable multiprocessing for MPS
+        print(f"🔧 Disabling multiprocessing for {config.device} compatibility")
+    
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     
     # Training configuration
     n_epochs = 100
     tracker.start_training(n_epochs)
     
-    # Mixed precision training
+    # Mixed precision training (only for CUDA, not MPS)
     scaler = GradScaler() if config.device == "cuda" else None
+    if config.device == "mps":
+        print("🍎 MPS detected - using full precision training")
+    elif config.device == "cuda":
+        print("🔥 CUDA detected - using mixed precision training")
+    else:
+        print("💻 CPU detected - using full precision training")
     
     print("🚀 Starting anomaly detection training (normal logs only)...")
     
@@ -718,7 +1118,12 @@ def evaluate_anomaly_model(model: AnomalyDetectionTransformer, all_embeddings: n
     recon_errors = []
     enhanced_embeddings = []
     
-    batch_size = 256
+    # Adjust batch size for device compatibility
+    if config.device == "mps":
+        batch_size = 128  # Smaller batches for MPS
+    else:
+        batch_size = 256
+    
     with torch.no_grad():
         for i in range(0, len(all_embeddings), batch_size):
             batch = embeddings_tensor[i:i+batch_size]
@@ -726,7 +1131,7 @@ def evaluate_anomaly_model(model: AnomalyDetectionTransformer, all_embeddings: n
             # Forward pass
             outputs = model(batch)
             
-            # Store results
+            # Store results (ensure CPU transfer for numpy conversion)
             anomaly_scores.append(outputs['anomaly_score'].cpu().numpy())
             recon_errors.append(outputs['recon_error'].cpu().numpy())
             
@@ -1069,71 +1474,177 @@ def save_final_results(model: AnomalyDetectionTransformer, results: Dict[str, An
     print(f"   Summary: {summary_path}")
 
 def main():
-    """Main execution pipeline for transformer anomaly detection"""
+    """Main execution pipeline for transformer anomaly detection with extreme imbalance handling"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Transformer-based Unsupervised Anomaly Detection')
-    parser.add_argument('--log-type', type=str, required=True, 
+    parser.add_argument('--log-type', type=str, default=None,
                        help='Log type to process (e.g., wp-access, wp-error)')
+    parser.add_argument('--family', type=str, default=None,
+                       help='Log family to process (e.g., wp, company, all)')
     parser.add_argument('--sample-size', type=int, default=None,
                        help='Limit dataset size for testing')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
+    parser.add_argument('--discover', action='store_true',
+                       help='Discover and show available log families')
     
     args = parser.parse_args()
     
-    print("🚀 Starting Transformer Anomaly Detection Pipeline")
-    print(f"📊 Processing log type: {args.log_type}")
-    print(f"🎯 Strategy: Train on normal logs only, detect anomalies via reconstruction")
+    # Handle log discovery
+    if args.discover:
+        families, stats = discover_and_group_logs()
+        if families:
+            print(f"\n✅ Log discovery completed!")
+            print(f"   Found {len(families)} log families")
+            print(f"   Total log types: {sum(len(family.log_types) for family in families)}")
+            
+            print(f"\n🚀 Usage examples:")
+            print(f"   # Train on specific log type:")
+            print(f"   python src/transformer_anomaly.py --log-type wp-error")
+            print(f"   ")
+            print(f"   # Train on log family:")
+            print(f"   python src/transformer_anomaly.py --family wp")
+            print(f"   python src/transformer_anomaly.py --family company")
+            print(f"   python src/transformer_anomaly.py --family all")
+        return
+    
+    # Validate arguments
+    if not args.log_type and not args.family:
+        print("❌ Error: Must specify either --log-type or --family")
+        print("   Use --discover to see available options")
+        return
+    
+    if args.log_type and args.family:
+        print("❌ Error: Cannot specify both --log-type and --family")
+        return
     
     # Initialize system
     config = detect_system_resources()
-    tracker = ProgressTracker(RESULTS_DIR, args.log_type, config)
     
     try:
-        # Load and preprocess data
-        normal_embeddings, all_embeddings, anomaly_flags, classes, scaler = load_and_preprocess_data(
-            args.log_type, config, tracker, args.sample_size
-        )
-        
-        # Train anomaly detection model (on normal logs only)
-        model = train_anomaly_model(normal_embeddings, config, tracker, args.log_type)
-        
-        # Evaluate model (on all logs)
-        results = evaluate_anomaly_model(model, all_embeddings, anomaly_flags, classes, config, tracker)
-        
-        # Create enhanced embeddings with anomaly flag
-        create_enhanced_embeddings_output(results, all_embeddings, args.log_type, classes, RESULTS_DIR.parent)
-        
-        # Generate visualizations
-        visualize_anomaly_results(results, RESULTS_DIR, args.log_type)
-        
-        # Save final results
-        save_final_results(model, results, classes, scaler, args.log_type, tracker)
-        
-        print("🎉 Transformer anomaly detection pipeline completed successfully!")
-        
-        # Print final summary
-        print(f"\n📈 Final Anomaly Detection Summary:")
-        if len(np.unique(anomaly_flags)) > 1:
-            print(f"   Accuracy: {results['metrics']['accuracy']:.4f}")
-            print(f"   F1 Score: {results['metrics']['f1_score']:.4f}")
-            print(f"   ROC AUC: {results['metrics']['roc_auc']:.4f}")
-        
-        print(f"   Detection Threshold: {results['threshold']:.4f}")
-        print(f"   Processed {len(all_embeddings):,} samples")
-        print(f"   Enhanced embedding shape: {results['enhanced_embeddings'].shape}")
-        print(f"   Anomaly rate: {anomaly_flags.mean():.1%}")
-        
-        # Output file locations
-        print(f"\n📁 Output files for downstream use:")
-        embeddings_dir = RESULTS_DIR.parent / "embeddings" / f"{args.log_type}_anomaly"
-        print(f"   Enhanced embeddings: {embeddings_dir / f'log_{args.log_type}_anomaly.pkl'}")
-        print(f"   Binary labels: {embeddings_dir / f'label_{args.log_type}_anomaly.pkl'}")
+        if args.family:
+            # Process log family
+            families, stats = discover_and_group_logs()
+            
+            # Find the requested family
+            target_family = None
+            if args.family.lower() == 'all':
+                # Use all families combined
+                all_log_types = []
+                for family in families:
+                    all_log_types.extend(family.log_types)
+                
+                target_family = LogFamily(
+                    name='all',
+                    log_types=all_log_types,
+                    description='All Log Types Combined',
+                    category='combined'
+                )
+            else:
+                for family in families:
+                    if family.name.lower() == args.family.lower():
+                        target_family = family
+                        break
+            
+            if not target_family:
+                print(f"❌ Family '{args.family}' not found")
+                print(f"Available families: {[f.name for f in families]}")
+                return
+            
+            # Use family-based processing
+            tracker = ProgressTracker(RESULTS_DIR, target_family.name, config)
+            
+            # Load family data
+            training_embeddings, all_embeddings, anomaly_flags, classes, scaler = load_family_data(
+                target_family, config, tracker, args.sample_size
+            )
+            
+            # Train anomaly detection model
+            model = train_anomaly_model(training_embeddings, config, tracker, target_family.name)
+            
+            # Evaluate model (on all logs)
+            results = evaluate_anomaly_model(model, all_embeddings, anomaly_flags, classes, config, tracker)
+            
+            # Create enhanced embeddings with anomaly flag
+            create_enhanced_embeddings_output(results, all_embeddings, target_family.name, classes, RESULTS_DIR.parent)
+            
+            # Generate visualizations
+            visualize_anomaly_results(results, RESULTS_DIR, target_family.name)
+            
+            # Save final results
+            save_final_results(model, results, classes, scaler, target_family.name, tracker)
+            
+            print("🎉 Transformer anomaly detection pipeline completed successfully!")
+            
+            # Print final summary
+            print(f"\n📈 Final Anomaly Detection Summary:")
+            print(f"   Family: {target_family.name}")
+            print(f"   Log types: {', '.join(target_family.log_types)}")
+            if len(np.unique(anomaly_flags)) > 1:
+                print(f"   Accuracy: {results['metrics']['accuracy']:.4f}")
+                print(f"   F1 Score: {results['metrics']['f1_score']:.4f}")
+                print(f"   ROC AUC: {results['metrics']['roc_auc']:.4f}")
+            
+            print(f"   Detection Threshold: {results['threshold']:.4f}")
+            print(f"   Processed {len(all_embeddings):,} samples")
+            print(f"   Enhanced embedding shape: {results['enhanced_embeddings'].shape}")
+            print(f"   Anomaly rate: {anomaly_flags.mean():.1%}")
+            
+            # Output file locations
+            print(f"\n📁 Output files for downstream use:")
+            embeddings_dir = RESULTS_DIR.parent / "embeddings" / f"{target_family.name}_anomaly"
+            print(f"   Enhanced embeddings: {embeddings_dir / f'log_{target_family.name}_anomaly.pkl'}")
+            print(f"   Binary labels: {embeddings_dir / f'label_{target_family.name}_anomaly.pkl'}")
+            
+        else:
+            # Process single log type (original functionality)
+            tracker = ProgressTracker(RESULTS_DIR, args.log_type, config)
+            
+            # Load and preprocess data
+            training_embeddings, all_embeddings, anomaly_flags, classes, scaler = load_and_preprocess_data(
+                args.log_type, config, tracker, args.sample_size
+            )
+            
+            # Train anomaly detection model
+            model = train_anomaly_model(training_embeddings, config, tracker, args.log_type)
+            
+            # Evaluate model (on all logs)
+            results = evaluate_anomaly_model(model, all_embeddings, anomaly_flags, classes, config, tracker)
+            
+            # Create enhanced embeddings with anomaly flag
+            create_enhanced_embeddings_output(results, all_embeddings, args.log_type, classes, RESULTS_DIR.parent)
+            
+            # Generate visualizations
+            visualize_anomaly_results(results, RESULTS_DIR, args.log_type)
+            
+            # Save final results
+            save_final_results(model, results, classes, scaler, args.log_type, tracker)
+            
+            print("🎉 Transformer anomaly detection pipeline completed successfully!")
+            
+            # Print final summary
+            print(f"\n📈 Final Anomaly Detection Summary:")
+            if len(np.unique(anomaly_flags)) > 1:
+                print(f"   Accuracy: {results['metrics']['accuracy']:.4f}")
+                print(f"   F1 Score: {results['metrics']['f1_score']:.4f}")
+                print(f"   ROC AUC: {results['metrics']['roc_auc']:.4f}")
+            
+            print(f"   Detection Threshold: {results['threshold']:.4f}")
+            print(f"   Processed {len(all_embeddings):,} samples")
+            print(f"   Enhanced embedding shape: {results['enhanced_embeddings'].shape}")
+            print(f"   Anomaly rate: {anomaly_flags.mean():.1%}")
+            
+            # Output file locations
+            print(f"\n📁 Output files for downstream use:")
+            embeddings_dir = RESULTS_DIR.parent / "embeddings" / f"{args.log_type}_anomaly"
+            print(f"   Enhanced embeddings: {embeddings_dir / f'log_{args.log_type}_anomaly.pkl'}")
+            print(f"   Binary labels: {embeddings_dir / f'label_{args.log_type}_anomaly.pkl'}")
         
     except Exception as e:
         print(f"❌ Error in anomaly detection pipeline: {str(e)}")
-        tracker.logger.error(f"Pipeline error: {str(e)}", exc_info=True)
+        if 'tracker' in locals():
+            tracker.logger.error(f"Pipeline error: {str(e)}", exc_info=True)
         raise
     finally:
         # Cleanup
