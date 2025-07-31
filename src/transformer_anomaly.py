@@ -334,6 +334,9 @@ def generate_classification_report(y_true: np.ndarray, y_pred: np.ndarray) -> st
     normal_samples = np.sum(y_true == 0)
     abnormal_samples = np.sum(y_true == 1)
 
+    predicted_normal_samples = np.sum(y_pred == 0)
+    predicted_abnormal_samples = np.sum(y_pred == 1)
+
     # Calculate confusion matrix components
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
 
@@ -353,8 +356,12 @@ Classification Report:
 Total Samples: {total_samples}
 
 Data Distribution:
-  Normal Samples:   {normal_samples:<10} ({normal_samples / total_samples:.2%})
-  Abnormal Samples: {abnormal_samples:<10} ({abnormal_samples / total_samples:.2%})
+  Original Distribution:
+    Normal Samples:   {normal_samples:<10} ({normal_samples / total_samples:.2%})
+    Abnormal Samples: {abnormal_samples:<10} ({abnormal_samples / total_samples:.2%})
+  Predicted Distribution:
+    Normal Samples:   {predicted_normal_samples:<10} ({predicted_normal_samples / total_samples:.2%})
+    Abnormal Samples: {predicted_abnormal_samples:<10} ({predicted_abnormal_samples / total_samples:.2%})
 
 Accuracy per Class:
   Normal (Class 0): {normal_accuracy:.4f}
@@ -391,7 +398,7 @@ def main():
 
     for log_type in log_types:
         try:
-            embeddings, anomaly_flags, classes, scaler = load_and_preprocess_data(log_type)
+            embeddings, anomaly_flags, classes, scaler = load_and_preprocess_data(log_type, sample_size=100000)
             
             normal_embeddings = embeddings[anomaly_flags == 0]
             if len(normal_embeddings) == 0:
