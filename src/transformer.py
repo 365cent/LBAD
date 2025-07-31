@@ -227,6 +227,33 @@ def cleanup_distributed():
 # =============================================================================
 
 
+class OptimizedTransformerBlock(nn.Module):
+    """Memory and compute optimized transformer block for Nibi"""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.linear1 = nn.Linear(d_model, d_model * 2)
+        self.linear2 = nn.Linear(d_model * 2, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Pre-norm architecture for better training stability
+        x2 = self.norm1(x)
+        x2, _ = self.self_attn(x2, x2, x2)
+        x = x + self.dropout(x2)
+
+        x2 = self.norm2(x)
+        x2 = self.linear2(F.gelu(self.linear1(x2)))
+        x = x + self.dropout(x2)
+
+        return x
+
+
 class UnsupervisedMultiLabelTransformer(nn.Module):
     """
     Simplified and optimized transformer for unsupervised multi-label learning.
