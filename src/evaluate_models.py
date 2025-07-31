@@ -555,6 +555,7 @@ def main():
     print("")
     
     all_results = {}
+    evaluation_start_time = time.time()
     
     for log_type in log_types:
         print(f"\n{log_type.upper()}")
@@ -638,33 +639,41 @@ def main():
             all_results[log_type] = {
                 'metrics': metrics,
                 'classes': classes,
-                'results_file': f"results/{log_type}/predictions.pkl" if existing_predictions else results_file
+                'results_file': f"results/{log_type}/predictions.pkl" if existing_predictions else results_file,
+                'status': 'SUCCESS'
             }
             
         except Exception as e:
             print(f"Evaluation failed for {log_type}: {e}")
+            all_results[log_type] = {'status': 'FAILED', 'error': str(e)}
             continue
     
-    # Final summary across all log types
-    if len(all_results) > 1:
-        print(f"\n{'='*60}")
-        print(f"EVALUATION SUMMARY")
-        print(f"{'='*60}")
-        
-        for log_type, result in all_results.items():
+    total_evaluation_time = time.time() - evaluation_start_time
+    
+    print(f"\n{'='*60}")
+    print(f"OVERALL EVALUATION SUMMARY")
+    print(f"{'='*60}")
+    
+    for log_type, result in all_results.items():
+        status = result['status']
+        if status == 'SUCCESS':
             metrics = result['metrics']
-            print(f"\n{log_type.upper()}:")
+            print(f"\n✅ {log_type.upper()} (SUCCESS):")
             print(f"   Macro F1: {metrics['macro_f1']:.4f} | Micro F1: {metrics['micro_f1']:.4f}")
             print(f"   Label-wise Accuracy: {metrics['label_wise_accuracy_micro']:.4f}")
             print(f"   Classes: {len(result['classes'])}")
-        
-        print(f"\nEvaluated {len(all_results)} log types successfully.")
+        else:
+            print(f"\n❌ {log_type.upper()} (FAILED): {result['error']}")
     
-    elif len(all_results) == 1:
-        log_type = list(all_results.keys())[0]
-        print(f"\nEvaluation completed for {log_type}")
+    print(f"\nTotal log types evaluated: {len(log_types)}")
+    print(f"Total successful evaluations: {sum(1 for r in all_results.values() if r['status'] == 'SUCCESS')}")
+    print(f"Total failed evaluations: {sum(1 for r in all_results.values() if r['status'] == 'FAILED')}")
+    print(f"Total evaluation time: {total_evaluation_time:.2f} seconds")
+    
+    if all(r['status'] == 'SUCCESS' for r in all_results.values()):
+        print(f"\nAll evaluations completed successfully.")
     else:
-        print(f"\nNo evaluations completed successfully")
+        print(f"\nSome evaluations failed. Please check the logs above for details.")
 
 
 if __name__ == "__main__":

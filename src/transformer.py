@@ -1343,7 +1343,7 @@ class ProgressTracker:
         self.current_epoch = 0
         self.current_batch = 0
         
-        print(f"🚀 Training started: {total_epochs} epochs, ~{total_batches_per_epoch} batches/epoch")
+        print(f"🚀 Training started for {self.log_type}: {total_epochs} epochs, ~{total_batches_per_epoch} batches/epoch")
     
     def start_epoch(self, epoch: int):
         """Start tracking a new epoch"""
@@ -1415,11 +1415,11 @@ class ProgressTracker:
                     loss_str = f" | {loss_str}"
             
             # Print progress update
-            print(f"📊 Progress: {overall_progress_pct:.1f}% | "
+            print(f"📊 Progress ({self.log_type}): {overall_progress_pct:.1f}% | "
                   f"Epoch {self.current_epoch + 1}/{self.total_epochs} "
                   f"({epoch_progress_pct:.1f}%) | "
                   f"Batch {batch_idx + 1}/{self.total_batches_per_epoch} | "
-                  f"ETA: {eta_str}{loss_str}")
+                  f"Overall ETA: {eta_str}{loss_str}")
     
     def update_epoch_progress(self, epoch: int, epoch_time: float):
         """Update epoch progress and estimate completion time"""
@@ -1445,7 +1445,7 @@ class ProgressTracker:
             print(f"✅ Epoch {epoch + 1}/{self.total_epochs} completed ({overall_progress_pct:.1f}%) | "
                   f"Time: {self._format_time(epoch_time)} | "
                   f"Avg: {self._format_time(avg_epoch_time)} | "
-                  f"ETA: {remaining_str}")
+                  f"Overall Remaining: {remaining_str}")
             
             return {
                 'epoch': epoch + 1,
