@@ -2294,7 +2294,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     print(f"⏱️  Estimated training time: {est_total_time:.1f} minutes ({est_time_per_epoch:.1f}s/epoch)")
     print(f"⚡ Supercomputer optimizations:")
     print(f"   - Extended training: 100 epochs with patience={patience}")
-    print(f"   - Checkpoint frequency: Every 5% (20 checkpoints)")
+    print(f"   - Checkpoint frequency: Every epoch (to minimize data loss)")
     print(f"   - Class balance: {'Enabled' if class_weights is not None else 'Disabled'}")
     print(f"   - Learning rate: 8e-5 with 10-epoch warmup")
     print(f"   - ETA tracking: Real-time estimation")
@@ -2428,7 +2428,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     tracker.start_training(total_epochs, total_batches_per_epoch)
     
     refinement_interval = 10  # Refine pseudo-labels every 10 epochs
-    checkpoint_interval = 5   # Save checkpoint every 5 epochs
+    checkpoint_interval = 1   # Save checkpoint every epoch to minimize data loss
     
     # Early stopping parameters - more patient for longer training  
     patience_counter = 0
@@ -3069,10 +3069,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         
         # Enhanced checkpointing for supercomputer environments (every 5%)
         progress_pct = ((epoch + 1) / total_epochs) * 100
-        should_checkpoint_5pct = (epoch + 1) % max(1, total_epochs // 20) == 0  # Every 5%
-        should_checkpoint_regular = (epoch + 1) % checkpoint_interval == 0
-        
-        if config.rank == 0 and (should_checkpoint_5pct or should_checkpoint_regular):
+        if config.rank == 0 and (epoch + 1) % checkpoint_interval == 0:
             try:
                 model_to_save = model.module if hasattr(model, 'module') else model
                 checkpoint_metrics = {
@@ -5739,9 +5736,9 @@ def process_log_type_with_args(log_type: str, config: SystemConfig, force_restar
         # Train model with checkpointing
         tracker.log_step("Training Start", {"embeddings_shape": embeddings.shape})
         training_start_time = time.time()
-        with Halo(text=f"Training model for {log_type}...", spinner='dots') as spinner:
-            model, _ = train_model(embeddings, classes, C, config, tracker, log_type, scaler)
-            spinner.succeed(f"Training completed for {log_type}")
+        print(f"\n🚀 Starting training for {log_type}. Detailed progress will be shown below...")
+        model, _ = train_model(embeddings, classes, C, config, tracker, log_type, scaler)
+        print(f"✅ Training completed for {log_type}")
         
         # Calculate total training time
         total_training_time = time.time() - training_start_time
