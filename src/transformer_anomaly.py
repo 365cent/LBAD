@@ -44,7 +44,7 @@ import re
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     f1_score, accuracy_score, roc_auc_score, average_precision_score,
-    confusion_matrix, precision_score, recall_score
+    confusion_matrix, precision_score, recall_score, classification_report
 )
 
 # Suppress warnings for cleaner output
@@ -317,6 +317,62 @@ def evaluate_and_save_results(model: AnomalyDetectionTransformer, embeddings: np
         json.dump(metrics, f, indent=2)
         
     print(f"   F1: {metrics['f1']:.4f}, ROC AUC: {metrics['roc_auc']:.4f}")
+    
+    # Generate and print detailed classification report
+    report = generate_classification_report(anomaly_flags, predictions)
+    print(report)
+
+    # Save detailed classification report to a text file
+    with open(output_dir / "classification_report.txt", 'w') as f:
+        f.write(report)
+
+def generate_classification_report(y_true: np.ndarray, y_pred: np.ndarray) -> str:
+    """Generates a detailed classification report similar to sklearn's,
+    including data distribution and per-class accuracy.
+    """
+    total_samples = len(y_true)
+    normal_samples = np.sum(y_true == 0)
+    abnormal_samples = np.sum(y_true == 1)
+
+    # Calculate confusion matrix components
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    # Per-class accuracy
+    normal_accuracy = (tn / (tn + fp)) if (tn + fp) > 0 else 0
+    abnormal_accuracy = (tp / (tp + fn)) if (tp + fn) > 0 else 0
+
+    # Overall metrics
+    overall_accuracy = accuracy_score(y_true, y_pred)
+    overall_precision = precision_score(y_true, y_pred, zero_division=0)
+    overall_recall = recall_score(y_true, y_pred, zero_division=0)
+    overall_f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    report = f"""
+Classification Report:
+------------------------------------------------------
+Total Samples: {total_samples}
+
+Data Distribution:
+  Normal Samples:   {normal_samples:<10} ({normal_samples / total_samples:.2%})
+  Abnormal Samples: {abnormal_samples:<10} ({abnormal_samples / total_samples:.2%})
+
+Accuracy per Class:
+  Normal (Class 0): {normal_accuracy:.4f}
+  Abnormal (Class 1): {abnormal_accuracy:.4f}
+
+Overall Metrics:
+  Accuracy:  {overall_accuracy:.4f}
+  Precision: {overall_precision:.4f}
+  Recall:    {overall_recall:.4f}
+  F1-Score:  {overall_f1:.4f}
+
+Confusion Matrix:
+                  Predicted Normal   Predicted Abnormal
+Actual Normal     {tn:<16}   {fp:<18}
+Actual Abnormal   {fn:<16}   {tp:<18}
+------------------------------------------------------
+"""
+    return report
 
 def clear_gpu_memory():
     """Clear GPU memory."""
