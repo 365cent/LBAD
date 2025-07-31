@@ -2745,8 +2745,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             model.train()
         
         # Progress tracking for batches (removing spinner as we have detailed progress)
-        print(f"
-🔄 Starting Epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
+        print(f"🔄 Starting Epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
         
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
             print(f"  Processing batch {batch_idx+1}/{len(dataloader)} of epoch {epoch+1}...")
@@ -2759,6 +2758,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             supervised_loss = torch.tensor(0.0, device=device)
             
             try:
+                print("    Attempting data transfer to GPU...")
                 # Ensure tensors are contiguous before GPU transfer to avoid misalignment
                 if not x_batch.is_contiguous():
                     x_batch = x_batch.contiguous()
@@ -2769,18 +2769,21 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 try:
                     x_batch = x_batch.to(device, non_blocking=False)  # Use blocking for stability
                     y_batch = y_batch.to(device, non_blocking=False)
+                    print("    Data transfer successful.")
                 except RuntimeError as gpu_error:
                     if "misaligned address" in str(gpu_error) or "CUDA" in str(gpu_error):
                         print(f"⚠️  GPU transfer error, trying alignment fix...")
                         # Force tensor alignment by cloning
                         x_batch = x_batch.clone().contiguous().to(device, non_blocking=False)
                         y_batch = y_batch.clone().contiguous().to(device, non_blocking=False)
+                        print("    Alignment fix applied.")
                     else:
                         raise gpu_error
                 
                 # Force CUDA sync to catch alignment issues early
                 if device.type == 'cuda':
                     torch.cuda.synchronize()
+                    print("    CUDA synchronized.")
                 
             except RuntimeError as batch_error:
                 if "misaligned address" in str(batch_error) or "out of memory" in str(batch_error):
@@ -2801,201 +2804,54 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                 else:
                     raise batch_error
                 
-                optimizer.zero_grad()
+            optimizer.zero_grad()
+            print("    Optimizer gradients zeroed.")
+            
+            # Clear memory periodically during training for CUDA
+            if config.device == "cuda" and batch_idx % 20 == 0:
+                clear_gpu_memory()
+                print("    GPU memory cleared (periodic).")
+            
+            # UMTL Enhancement: Teacher predictions with weak augmentation
+            with torch.no_grad():
+                print("    Generating teacher predictions (weak augmentation)...")
+                x_weak = weak_augment(x_batch)
+                teacher_outputs = teacher(x_weak)
+                teacher_probs = torch.sigmoid(teacher_outputs['labels'])
                 
-                # Clear memory periodically during training for CUDA
-                if config.device == "cuda" and batch_idx % 20 == 0:
-                    clear_gpu_memory()
+                # Confidence mask for FixMatch-style training
+                max_probs = teacher_probs.max(dim=1).values
+                confidence_mask = (max_probs >= confidence_threshold).float()
                 
-                # UMTL Enhancement: Teacher predictions with weak augmentation
-                with torch.no_grad():
-                    # Weak augmentation for teacher
-                    x_weak = weak_augment(x_batch)
-                    teacher_outputs = teacher(x_weak)
-                    teacher_probs = torch.sigmoid(teacher_outputs['labels'])
-                    
-                    # Confidence mask for FixMatch-style training
-                    max_probs = teacher_probs.max(dim=1).values
-                    confidence_mask = (max_probs >= confidence_threshold).float()
-                    
-                    # Create pseudo-labels from confident teacher predictions
-                    teacher_pseudo_labels = (teacher_probs >= confidence_threshold).float()
-                
-                # Only train on confident samples (FixMatch-style)
-                n_confident = confidence_mask.sum().item()
-                
-                if scaler:
-                    with autocast():
-                        try:
-                            # Strong augmentation for student
-                            x_strong = strong_augment(x_batch)
-                            outputs = model(x_strong)
-                        except torch.cuda.OutOfMemoryError:
-                            # Skip this batch and clear memory
-                            clear_gpu_memory()
-                            continue
-                        
-                        # Advanced multi-component loss with curriculum learning
-                        recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
-                        
-                        # Enhanced focal loss with distribution-balanced weights and class weighting
-                        label_loss = enhanced_focal_loss(outputs['labels'], y_batch, class_weights=class_weights)
-                        
-                        # Supervised loss on confident teacher predictions (FixMatch)
-                        if n_confident > 0:
-                            confidence_mask_expanded = confidence_mask.unsqueeze(1)
-                            supervised_loss = F.binary_cross_entropy_with_logits(
-                                outputs['labels'], 
-                                teacher_pseudo_labels,
-                                reduction='none'
-                            )
-                            supervised_loss = (supervised_loss * confidence_mask_expanded).sum() / (confidence_mask_expanded.sum() + 1e-8)
-                        else:
-                            supervised_loss = torch.tensor(0.0, device=device)
-                        
-                        # Add confidence regularization
-                        predictions = torch.sigmoid(outputs['labels'])
-                        confidence_loss = confidence_regularization_loss(predictions, confidence_target=0.8)
-                        
-                        # Ensemble consistency loss
-                        ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
-                        
-                        # NEW: Multi-label specific enhancements inspired by supervised learning
-                        # Multi-label consistency loss - encourages coherent label combinations
-                        multilabel_consistency = multilabel_consistency_loss(outputs['labels'], temperature=2.0)
-                        
-                        # Class balance regularization - maintains reasonable class distribution
-                        class_balance_loss = class_balance_regularization(outputs['labels'])
-                        
-                        # Multi-label aware contrastive loss - similar labels should have similar embeddings
-                        multilabel_contrastive = multilabel_contrastive_loss(outputs['latent'], outputs['labels'])
-                        
-                        # Adaptive pseudo-labeling refinement for better unsupervised learning
-                        refined_pseudo_labels = adaptive_pseudo_labeling(outputs['labels'], confidence_threshold=0.7)
-                        
-                        # Additional loss on refined pseudo-labels
-                        refined_label_loss = F.binary_cross_entropy_with_logits(
-                            outputs['labels'], refined_pseudo_labels, reduction='mean'
-                        )
-                        
-                        # Prototype/margin loss
-                        # Handle DataParallel wrapper
-                        actual_model = model.module if hasattr(model, 'module') else model
-                        if actual_model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
-                            prototype_loss = prototype_margin_loss(
-                                outputs['prototype'], 
-                                predictions,  # Use predictions as soft labels
-                                actual_model.class_prototypes,
-                                actual_model.margin
-                            )
-                        else:
-                            prototype_loss = torch.tensor(0.0, device=device)
-                        
-                        if C is not None:
-                            C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
-                            # Ensure same dtype for matrix multiplication in mixed precision
-                            cluster_targets = torch.matmul(y_batch.float(), C_tensor)
-                            cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
-                        else:
-                            cluster_loss = torch.tensor(0.0, device=device)
-                        
-                        # Contrastive loss - create augmented batch
-                        x_augmented = x_batch + torch.randn_like(x_batch) * 0.1
-                        outputs_aug = model(x_augmented)
-                        
-                        # Compute contrastive loss between original and augmented
-                        contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'])
-                        
-                        # Mutual learning loss
-                        mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
-                        
-                        # Curriculum-based loss weighting
-                        loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
-                        
-                        # Add weights for UMTL losses
-                        loss_weights['supervised'] = min(0.3, 0.1 + 0.2 * (epoch / total_epochs))  # Gradually increase
-                        loss_weights['prototype'] = min(0.2, 0.05 + 0.15 * (epoch / total_epochs))  # Start small
-                        
-                        # NEW: Weights for multi-label specific losses
-                        loss_weights['multilabel_consistency'] = min(0.15, 0.05 + 0.1 * (epoch / total_epochs))
-                        loss_weights['class_balance'] = 0.1  # Steady throughout training
-                        loss_weights['multilabel_contrastive'] = min(0.2, 0.1 + 0.1 * (epoch / total_epochs))
-                        loss_weights['refined_labels'] = min(0.25, 0.1 + 0.15 * (epoch / total_epochs))
-                        
-                        total_loss = (loss_weights['recon'] * recon_loss + 
-                                    loss_weights['label'] * label_loss + 
-                                    loss_weights['supervised'] * supervised_loss +  # Added
-                                    loss_weights['prototype'] * prototype_loss +     # Added
-                                    loss_weights['cluster'] * cluster_loss + 
-                                    loss_weights['contrastive'] * contrast_loss + 
-                                    loss_weights['mutual'] * mutual_loss + 
-                                    loss_weights['confidence'] * confidence_loss + 
-                                    loss_weights['ensemble'] * ensemble_loss +
-                                    loss_weights['multilabel_consistency'] * multilabel_consistency +  # NEW
-                                    loss_weights['class_balance'] * class_balance_loss +  # NEW
-                                    loss_weights['multilabel_contrastive'] * multilabel_contrastive +  # NEW
-                                    loss_weights['refined_labels'] * refined_label_loss)  # NEW
-                        
-                        # Check for nan/inf in individual losses
-                        loss_dict = {
-                            'recon': recon_loss,
-                            'label': label_loss,
-                            'supervised': supervised_loss,  # Added
-                            'prototype': prototype_loss,    # Added
-                            'cluster': cluster_loss,
-                            'contrastive': contrast_loss,
-                            'mutual': mutual_loss,
-                            'confidence': confidence_loss,
-                            'ensemble': ensemble_loss,
-                            'multilabel_consistency': multilabel_consistency,  # NEW
-                            'class_balance': class_balance_loss,  # NEW
-                            'multilabel_contrastive': multilabel_contrastive,  # NEW
-                            'refined_labels': refined_label_loss  # NEW
-                        }
-                        
-                        # Check each loss component
-                        skip_batch = False
-                        for loss_name, loss_val in loss_dict.items():
-                            if torch.isnan(loss_val) or torch.isinf(loss_val):
-                                print(f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}")
-                                skip_batch = True
-                        
-                        if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
-                            print(f"Skipping batch due to numerical instability.")
-                            optimizer.zero_grad()
-                            
-                            # Still track progress for skipped batch
-                            batch_time = time.time() - batch_start_time
-                            loss_info = {'total': 0.0, 'nan_skip': True}
-                            tracker.update_batch_progress(batch_idx, batch_time, loss_info)
-                            
-                            continue
-                    
-                    scaler.scale(total_loss).backward()
-                    
-                    # Gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # UMTL Enhancement: Update teacher network (EMA)
-                    update_teacher_ema(model, teacher, ema_momentum)
-                    
-                    # Update class prototypes
-                    update_class_prototypes(model, outputs['prototype'], predictions)
-                    
-                else:
+                # Create pseudo-labels from confident teacher predictions
+                teacher_pseudo_labels = (teacher_probs >= confidence_threshold).float()
+                print("    Teacher predictions generated.")
+            
+            # Only train on confident samples (FixMatch-style)
+            n_confident = confidence_mask.sum().item()
+            
+            if scaler:
+                with autocast():
+                    print("    Performing forward pass (autocast enabled)...")
                     try:
-                        # Strong augmentation for student (same as scaler branch)
+                        # Strong augmentation for student
                         x_strong = strong_augment(x_batch)
                         outputs = model(x_strong)
+                        print("    Forward pass successful.")
                     except torch.cuda.OutOfMemoryError:
+                        print("⚠️  CUDA Out of Memory during forward pass. Skipping batch and clearing memory.")
                         # Skip this batch and clear memory
                         clear_gpu_memory()
+                        
+                        # Still track progress for skipped batch
+                        batch_time = time.time() - batch_start_time
+                        loss_info = {'total': 0.0, 'oom': True}
+                        tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                        
                         continue
                     
+                    print("    Calculating losses...")
+                    # Advanced multi-component loss with curriculum learning
                     recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
                     
                     # Enhanced focal loss with distribution-balanced weights and class weighting
@@ -3053,7 +2909,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                     
                     if C is not None:
                         C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
-                        # Ensure same dtype for matrix multiplication
+                        # Ensure same dtype for matrix multiplication in mixed precision
                         cluster_targets = torch.matmul(y_batch.float(), C_tensor)
                         cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
                     else:
@@ -3095,6 +2951,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                                 loss_weights['class_balance'] * class_balance_loss +  # NEW
                                 loss_weights['multilabel_contrastive'] * multilabel_contrastive +  # NEW
                                 loss_weights['refined_labels'] * refined_label_loss)  # NEW
+                    print("    Losses calculated.")
                     
                     # Check for nan/inf in individual losses
                     loss_dict = {
@@ -3130,40 +2987,225 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
                         tracker.update_batch_progress(batch_idx, batch_time, loss_info)
                         
                         continue
-                    
-                    total_loss.backward()
-                    
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    
-                    optimizer.step()
-                    
-                    # UMTL Enhancement: Update teacher network (EMA)
-                    update_teacher_ema(model, teacher, ema_momentum)
-                    
-                    # Update class prototypes
-                    update_class_prototypes(model, outputs['prototype'], predictions)
                 
-                epoch_losses.append(total_loss.item())
+                print("    Performing backward pass (scaler.scale(total_loss).backward())...")
+                scaler.scale(total_loss).backward()
+                print("    Backward pass successful.")
                 
-                # Calculate batch processing time and update progress tracking
-                batch_time = time.time() - batch_start_time
+                # Gradient clipping
+                print("    Applying gradient clipping...")
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                print("    Gradient clipping applied.")
                 
-                # Prepare loss info for progress display - safely handle undefined variables
-                loss_info = {
-                    'total': total_loss.item(),
+                print("    Performing optimizer step (scaler.step(optimizer))...")
+                scaler.step(optimizer)
+                scaler.update()
+                print("    Optimizer step successful.")
+                
+                # UMTL Enhancement: Update teacher network (EMA)
+                print("    Updating teacher network (EMA)...")
+                update_teacher_ema(model, teacher, ema_momentum)
+                print("    Teacher network updated.")
+                
+                # Update class prototypes
+                print("    Updating class prototypes...")
+                update_class_prototypes(model, outputs['prototype'], predictions)
+                print("    Class prototypes updated.")
+                
+            else:
+                print("    Performing forward pass (autocast disabled)...")
+                try:
+                    # Strong augmentation for student (same as scaler branch)
+                    x_strong = strong_augment(x_batch)
+                    outputs = model(x_strong)
+                    print("    Forward pass successful.")
+                except torch.cuda.OutOfMemoryError:
+                    print("⚠️  CUDA Out of Memory during forward pass. Skipping batch and clearing memory.")
+                    # Skip this batch and clear memory
+                    clear_gpu_memory()
+                    continue
+                
+                print("    Calculating losses...")
+                recon_loss = F.mse_loss(outputs['reconstructed'], x_batch)
+                
+                # Enhanced focal loss with distribution-balanced weights and class weighting
+                label_loss = enhanced_focal_loss(outputs['labels'], y_batch, class_weights=class_weights)
+                
+                # Supervised loss on confident teacher predictions (FixMatch)
+                if n_confident > 0:
+                    confidence_mask_expanded = confidence_mask.unsqueeze(1)
+                    supervised_loss = F.binary_cross_entropy_with_logits(
+                        outputs['labels'], 
+                        teacher_pseudo_labels,
+                        reduction='none'
+                    )
+                    supervised_loss = (supervised_loss * confidence_mask_expanded).sum() / (confidence_mask_expanded.sum() + 1e-8)
+                else:
+                    supervised_loss = torch.tensor(0.0, device=device)
+                
+                # Add confidence regularization
+                predictions = torch.sigmoid(outputs['labels'])
+                confidence_loss = confidence_regularization_loss(predictions, confidence_target=0.8)
+                
+                # Ensemble consistency loss
+                ensemble_loss = ensemble_consistency_loss(outputs['branch_predictions'])
+                
+                # NEW: Multi-label specific enhancements inspired by supervised learning
+                # Multi-label consistency loss - encourages coherent label combinations
+                multilabel_consistency = multilabel_consistency_loss(outputs['labels'], temperature=2.0)
+                
+                # Class balance regularization - maintains reasonable class distribution
+                class_balance_loss = class_balance_regularization(outputs['labels'])
+                
+                # Multi-label aware contrastive loss - similar labels should have similar embeddings
+                multilabel_contrastive = multilabel_contrastive_loss(outputs['latent'], outputs['labels'])
+                
+                # Adaptive pseudo-labeling refinement for better unsupervised learning
+                refined_pseudo_labels = adaptive_pseudo_labeling(outputs['labels'], confidence_threshold=0.7)
+                
+                # Additional loss on refined pseudo-labels
+                refined_label_loss = F.binary_cross_entropy_with_logits(
+                    outputs['labels'], refined_pseudo_labels, reduction='mean'
+                )
+                
+                # Prototype/margin loss
+                # Handle DataParallel wrapper
+                actual_model = model.module if hasattr(model, 'module') else model
+                if actual_model.prototype_counts.sum() > 0:  # Only if prototypes are initialized
+                    prototype_loss = prototype_margin_loss(
+                        outputs['prototype'], 
+                        predictions,  # Use predictions as soft labels
+                        actual_model.class_prototypes,
+                        actual_model.margin
+                    )
+                else:
+                    prototype_loss = torch.tensor(0.0, device=device)
+                
+                if C is not None:
+                    C_tensor = torch.from_numpy(C.astype(np.float32)).to(device)
+                    # Ensure same dtype for matrix multiplication
+                    cluster_targets = torch.matmul(y_batch.float(), C_tensor)
+                    cluster_loss = F.mse_loss(outputs['clusters'], cluster_targets)
+                else:
+                    cluster_loss = torch.tensor(0.0, device=device)
+                
+                # Contrastive loss - create augmented batch
+                x_augmented = x_batch + torch.randn_like(x_batch) * 0.1
+                outputs_aug = model(x_augmented)
+                
+                # Compute contrastive loss between original and augmented
+                contrast_loss = contrastive_loss(outputs['contrastive'], outputs_aug['contrastive'])
+                
+                # Mutual learning loss
+                mutual_loss = mutual_learning_loss(outputs['latent'], outputs_aug['latent'], y_batch)
+                
+                # Curriculum-based loss weighting
+                loss_weights = curriculum_weight_scheduler(epoch, total_epochs)
+                
+                # Add weights for UMTL losses
+                loss_weights['supervised'] = min(0.3, 0.1 + 0.2 * (epoch / total_epochs))  # Gradually increase
+                loss_weights['prototype'] = min(0.2, 0.05 + 0.15 * (epoch / total_epochs))  # Start small
+                
+                # NEW: Weights for multi-label specific losses
+                loss_weights['multilabel_consistency'] = min(0.15, 0.05 + 0.1 * (epoch / total_epochs))
+                loss_weights['class_balance'] = 0.1  # Steady throughout training
+                loss_weights['multilabel_contrastive'] = min(0.2, 0.1 + 0.1 * (epoch / total_epochs))
+                loss_weights['refined_labels'] = min(0.25, 0.1 + 0.15 * (epoch / total_epochs))
+                
+                total_loss = (loss_weights['recon'] * recon_loss + 
+                            loss_weights['label'] * label_loss + 
+                            loss_weights['supervised'] * supervised_loss +  # Added
+                            loss_weights['prototype'] * prototype_loss +     # Added
+                            loss_weights['cluster'] * cluster_loss + 
+                            loss_weights['contrastive'] * contrast_loss + 
+                            loss_weights['mutual'] * mutual_loss + 
+                            loss_weights['confidence'] * confidence_loss + 
+                            loss_weights['ensemble'] * ensemble_loss +
+                            loss_weights['multilabel_consistency'] * multilabel_consistency +  # NEW
+                            loss_weights['class_balance'] * class_balance_loss +  # NEW
+                            loss_weights['multilabel_contrastive'] * multilabel_contrastive +  # NEW
+                            loss_weights['refined_labels'] * refined_label_loss)  # NEW
+                print("    Losses calculated.")
+                
+                # Check for nan/inf in individual losses
+                loss_dict = {
+                    'recon': recon_loss,
+                    'label': label_loss,
+                    'supervised': supervised_loss,  # Added
+                    'prototype': prototype_loss,    # Added
+                    'cluster': cluster_loss,
+                    'contrastive': contrast_loss,
+                    'mutual': mutual_loss,
+                    'confidence': confidence_loss,
+                    'ensemble': ensemble_loss,
+                    'multilabel_consistency': multilabel_consistency,  # NEW
+                    'class_balance': class_balance_loss,  # NEW
+                    'multilabel_contrastive': multilabel_contrastive,  # NEW
+                    'refined_labels': refined_label_loss  # NEW
                 }
                 
-                # Add individual loss components if they exist
-                if 'recon_loss' in locals() and recon_loss is not None:
-                    loss_info['recon'] = recon_loss.item()
-                if 'label_loss' in locals() and label_loss is not None:
-                    loss_info['label'] = label_loss.item()
-                if 'supervised_loss' in locals() and supervised_loss is not None:
-                    loss_info['sup'] = supervised_loss.item()
+                # Check each loss component
+                skip_batch = False
+                for loss_name, loss_val in loss_dict.items():
+                    if torch.isnan(loss_val) or torch.isinf(loss_val):
+                        print(f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}")
+                        skip_batch = True
                 
-                # Update batch progress with detailed tracking
-                tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"Skipping batch due to numerical instability.")
+                    optimizer.zero_grad()
+                    
+                    # Still track progress for skipped batch
+                    batch_time = time.time() - batch_start_time
+                    loss_info = {'total': 0.0, 'nan_skip': True}
+                    tracker.update_batch_progress(batch_idx, batch_time, loss_info)
+                    
+                    continue
+                
+                print("    Performing backward pass (total_loss.backward())...")
+                total_loss.backward()
+                print("    Backward pass successful.")
+                
+                # Gradient clipping
+                print("    Applying gradient clipping...")
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                print("    Gradient clipping applied.")
+                
+                print("    Performing optimizer step (optimizer.step())...")
+                optimizer.step()
+                print("    Optimizer step successful.")
+                
+                # UMTL Enhancement: Update teacher network (EMA)
+                print("    Updating teacher network (EMA)...")
+                update_teacher_ema(model, teacher, ema_momentum)
+                print("    Teacher network updated.")
+                
+                # Update class prototypes
+                print("    Updating class prototypes...")
+                update_class_prototypes(model, outputs['prototype'], predictions)
+                print("    Class prototypes updated.")
+            
+            epoch_losses.append(total_loss.item())
+            
+            # Calculate batch processing time and update progress tracking
+            batch_time = time.time() - batch_start_time
+            
+            # Prepare loss info for progress display - safely handle undefined variables
+            loss_info = {
+                'total': total_loss.item(),
+            }
+            
+            # Add individual loss components if they exist
+            if 'recon_loss' in locals() and recon_loss is not None:
+                loss_info['recon'] = recon_loss.item()
+            if 'label_loss' in locals() and label_loss is not None:
+                loss_info['label'] = label_loss.item()
+            if 'supervised_loss' in locals() and supervised_loss is not None:
+                loss_info['sup'] = supervised_loss.item()
+            
+            # Update batch progress with detailed tracking
+            tracker.update_batch_progress(batch_idx, batch_time, loss_info)
         
         scheduler.step()
         
@@ -4593,82 +4635,38 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                                    true_labels: np.ndarray = None, 
                                    epoch: int = 0, total_epochs: int = 50) -> np.ndarray:
     """
-    Advanced pseudo-label generation with curriculum learning and confidence boosting
+    Simplified pseudo-label generation for improved speed and stability.
+    Generates pseudo-labels based on initial confidence and curriculum learning.
     """
     if not classes:
-        # If no classes, create a single 'normal' class with high confidence
-        confidence = 0.7 + 0.2 * (epoch / max(total_epochs, 1))  # Increase confidence over time
+        confidence = 0.7 + 0.2 * (epoch / max(total_epochs, 1))
         return np.ones((len(embeddings), 1), dtype=np.float32) * confidence
     
     n_samples = len(embeddings)
     n_classes = len(classes)
-    
-    # Curriculum learning: start conservative, become more aggressive
     progress = epoch / max(total_epochs, 1)
     
+    pseudo_labels = np.zeros((n_samples, n_classes), dtype=np.float32)
+    
     if true_labels is not None:
-        # Use true labels as strong supervision
         pseudo_labels = true_labels.astype(np.float32)
-        
-        # Apply curriculum noise reduction
         noise_factor = max(0.02, 0.1 - 0.08 * progress)
         noise = np.random.rand(n_samples, n_classes) * noise_factor
         pseudo_labels = pseudo_labels * (0.95 + 0.05 * progress) + noise * (1 - progress)
         
-        # For unlabeled samples, use confident initialization
         unlabeled_mask = (true_labels.sum(axis=1) == 0)
         if np.any(unlabeled_mask):
             n_unlabeled = np.sum(unlabeled_mask)
-            # More confident initialization as training progresses
             base_confidence = 0.3 + 0.4 * progress
             confident_labels = np.random.rand(n_unlabeled, n_classes)
             confident_labels = (confident_labels > (1 - base_confidence)).astype(float) * 0.8 + 0.1
             pseudo_labels[unlabeled_mask] = confident_labels
     else:
-        # Start with moderate confidence, increase over time
         base_confidence = 0.2 + 0.5 * progress
         pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
         pseudo_labels = (pseudo_labels > (1 - base_confidence)).astype(float) * 0.7 + 0.15
     
-    # Simplified similarity-based propagation using NearestNeighbors for efficiency
-    embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
-    
-    # Adaptive k_neighbors based on curriculum
-    k_neighbors_prop = min(50 + int(20 * progress), n_samples - 1) # Max 70 neighbors, capped by n_samples
-    
-    # Use NearestNeighbors to find similar samples
-    nn_model = NearestNeighbors(n_neighbors=k_neighbors_prop + 1, metric='cosine') # +1 to include self
-    nn_model.fit(embeddings_norm)
-    distances, indices = nn_model.kneighbors(embeddings_norm)
-    
-    # Iterate through samples to propagate labels
-    for i in range(n_samples):
-        global_idx = i
-        
-        # Get indices of similar samples (excluding self)
-        similar_indices = indices[i, 1:] # Exclude the first index which is self
-        similar_distances = distances[i, 1:]
-        
-        # Filter by similarity threshold
-        similarity_threshold = 0.8 # Fixed for simplicity
-        valid_mask = similar_distances < (1 - similarity_threshold) # Cosine distance is 1 - similarity
-        valid_indices = similar_indices[valid_mask]
-        valid_similarities = 1 - similar_distances[valid_mask] # Convert distance back to similarity
-        
-        # Initialize propagated_labels with current pseudo_labels (no change if no valid samples)
-        propagated_labels = pseudo_labels[global_idx]
-        
-        if len(valid_indices) > 0:
-            # Weighted average with confidence boost
-            weights = valid_similarities / (valid_similarities.sum() + 1e-8) # Add epsilon for stability
-            propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
-        
-        # Adaptive momentum for updating pseudo-labels
-        momentum = 0.7 + 0.2 * progress # Increase momentum over epochs
-        pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
-    
-    # --- NEW ADDITION: Reinforce "opposite" class predictions ---
-    # For each sample, if a class is confidently *not* present, and others are, reinforce the negative.
+    # --- Reinforce "opposite" class predictions ---
     negative_reinforce_threshold = 0.1 # If pseudo-label for a class is below this
     positive_presence_threshold = 0.7 # If other pseudo-labels are above this
     
@@ -4685,27 +4683,22 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                 if other_classes_present:
                     # Strongly push this class's pseudo-label towards 0
                     pseudo_labels[i, c] = pseudo_labels[i, c] * 0.1 # Reduce by 90%
-    # --- END NEW ADDITION ---
 
-    # Simplified confidence boosting and sharpening
-    # Apply confidence boosting to top-k predictions
+    # Confidence boosting and sharpening
     for i in range(n_samples):
-        k = min(3 + int(2 * progress), n_classes) # Adaptive k
+        k = min(3 + int(2 * progress), n_classes)
         top_indices = np.argsort(pseudo_labels[i])[-k:]
         
-        boost_factor = 0.1 + 0.3 * progress # Stronger boosting over epochs
+        boost_factor = 0.1 + 0.3 * progress
         pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + boost_factor, 0.95)
         
-        # Suppress weak predictions
-        weak_threshold = 0.4 - 0.1 * progress # More aggressive suppression over epochs
+        weak_threshold = 0.4 - 0.1 * progress
         weak_mask = pseudo_labels[i] < weak_threshold
         pseudo_labels[i][weak_mask] *= (0.8 - 0.3 * progress)
     
-    # Sharpening
-    temperature = max(0.3, 0.8 - 0.5 * progress) # Stronger sharpening over epochs
+    temperature = max(0.3, 0.8 - 0.5 * progress)
     pseudo_labels = pseudo_labels ** (1/temperature)
     
-    # Normalize and clip
     row_sums = pseudo_labels.sum(axis=1, keepdims=True)
     row_sums = np.maximum(row_sums, 1e-8)
     pseudo_labels = pseudo_labels / row_sums
@@ -4714,20 +4707,17 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
     max_conf = min(0.95, 0.8 + 0.15 * progress)
     pseudo_labels = np.clip(pseudo_labels, min_conf, max_conf)
     
-    # Ensure no invalid values
     pseudo_labels = np.nan_to_num(pseudo_labels, nan=min_conf, posinf=max_conf, neginf=min_conf)
     
     return pseudo_labels
 
-def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarray, 
-                                  classes: List[str], true_labels: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+def enhanced_adaptive_thresholding(predictions: np.ndarray, classes: List[str], true_labels: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Enhanced adaptive thresholding combining global information for better F1.
     Simplified for better speed and stability.
     
     Args:
         predictions: Predicted probabilities (n_samples, n_classes)
-        embeddings: Original embeddings (not used for local density in this simplified version)
         classes: List of class names
         true_labels: True labels if available for optimization
     
