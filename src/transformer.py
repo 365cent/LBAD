@@ -2380,6 +2380,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     # Check for existing checkpoint
     start_epoch = 0
     best_model_state = None  # Initialize best model state for early stopping
+    print("🔍 Attempting to load training checkpoint...")
     checkpoint_data = load_training_checkpoint(log_type, training_hash)
     if checkpoint_data:
         try:
@@ -2402,6 +2403,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             best_loss = float('inf')
     else:
         best_loss = float('inf')
+        print("ℹ️ No existing checkpoint found. Starting training from scratch.")
     
     tracker.log_step("Training Setup", {
         "model_parameters": sum(p.numel() for p in model.parameters()),
@@ -2418,6 +2420,126 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
         "total_samples": len(embeddings),
         "training_mode": "Fully unsupervised - all data used for training"
     })
+    print("⚙️ Training setup complete. Initializing data loader...")
+    
+    # Generate initial pseudo-labels using all available true labels (if any) for guidance
+    true_labels = getattr(tracker, 'true_labels', None)
+    print("Generating initial pseudo-labels...")
+    pseudo_labels = advanced_pseudo_label_generation(embeddings, classes, true_labels=true_labels, epoch=0, total_epochs=100)
+    print("Initial pseudo-labels generated.")
+    
+    # Store initial pseudo-labels for refinement
+    current_pseudo_labels = pseudo_labels.copy()
+    
+    # Data setup - use ALL data for training (no splitting)
+    # Ensure tensors are contiguous to prevent CUDA alignment issues
+    embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
+    labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
+    
+    dataset = TensorDataset(embeddings_tensor, labels_tensor)
+    
+    sampler = DistributedSampler(dataset) if config.is_distributed else None
+    
+    # Adaptive batch size based on embedding type and device
+    if config.device == "cuda":
+        # Conservative batch sizes for CUDA to prevent OOM
+        if embedding_dim <= 300:  # FastText
+            batch_size = min(64, max(8, int(config.gpu_memory_gb * 0.8)))
+        elif embedding_dim <= 768:  # Standard BERT
+            batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.5)))
+        else:  # Enhanced LogBERT (2314D)
+            batch_size = min(16, max(2, int(config.gpu_memory_gb * 0.3)))
+    else:
+        # More generous batch sizes for MPS/CPU
+        if embedding_dim <= 300:  # FastText
+            batch_size = min(128, max(16, int(config.gpu_memory_gb * 2)))
+        elif embedding_dim <= 768:  # Standard BERT
+            batch_size = min(64, max(8, int(config.gpu_memory_gb * 1.5)))
+        else:  # Enhanced LogBERT (2314D)
+            batch_size = min(32, max(4, int(config.gpu_memory_gb * 0.8)))
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=0,  # Disable multiprocessing to avoid alignment issues
+        pin_memory=False  # Disable pin_memory to prevent CUDA misalignment
+    )
+    print("Data loader initialized.")
+    
+    # Advanced training setup - adjusted for longer training
+    optimizer = optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)  # Slightly lower LR for 100 epochs
+    
+    # Compute class weights for balanced training if true labels available
+    if true_labels is not None:
+        # Calculate inverse frequency weights for class balance
+        class_frequencies = true_labels.sum(axis=0)
+        # Avoid division by zero for classes with no samples
+        class_frequencies = np.maximum(class_frequencies, 1)
+        class_weights = len(true_labels) / (len(classes) * class_frequencies)
+        class_weights = torch.from_numpy(class_weights.astype(np.float32)).to(device)
+        print(f"🎯 Using class balance weights: {[f'{w:.2f}' for w in class_weights.cpu().numpy()]}")
+    scaler = GradScaler() if config.device == "cuda" else None
+    
+    # Advanced scheduler with warmup - adapted for 100 epochs
+    def lr_lambda(epoch):
+        warmup_epochs = 10  # Longer warmup for 100 epochs
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        else:
+            # Cosine annealing over remaining epochs
+            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (100 - warmup_epochs)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Gradient clipping for stability
+    max_grad_norm = 1.0  # Reduced for better stability
+    
+    # Check for existing checkpoint
+    start_epoch = 0
+    best_model_state = None  # Initialize best model state for early stopping
+    print("🔍 Attempting to load training checkpoint...")
+    checkpoint_data = load_training_checkpoint(log_type, training_hash)
+    if checkpoint_data:
+        try:
+            checkpoint, loaded_epoch = checkpoint_data
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = loaded_epoch + 1
+            print(f"✅ Resuming training from epoch {start_epoch}")
+            
+            # Restore best loss for early stopping
+            if 'metrics' in checkpoint and 'best_loss' in checkpoint['metrics']:
+                best_loss = checkpoint['metrics']['best_loss']
+                # Initialize best model state with current loaded state
+                best_model_state = model.state_dict().copy()
+            else:
+                best_loss = float('inf')
+        except Exception as e:
+            print(f"⚠️  Could not restore checkpoint: {e}")
+            start_epoch = 0
+            best_loss = float('inf')
+    else:
+        best_loss = float('inf')
+        print("ℹ️ No existing checkpoint found. Starting training from scratch.")
+    
+    tracker.log_step("Training Setup", {
+        "model_parameters": sum(p.numel() for p in model.parameters()),
+        "input_dim": embedding_dim,
+        "latent_dim": latent_dim,
+        "n_labels": n_labels,
+        "n_clusters": n_clusters,
+        "batch_size": batch_size,
+        "device": str(device),
+        "mixed_precision": scaler is not None,
+        "embedding_type": embedding_type,
+        "device_memory_gb": config.gpu_memory_gb,
+        "memory_optimization": "CUDA conservative" if config.device == "cuda" else "Standard",
+        "total_samples": len(embeddings),
+        "training_mode": "Fully unsupervised - all data used for training"
+    })
+    print("⚙️ Training setup complete. Entering main training loop...")
     
     # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
@@ -2435,6 +2557,7 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
     min_delta = 1e-5  # Smaller minimum improvement threshold
     
     for epoch in range(start_epoch, total_epochs):
+        print(f"Starting epoch {epoch+1}/{total_epochs}...")
         epoch_start = time.time()
         epoch_losses = []
         
@@ -2622,9 +2745,11 @@ def train_model(embeddings: np.ndarray, classes: List[str], C: np.ndarray,
             model.train()
         
         # Progress tracking for batches (removing spinner as we have detailed progress)
-        print(f"\n🔄 Starting Epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
+        print(f"
+🔄 Starting Epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
         
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+            print(f"  Processing batch {batch_idx+1}/{len(dataloader)} of epoch {epoch+1}...")
             batch_start_time = time.time()
             
             # Initialize default loss variables in case batch is skipped
@@ -3871,73 +3996,69 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
         pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
         pseudo_labels = (pseudo_labels > (1 - base_confidence)).astype(float) * 0.7 + 0.15
     
-    # Advanced similarity-based propagation
+    # Simplified similarity-based propagation
     embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
     
-    # Adaptive similarity threshold based on curriculum
-    similarity_threshold = 0.75 + 0.1 * progress  # Start at 0.75, go to 0.85
+    # Fixed similarity threshold (can be made adaptive if needed, but simplified for now)
+    similarity_threshold = 0.8
     
-    # Multi-scale propagation with different neighborhood sizes
-    for scale in [500, 1000, 2000]:  # Different scales
-        chunk_size = min(scale, n_samples)
+    # Use a single pass for propagation
+    chunk_size = min(1000, n_samples) # Process in chunks to manage memory
+    
+    for i in range(0, n_samples, chunk_size):
+        end_i = min(i + chunk_size, n_samples)
+        chunk_i = embeddings_norm[i:end_i]
         
-        for i in range(0, n_samples, chunk_size):
-            end_i = min(i + chunk_size, n_samples)
-            chunk_i = embeddings_norm[i:end_i]
+        similarities = np.dot(chunk_i, embeddings_norm.T)
+        
+        for j in range(len(chunk_i)):
+            global_idx = i + j
             
-            similarities = np.dot(chunk_i, embeddings_norm.T)
+            # Find highly similar samples
+            similar_indices = np.where(similarities[j] > similarity_threshold)[0]
             
-            for j in range(len(chunk_i)):
-                global_idx = i + j
+            # Initialize propagated_labels with current pseudo_labels (no change if no valid samples)
+            propagated_labels = pseudo_labels[global_idx]
+            
+            if len(similar_indices) > 1: # Ensure there's more than just the sample itself
+                # Exclude self from similar_indices if present
+                self_idx_in_similar = np.where(similar_indices == global_idx)[0]
+                if len(self_idx_in_similar) > 0:
+                    similar_indices = np.delete(similar_indices, self_idx_in_similar)
                 
-                # Find top-k similar samples (adaptive k)
-                k_neighbors = min(20 + int(10 * progress), n_samples // 10)
-                top_k_indices = np.argsort(similarities[j])[-k_neighbors:]
-                top_k_similarities = similarities[j][top_k_indices]
-                
-                # Only use highly similar samples
-                valid_mask = top_k_similarities > similarity_threshold
-                
-                # Initialize propagated_labels with current pseudo_labels (no change if no valid samples)
-                propagated_labels = pseudo_labels[global_idx]
-                
-                if np.any(valid_mask):
-                    valid_indices = top_k_indices[valid_mask]
-                    valid_similarities = top_k_similarities[valid_mask]
-                    
-                    # Weighted propagation
-                    weights = valid_similarities / valid_similarities.sum()
-                    propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
-                    
-                # Adaptive momentum based on curriculum
-                momentum = 0.7 + 0.2 * progress
-                pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+                if len(similar_indices) > 0: # Check again after removing self
+                    # Weighted average with confidence boost
+                    sim_weights = similarities[j][similar_indices]
+                    sim_weights = sim_weights / (sim_weights.sum() + 1e-8) # Add epsilon for stability
+                    propagated_labels = np.average(pseudo_labels[similar_indices], axis=0, weights=sim_weights)
+            
+            # Adaptive momentum for updating pseudo-labels
+            momentum = 0.7 + 0.2 * progress # Increase momentum over epochs
+            pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
     
-    # Progressive confidence boosting
+    # Simplified confidence boosting and sharpening
+    # Apply confidence boosting to top-k predictions
     for i in range(n_samples):
-        # Dynamic k based on curriculum
-        k = min(3 + int(2 * progress), n_classes)
+        k = min(3 + int(2 * progress), n_classes) # Adaptive k
         top_indices = np.argsort(pseudo_labels[i])[-k:]
         
-        # Stronger boosting as training progresses
-        boost_factor = 0.1 + 0.3 * progress
+        boost_factor = 0.1 + 0.3 * progress # Stronger boosting over epochs
         pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + boost_factor, 0.95)
         
-        # Suppress weak predictions more aggressively
-        weak_threshold = 0.4 - 0.1 * progress
+        # Suppress weak predictions
+        weak_threshold = 0.4 - 0.1 * progress # More aggressive suppression over epochs
         weak_mask = pseudo_labels[i] < weak_threshold
         pseudo_labels[i][weak_mask] *= (0.8 - 0.3 * progress)
     
-    # Progressive sharpening
-    temperature = max(0.3, 0.8 - 0.5 * progress)
+    # Sharpening
+    temperature = max(0.3, 0.8 - 0.5 * progress) # Stronger sharpening over epochs
     pseudo_labels = pseudo_labels ** (1/temperature)
     
-    # Normalization with confidence preservation
+    # Normalize and clip
     row_sums = pseudo_labels.sum(axis=1, keepdims=True)
     row_sums = np.maximum(row_sums, 1e-8)
     pseudo_labels = pseudo_labels / row_sums
     
-    # Progressive confidence bounds
     min_conf = max(0.05, 0.15 - 0.1 * progress)
     max_conf = min(0.95, 0.8 + 0.15 * progress)
     pseudo_labels = np.clip(pseudo_labels, min_conf, max_conf)
@@ -4509,72 +4630,86 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
         pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
         pseudo_labels = (pseudo_labels > (1 - base_confidence)).astype(float) * 0.7 + 0.15
     
-    # Advanced similarity-based propagation
+    # Simplified similarity-based propagation using NearestNeighbors for efficiency
     embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
     
-    # Adaptive similarity threshold based on curriculum
-    similarity_threshold = 0.75 + 0.1 * progress  # Start at 0.75, go to 0.85
+    # Adaptive k_neighbors based on curriculum
+    k_neighbors_prop = min(50 + int(20 * progress), n_samples - 1) # Max 70 neighbors, capped by n_samples
     
-    # Multi-scale propagation with different neighborhood sizes
-    for scale in [500, 1000, 2000]:  # Different scales
-        chunk_size = min(scale, n_samples)
-        
-        for i in range(0, n_samples, chunk_size):
-            end_i = min(i + chunk_size, n_samples)
-            chunk_i = embeddings_norm[i:end_i]
-            
-            similarities = np.dot(chunk_i, embeddings_norm.T)
-            
-            for j in range(len(chunk_i)):
-                global_idx = i + j
-                
-                # Find top-k similar samples (adaptive k)
-                k_neighbors = min(20 + int(10 * progress), n_samples // 10)
-                top_k_indices = np.argsort(similarities[j])[-k_neighbors:]
-                top_k_similarities = similarities[j][top_k_indices]
-                
-                # Only use highly similar samples
-                valid_mask = top_k_similarities > similarity_threshold
-                if np.any(valid_mask):
-                    valid_indices = top_k_indices[valid_mask]
-                    valid_similarities = top_k_similarities[valid_mask]
-                    
-                    # Weighted propagation
-                    weights = valid_similarities / valid_similarities.sum()
-                    propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
-                else:
-                    # If no valid similar samples, propagated_labels remains the current pseudo_label
-                    propagated_labels = pseudo_labels[global_idx]
-                    
-                # Adaptive momentum based on curriculum
-                momentum = 0.7 + 0.2 * progress
-                pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+    # Use NearestNeighbors to find similar samples
+    nn_model = NearestNeighbors(n_neighbors=k_neighbors_prop + 1, metric='cosine') # +1 to include self
+    nn_model.fit(embeddings_norm)
+    distances, indices = nn_model.kneighbors(embeddings_norm)
     
-    # Progressive confidence boosting
+    # Iterate through samples to propagate labels
     for i in range(n_samples):
-        # Dynamic k based on curriculum
-        k = min(3 + int(2 * progress), n_classes)
+        global_idx = i
+        
+        # Get indices of similar samples (excluding self)
+        similar_indices = indices[i, 1:] # Exclude the first index which is self
+        similar_distances = distances[i, 1:]
+        
+        # Filter by similarity threshold
+        similarity_threshold = 0.8 # Fixed for simplicity
+        valid_mask = similar_distances < (1 - similarity_threshold) # Cosine distance is 1 - similarity
+        valid_indices = similar_indices[valid_mask]
+        valid_similarities = 1 - similar_distances[valid_mask] # Convert distance back to similarity
+        
+        # Initialize propagated_labels with current pseudo_labels (no change if no valid samples)
+        propagated_labels = pseudo_labels[global_idx]
+        
+        if len(valid_indices) > 0:
+            # Weighted average with confidence boost
+            weights = valid_similarities / (valid_similarities.sum() + 1e-8) # Add epsilon for stability
+            propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
+        
+        # Adaptive momentum for updating pseudo-labels
+        momentum = 0.7 + 0.2 * progress # Increase momentum over epochs
+        pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+    
+    # --- NEW ADDITION: Reinforce "opposite" class predictions ---
+    # For each sample, if a class is confidently *not* present, and others are, reinforce the negative.
+    negative_reinforce_threshold = 0.1 # If pseudo-label for a class is below this
+    positive_presence_threshold = 0.7 # If other pseudo-labels are above this
+    
+    for i in range(n_samples):
+        for c in range(n_classes):
+            if pseudo_labels[i, c] < negative_reinforce_threshold:
+                # Check if other classes are confidently present
+                other_classes_present = False
+                for other_c in range(n_classes):
+                    if other_c != c and pseudo_labels[i, other_c] > positive_presence_threshold:
+                        other_classes_present = True
+                        break
+                
+                if other_classes_present:
+                    # Strongly push this class's pseudo-label towards 0
+                    pseudo_labels[i, c] = pseudo_labels[i, c] * 0.1 # Reduce by 90%
+    # --- END NEW ADDITION ---
+
+    # Simplified confidence boosting and sharpening
+    # Apply confidence boosting to top-k predictions
+    for i in range(n_samples):
+        k = min(3 + int(2 * progress), n_classes) # Adaptive k
         top_indices = np.argsort(pseudo_labels[i])[-k:]
         
-        # Stronger boosting as training progresses
-        boost_factor = 0.1 + 0.3 * progress
+        boost_factor = 0.1 + 0.3 * progress # Stronger boosting over epochs
         pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + boost_factor, 0.95)
         
-        # Suppress weak predictions more aggressively
-        weak_threshold = 0.4 - 0.1 * progress
+        # Suppress weak predictions
+        weak_threshold = 0.4 - 0.1 * progress # More aggressive suppression over epochs
         weak_mask = pseudo_labels[i] < weak_threshold
         pseudo_labels[i][weak_mask] *= (0.8 - 0.3 * progress)
     
-    # Progressive sharpening
-    temperature = max(0.3, 0.8 - 0.5 * progress)
+    # Sharpening
+    temperature = max(0.3, 0.8 - 0.5 * progress) # Stronger sharpening over epochs
     pseudo_labels = pseudo_labels ** (1/temperature)
     
-    # Normalization with confidence preservation
+    # Normalize and clip
     row_sums = pseudo_labels.sum(axis=1, keepdims=True)
     row_sums = np.maximum(row_sums, 1e-8)
     pseudo_labels = pseudo_labels / row_sums
     
-    # Progressive confidence bounds
     min_conf = max(0.05, 0.15 - 0.1 * progress)
     max_conf = min(0.95, 0.8 + 0.15 * progress)
     pseudo_labels = np.clip(pseudo_labels, min_conf, max_conf)
@@ -4585,17 +4720,16 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
     return pseudo_labels
 
 def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarray, 
-                                  classes: List[str], true_labels: np.ndarray = None, 
-                                  k_neighbors: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+                                  classes: List[str], true_labels: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Enhanced adaptive thresholding combining global and local information for better F1
+    Enhanced adaptive thresholding combining global information for better F1.
+    Simplified for better speed and stability.
     
     Args:
         predictions: Predicted probabilities (n_samples, n_classes)
-        embeddings: Original embeddings for local density calculation
+        embeddings: Original embeddings (not used for local density in this simplified version)
         classes: List of class names
         true_labels: True labels if available for optimization
-        k_neighbors: Number of neighbors for local density
     
     Returns:
         adaptive_thresholds: Per-class thresholds
@@ -4608,19 +4742,7 @@ def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarr
     global_priors = predictions.mean(axis=0)  # Average prediction per class
     class_rarity = -np.log(global_priors + 1e-8)  # IDF-like rarity score
     
-    # Step 2: Calculate local density information (if embeddings available)
-    if embeddings is not None and len(embeddings) > k_neighbors:
-        nn = NearestNeighbors(n_neighbors=k_neighbors, metric='cosine')
-        nn.fit(embeddings)
-        distances, indices = nn.kneighbors(embeddings)
-        
-        # Local density: inverse of average distance to k nearest neighbors
-        local_density = 1.0 / (distances.mean(axis=1) + 1e-8)
-        local_density = (local_density - local_density.min()) / (local_density.max() - local_density.min() + 1e-8)
-    else:
-        local_density = np.ones(n_samples) * 0.5
-    
-    # Step 3: Calculate per-class adaptive thresholds
+    # Step 2: Calculate per-class adaptive thresholds
     for class_idx in range(n_classes):
         class_preds = predictions[:, class_idx]
         
@@ -4635,49 +4757,52 @@ def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarr
                 
                 # Test multiple thresholds
                 for threshold in np.linspace(0.1, 0.9, 25):
-                    # Combine global and local information
-                    adjusted_threshold = threshold * (1 + 0.1 * class_rarity[class_idx])
-                    binary_preds = (class_preds > adjusted_threshold).astype(int)
+                    # Apply threshold to class predictions
+                    binary_class_preds = (class_preds >= threshold).astype(int)
                     
-                    f1 = f1_score(true_class, binary_preds, zero_division=0)
+                    # Calculate F1 score
+                    f1 = f1_score(true_class, binary_class_preds, zero_division=0)
+                    
                     if f1 > best_f1:
                         best_f1 = f1
-                        best_threshold = adjusted_threshold
+                        best_threshold = threshold
                 
                 adaptive_thresholds[class_idx] = best_threshold
             else:
-                # No positive samples, use heuristic
-                adaptive_thresholds[class_idx] = 0.5 + 0.1 * class_rarity[class_idx]
+                # If no positive samples in true_class, use a high threshold to avoid false positives
+                adaptive_thresholds[class_idx] = 0.95
         else:
-            # No true labels, use distribution-based adaptive threshold
-            mean_pred = np.mean(class_preds)
-            std_pred = np.std(class_preds)
+            # If no true labels, use a percentile-based approach adjusted by rarity
+            # This simplifies the logic by removing the local density influence
             
-            # Combine global rarity and local distribution
-            base_threshold = mean_pred + 0.5 * std_pred
+            # Rarity factor: 0 for most common, 1 for rarest
+            rarity_factor = 1.0 - (class_rarity[class_idx] / (class_rarity.max() + 1e-8))
             
-            # Adjust based on class rarity (rare classes get lower thresholds)
-            rarity_adjustment = 0.1 * (1 - global_priors[class_idx])
+            # Calculate a dynamic percentile target based on rarity
+            # Rarer classes get a lower percentile (more inclusive threshold)
+            base_percentile = 70 # Start with a base percentile
+            percentile_adjustment = rarity_factor * 20 # Max 20 point adjustment
+            percentile_target = base_percentile - percentile_adjustment
             
-            # Final threshold bounded between 0.15 and 0.85
-            adaptive_thresholds[class_idx] = np.clip(
-                base_threshold - rarity_adjustment,
-                0.15, 0.85
-            )
+            # Ensure percentile is within reasonable bounds (e.g., 50 to 90)
+            percentile_target = np.clip(percentile_target, 50, 90)
+            
+            adaptive_thresholds[class_idx] = np.percentile(class_preds, percentile_target)
+            
+            # Ensure threshold is within reasonable bounds (e.g., 0.1 to 0.9)
+            adaptive_thresholds[class_idx] = np.clip(adaptive_thresholds[class_idx], 0.1, 0.9)
     
-    # Step 4: Apply thresholds with local density adjustment
+    # Step 4: Apply thresholds and assign binary predictions
     binary_predictions = np.zeros_like(predictions, dtype=int)
+    for class_idx in range(n_classes):
+        binary_predictions[:, class_idx] = (predictions[:, class_idx] >= adaptive_thresholds[class_idx]).astype(int)
     
-    for sample_idx in range(n_samples):
-        sample_preds = predictions[sample_idx]
-        sample_density = local_density[sample_idx]
-        
-        # Adjust thresholds based on local density (denser regions = higher confidence required)
-        density_factor = 1.0 + 0.2 * (sample_density - 0.5)
-        
-        for class_idx in range(n_classes):
-            adjusted_threshold = adaptive_thresholds[class_idx] * density_factor
-            binary_predictions[sample_idx, class_idx] = int(sample_preds[class_idx] > adjusted_threshold)
+    # Step 5: Post-processing for multi-label coherence
+    # Ensure at least one label per sample if no labels are predicted
+    for i in range(n_samples):
+        if binary_predictions[i].sum() == 0:
+            # Assign the class with the highest probability if no labels are predicted
+            binary_predictions[i, np.argmax(predictions[i])] = 1
     
     return adaptive_thresholds, binary_predictions
 
