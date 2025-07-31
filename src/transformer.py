@@ -3900,6 +3900,10 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                 
                 # Only use highly similar samples
                 valid_mask = top_k_similarities > similarity_threshold
+                
+                # Initialize propagated_labels with current pseudo_labels (no change if no valid samples)
+                propagated_labels = pseudo_labels[global_idx]
+                
                 if np.any(valid_mask):
                     valid_indices = top_k_indices[valid_mask]
                     valid_similarities = top_k_similarities[valid_mask]
@@ -3908,9 +3912,9 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                     weights = valid_similarities / valid_similarities.sum()
                     propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
                     
-                    # Adaptive momentum based on curriculum
-                    momentum = 0.7 + 0.2 * progress
-                    pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+                # Adaptive momentum based on curriculum
+                momentum = 0.7 + 0.2 * progress
+                pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
     
     # Progressive confidence boosting
     for i in range(n_samples):
@@ -4539,11 +4543,15 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                     valid_similarities = top_k_similarities[valid_mask]
                     
                     # Weighted propagation
+                    weights = valid_similarities / valid_similarities.sum()
                     propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
+                else:
+                    # If no valid similar samples, propagated_labels remains the current pseudo_label
+                    propagated_labels = pseudo_labels[global_idx]
                     
-                    # Adaptive momentum based on curriculum
-                    momentum = 0.7 + 0.2 * progress
-                    pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+                # Adaptive momentum based on curriculum
+                momentum = 0.7 + 0.2 * progress
+                pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
     
     # Progressive confidence boosting
     for i in range(n_samples):
