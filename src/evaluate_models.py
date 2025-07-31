@@ -222,69 +222,50 @@ class TransformerEvaluator:
             
             # Strategy selection based on class characteristics
             if pos_samples == 0:
-                # No positive samples - use very high threshold to minimize false positives
                 optimized_thresholds[i] = 0.95
-                print(f"   {cls:<25} NO POS SAMPLES -> threshold: 0.95")
+                print(f"   {cls:<25} threshold: 0.95 (NO POS SAMPLES)")
                 continue
                 
             elif pos_samples < 10:
-                # Extremely rare classes (< 10 samples)
-                # Use precision-recall curve to find best threshold
                 precision, recall, thresholds_pr = precision_recall_curve(y_true_class, probs_class)
-                
-                # Find threshold that maximizes (precision * recall) / (precision + recall) = F1
                 f1_scores_pr = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
                 
                 if len(f1_scores_pr) > 0:
                     best_idx = np.argmax(f1_scores_pr)
                     best_threshold = thresholds_pr[best_idx]
-                    
-                    # For extremely rare classes, bias towards higher recall (lower threshold)
-                    # to ensure we don't miss the few positive samples
-                    adjusted_threshold = best_threshold * 0.8  # Reduce by 20%
+                    adjusted_threshold = best_threshold * 0.8
                     optimized_thresholds[i] = np.clip(adjusted_threshold, 0.05, 0.90)
-                    best_f1 = f1_scores_pr[best_idx]
-                    print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_PR")
+                    print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {f1_scores_pr[best_idx]:.3f}) | pos: {pos_samples} | RARE_PR")
                 else:
-                    optimized_thresholds[i] = 0.3  # Conservative for rare classes
+                    optimized_thresholds[i] = 0.3
                     print(f"   {cls:<25} threshold: 0.30 (fallback) | pos: {pos_samples} | RARE_FB")
                     
             elif pos_samples < 100:
-                # Rare classes (10-100 samples)
-                # Use F1 optimization with fine-grained search and statistical validation
                 best_f1 = 0
                 best_threshold = 0.5
                 candidate_thresholds = []
                 candidate_f1s = []
                 
-                # Fine-grained search for rare classes
-                for threshold in np.linspace(0.05, 0.95, 50):  # More granular for rare classes
+                for threshold in np.linspace(0.05, 0.95, 50):
                     pred_class = (probs_class >= threshold).astype(int)
                     f1 = f1_score(y_true_class, pred_class, zero_division=0)
-                    
                     candidate_thresholds.append(threshold)
                     candidate_f1s.append(f1)
-                    
                     if f1 > best_f1:
                         best_f1 = f1
                         best_threshold = threshold
                 
-                # Statistical validation: check if the best threshold is significantly better
                 candidate_f1s = np.array(candidate_f1s)
                 candidate_thresholds = np.array(candidate_thresholds)
-                
-                # Find all thresholds within 95% of best F1
                 good_threshold_mask = candidate_f1s >= (best_f1 * 0.95)
                 good_thresholds = candidate_thresholds[good_threshold_mask]
                 
                 if len(good_thresholds) > 1:
-                    # Among good thresholds, prefer one that gives balanced precision/recall
                     balanced_scores = []
                     for thresh in good_thresholds:
                         pred_class = (probs_class >= thresh).astype(int)
                         bal_acc = balanced_accuracy_score(y_true_class, pred_class)
                         balanced_scores.append(bal_acc)
-                    
                     best_balanced_idx = np.argmax(balanced_scores)
                     optimized_thresholds[i] = good_thresholds[best_balanced_idx]
                     print(f"   {cls:<25} threshold: {optimized_thresholds[i]:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_BAL")
@@ -293,60 +274,34 @@ class TransformerEvaluator:
                     print(f"   {cls:<25} threshold: {best_threshold:.3f} (F1: {best_f1:.3f}) | pos: {pos_samples} | RARE_F1")
                     
             else:
-                # Common classes (>= 100 samples)
-                # Use comprehensive optimization considering multiple metrics
                 best_score = 0
                 best_threshold = 0.5
                 
-                # Coarse-to-fine search for efficiency
-                # Coarse search
                 coarse_thresholds = np.linspace(0.1, 0.9, 17)
-                coarse_scores = []
-                
                 for threshold in coarse_thresholds:
                     pred_class = (probs_class >= threshold).astype(int)
-                    
-                    # Composite score: weighted combination of F1, balanced accuracy
                     f1 = f1_score(y_true_class, pred_class, zero_division=0)
                     bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                    
-                    # Weight based on class frequency (more balanced for common classes)
-                    if pos_rate > 0.1:  # Common class
-                        composite_score = 0.7 * f1 + 0.3 * bal_acc
-                    else:  # Still somewhat rare
-                        composite_score = 0.8 * f1 + 0.2 * bal_acc
-                    
-                    coarse_scores.append(composite_score)
-                    
+                    composite_score = 0.7 * f1 + 0.3 * bal_acc if pos_rate > 0.1 else 0.8 * f1 + 0.2 * bal_acc
                     if composite_score > best_score:
                         best_score = composite_score
                         best_threshold = threshold
                 
-                # Fine search around best coarse threshold
-                fine_range = 0.1  # Search +/- 0.1 around best coarse threshold
+                fine_range = 0.1
                 fine_start = max(0.05, best_threshold - fine_range)
                 fine_end = min(0.95, best_threshold + fine_range)
-                
                 fine_thresholds = np.linspace(fine_start, fine_end, 21)
                 
                 for threshold in fine_thresholds:
                     pred_class = (probs_class >= threshold).astype(int)
-                    
                     f1 = f1_score(y_true_class, pred_class, zero_division=0)
                     bal_acc = balanced_accuracy_score(y_true_class, pred_class)
-                    
-                    if pos_rate > 0.1:
-                        composite_score = 0.7 * f1 + 0.3 * bal_acc
-                    else:
-                        composite_score = 0.8 * f1 + 0.2 * bal_acc
-                    
+                    composite_score = 0.7 * f1 + 0.3 * bal_acc if pos_rate > 0.1 else 0.8 * f1 + 0.2 * bal_acc
                     if composite_score > best_score:
                         best_score = composite_score
                         best_threshold = threshold
                 
                 optimized_thresholds[i] = best_threshold
-                
-                # Calculate final F1 for display
                 final_pred = (probs_class >= best_threshold).astype(int)
                 final_f1 = f1_score(y_true_class, final_pred, zero_division=0)
                 strategy = "COMMON_BAL" if pos_rate > 0.1 else "MID_COMP"
@@ -426,22 +381,21 @@ class TransformerEvaluator:
         print(f"\nEVALUATION RESULTS")
         print("-" * 40)
         print(f"Test samples: {metrics['n_samples']:,} | Classes: {len(classes)}")
-        print("")
+        print("
+PERFORMANCE METRICS:")
+        print(f"  Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
+        print(f"  Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f}")
+        print(f"  Hamming Loss:     {metrics['hamming_loss']:.4f}")
+        print(f"  Micro F1:         {metrics['micro_f1']:.4f}")
+        print(f"  Macro F1:         {metrics['macro_f1']:.4f}")
+        print(f"  Weighted F1:      {metrics['weighted_f1']:.4f}")
+        print(f"  Micro Precision:  {metrics['micro_precision']:.4f}")
+        print(f"  Macro Precision:  {metrics['macro_precision']:.4f}")
+        print(f"  Micro Recall:     {metrics['micro_recall']:.4f}")
+        print(f"  Macro Recall:     {metrics['macro_recall']:.4f}")
         
-        print("PERFORMANCE METRICS:")
-        print(f"Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
-        print(f"Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f}")
-        print(f"Hamming Loss:     {metrics['hamming_loss']:.4f}")
-        print(f"Micro F1:         {metrics['micro_f1']:.4f}")
-        print(f"Macro F1:         {metrics['macro_f1']:.4f}")
-        print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
-        print(f"Micro Precision:  {metrics['micro_precision']:.4f}")
-        print(f"Macro Precision:  {metrics['macro_precision']:.4f}")
-        print(f"Micro Recall:     {metrics['micro_recall']:.4f}")
-        print(f"Macro Recall:     {metrics['macro_recall']:.4f}")
-        print("")
-        
-        print("PER-CLASS METRICS:")
+        print("
+PER-CLASS METRICS:")
         print("-" * 60)
         print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
         print("-" * 60)
@@ -453,11 +407,20 @@ class TransformerEvaluator:
             support = metrics['per_class_support'][i]
             print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8}")
         
-        print("")
-        print("CLASSIFICATION REPORT:")
+        print("
+CLASSIFICATION REPORT:")
         print("-" * 60)
         report = classification_report(y_true, y_pred, target_names=classes, zero_division=0, digits=3)
         print(report)
+        
+        print("
+ADDITIONAL ANALYSIS:")
+        print(f"  Average Predicted Labels per Sample: {metrics['avg_predicted_labels']:.2f}")
+        print(f"  Average True Labels per Sample:    {metrics['avg_true_labels']:.2f}")
+        print(f"  Samples with No Predicted Labels:  {metrics['samples_no_pred_labels']:,}")
+        print(f"  Samples with No True Labels:       {metrics['samples_no_true_labels']:,}")
+        print(f"  Samples with Multiple Predicted Labels: {metrics['samples_multi_pred_labels']:,}")
+        print(f"  Samples with Multiple True Labels:    {metrics['samples_multi_true_labels']:,}")
     
     def save_results(self, metrics: Dict[str, Any], y_pred: np.ndarray, 
                     probs: np.ndarray, y_true: np.ndarray, log_type: str, 

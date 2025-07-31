@@ -1970,6 +1970,26 @@ def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 
                 momentum = 0.8  # Increased from 0.7-0.9
                 pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * similar_labels
     
+    # --- NEW ADDITION: Reinforce "opposite" class predictions ---
+    # For each sample, if a class is confidently *not* present, and others are, reinforce the negative.
+    negative_reinforce_threshold = 0.1 # If pseudo-label for a class is below this
+    positive_presence_threshold = 0.7 # If other pseudo-labels are above this
+    
+    for i in range(n_samples):
+        for c in range(n_classes):
+            if pseudo_labels[i, c] < negative_reinforce_threshold:
+                # Check if other classes are confidently present
+                other_classes_present = False
+                for other_c in range(n_classes):
+                    if other_c != c and pseudo_labels[i, other_c] > positive_presence_threshold:
+                        other_classes_present = True
+                        break
+                
+                if other_classes_present:
+                    # Strongly push this class's pseudo-label towards 0
+                    pseudo_labels[i, c] = pseudo_labels[i, c] * 0.1 # Reduce by 90%
+    # --- END NEW ADDITION ---
+
     # 3. Apply confidence boosting
     # Enhance the most confident predictions
     for i in range(n_samples):
@@ -2002,6 +2022,37 @@ def generate_pseudo_labels(embeddings: np.ndarray, classes: List[str], k: int = 
     pseudo_labels = np.nan_to_num(pseudo_labels, nan=0.1, posinf=0.9, neginf=0.1)
     
     return pseudo_labels
+
+def negative_class_suppression_loss(logits: torch.Tensor, pseudo_labels: torch.Tensor, 
+                                    negative_threshold: float = 0.1, suppression_weight: float = 1.0) -> torch.Tensor:
+    """
+    Loss to suppress predictions for classes confidently identified as absent.
+    This encourages the model to learn the 'opposite' of a class.
+    
+    Args:
+        logits: Model predictions (before sigmoid)
+        pseudo_labels: Pseudo-labels for the batch (probabilities)
+        negative_threshold: Pseudo-label value below which a class is considered confidently absent.
+        suppression_weight: Weight for this loss component.
+    
+    Returns:
+        Negative class suppression loss.
+    """
+    
+    # Identify confidently absent classes based on pseudo-labels
+    # A class is confidently absent if its pseudo-label is below a certain threshold
+    confidently_absent_mask = (pseudo_labels < negative_threshold).float()
+    
+    # We want the model's logits for these classes to be very low (negative)
+    # Use a sigmoid to get probabilities from logits, then penalize high probabilities
+    probs = torch.sigmoid(logits)
+    
+    # The loss is higher when the model predicts a high probability for a confidently absent class
+    # We can use a form of binary cross-entropy or simply penalize `probs` directly.
+    # Let's use a squared error to push probabilities towards 0 for absent classes.
+    loss = confidently_absent_mask * (probs ** 2) # Penalize (prob - 0)^2
+    
+    return suppression_weight * loss.mean()
 
 def mutual_learning_loss(z1: torch.Tensor, z2: torch.Tensor, pseudo_labels: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
@@ -3855,6 +3906,639 @@ def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str],
                     
                     # Weighted propagation
                     weights = valid_similarities / valid_similarities.sum()
+                    propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
+                    
+                    # Adaptive momentum based on curriculum
+                    momentum = 0.7 + 0.2 * progress
+                    pseudo_labels[global_idx] = momentum * pseudo_labels[global_idx] + (1 - momentum) * propagated_labels
+    
+    # Progressive confidence boosting
+    for i in range(n_samples):
+        # Dynamic k based on curriculum
+        k = min(3 + int(2 * progress), n_classes)
+        top_indices = np.argsort(pseudo_labels[i])[-k:]
+        
+        # Stronger boosting as training progresses
+        boost_factor = 0.1 + 0.3 * progress
+        pseudo_labels[i][top_indices] = np.minimum(pseudo_labels[i][top_indices] + boost_factor, 0.95)
+        
+        # Suppress weak predictions more aggressively
+        weak_threshold = 0.4 - 0.1 * progress
+        weak_mask = pseudo_labels[i] < weak_threshold
+        pseudo_labels[i][weak_mask] *= (0.8 - 0.3 * progress)
+    
+    # Progressive sharpening
+    temperature = max(0.3, 0.8 - 0.5 * progress)
+    pseudo_labels = pseudo_labels ** (1/temperature)
+    
+    # Normalization with confidence preservation
+    row_sums = pseudo_labels.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-8)
+    pseudo_labels = pseudo_labels / row_sums
+    
+    # Progressive confidence bounds
+    min_conf = max(0.05, 0.15 - 0.1 * progress)
+    max_conf = min(0.95, 0.8 + 0.15 * progress)
+    pseudo_labels = np.clip(pseudo_labels, min_conf, max_conf)
+    
+    # Ensure no invalid values
+    pseudo_labels = np.nan_to_num(pseudo_labels, nan=min_conf, posinf=max_conf, neginf=min_conf)
+    
+    return pseudo_labels
+
+def enhanced_adaptive_thresholding(predictions: np.ndarray, embeddings: np.ndarray, 
+                                  classes: List[str], true_labels: np.ndarray = None, 
+                                  k_neighbors: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Enhanced adaptive thresholding combining global and local information for better F1
+    
+    Args:
+        predictions: Predicted probabilities (n_samples, n_classes)
+        embeddings: Original embeddings for local density calculation
+        classes: List of class names
+        true_labels: True labels if available for optimization
+        k_neighbors: Number of neighbors for local density
+    
+    Returns:
+        adaptive_thresholds: Per-class thresholds
+        binary_predictions: Binary predictions with sophisticated assignment
+    """
+    n_samples, n_classes = predictions.shape
+    adaptive_thresholds = np.zeros(n_classes)
+    
+    # Step 1: Calculate global information
+    global_priors = predictions.mean(axis=0)  # Average prediction per class
+    class_rarity = -np.log(global_priors + 1e-8)  # IDF-like rarity score
+    
+    # Step 2: Calculate local density information (if embeddings available)
+    if embeddings is not None and len(embeddings) > k_neighbors:
+        nn = NearestNeighbors(n_neighbors=k_neighbors, metric='cosine')
+        nn.fit(embeddings)
+        distances, indices = nn.kneighbors(embeddings)
+        
+        # Local density: inverse of average distance to k nearest neighbors
+        local_density = 1.0 / (distances.mean(axis=1) + 1e-8)
+        local_density = (local_density - local_density.min()) / (local_density.max() - local_density.min() + 1e-8)
+    else:
+        local_density = np.ones(n_samples) * 0.5
+    
+    # Step 3: Calculate per-class adaptive thresholds
+    for class_idx in range(n_classes):
+        class_preds = predictions[:, class_idx]
+        
+        if true_labels is not None and class_idx < true_labels.shape[1]:
+            # If we have true labels, optimize threshold for F1
+            from sklearn.metrics import f1_score
+            true_class = true_labels[:, class_idx]
+            
+            if true_class.sum() > 0:  # Only optimize if we have positive samples
+                best_threshold = 0.5
+                best_f1 = 0.0
+                
+                # Test multiple thresholds
+                for threshold in np.linspace(0.1, 0.9, 25):
+                    # Combine global and local information
+                    # This part needs to be carefully designed to integrate global priors and local density
+                    # For now, let's use a simple weighted average or a more sophisticated approach
+                    # based on the distribution of predictions for this class.
+                    
+                    # A simple approach: find the threshold that maximizes F1 score for this class
+                    # This is already implemented in evaluate_models.py, so we can reuse that logic
+                    
+                    # For unsupervised setting, we can use a percentile-based approach or clustering
+                    # Let's use a percentile-based approach for now, adjusted by rarity
+                    
+                    # Adjust percentile based on class rarity
+                    # Rarer classes might need a lower percentile (more inclusive threshold)
+                    rarity_factor = 1.0 - (class_rarity[class_idx] / class_rarity.max()) # 0 to 1, 1 for rarest
+                    percentile_target = 70 - (rarity_factor * 20) # e.g., 70th percentile for common, 50th for rarest
+                    
+                    adaptive_thresholds[class_idx] = np.percentile(class_preds, percentile_target)
+                    
+                    # Ensure threshold is within reasonable bounds
+                    adaptive_thresholds[class_idx] = np.clip(adaptive_thresholds[class_idx], 0.1, 0.9)
+            else:
+                # If no true labels or no positive samples, use a default percentile-based threshold
+                # adjusted by rarity
+                rarity_factor = 1.0 - (class_rarity[class_idx] / class_rarity.max()) # 0 to 1, 1 for rarest
+                percentile_target = 70 - (rarity_factor * 20) # e.g., 70th percentile for common, 50th for rarest
+                
+                adaptive_thresholds[class_idx] = np.percentile(class_preds, percentile_target)
+                adaptive_thresholds[class_idx] = np.clip(adaptive_thresholds[class_idx], 0.1, 0.9)
+    
+    # Step 4: Apply thresholds and assign binary predictions
+    binary_predictions = np.zeros_like(predictions, dtype=int)
+    for class_idx in range(n_classes):
+        binary_predictions[:, class_idx] = (predictions[:, class_idx] >= adaptive_thresholds[class_idx]).astype(int)
+    
+    # Step 5: Post-processing for multi-label coherence
+    # Ensure at least one label per sample if no labels are predicted
+    for i in range(n_samples):
+        if binary_predictions[i].sum() == 0:
+            # Assign the class with the highest probability if no labels are predicted
+            binary_predictions[i, np.argmax(predictions[i])] = 1
+    
+    # Ensure no sample has all labels if that's not expected
+    # (This might be too aggressive for some datasets, use with caution)
+    # if np.any(binary_predictions.sum(axis=1) == n_classes):
+    #     for i in range(n_samples):
+    #         if binary_predictions[i].sum() == n_classes:
+    #             # Remove the least probable label
+    #             binary_predictions[i, np.argmin(predictions[i])] = 0
+    
+    return adaptive_thresholds, binary_predictions
+
+
+def save_trained_model(model: UnsupervisedMultiLabelTransformer, 
+                      classes: List[str], config: SystemConfig, 
+                      log_type: str, training_time: float = 0.0, 
+                      scaler: 'StandardScaler' = None) -> Path:
+    """
+    Save the trained model with metadata for later evaluation.
+    This replaces the complex evaluation that was done during training.
+    """
+    # Create models directory
+    models_dir = Path("models")
+    models_dir.mkdir(exist_ok=True)
+    
+    # Save model with comprehensive metadata
+    model_path = models_dir / f"transformer_{log_type}_{config.node_name}_{config.job_id}.pth"
+    
+    model_to_save = model.module if hasattr(model, 'module') else model
+    
+    model_data = {
+        'model_state_dict': model_to_save.state_dict(),
+        'classes': classes,
+        'config': config.__dict__,
+        'log_type': log_type,
+        'training_time': training_time,
+        'model_type': 'UnsupervisedMultiLabelTransformer',
+        'input_dim': model_to_save.input_dim,
+        'latent_dim': model_to_save.latent_dim,
+        'transformer_layers': model_to_save.transformer_layers,
+        'attention_heads': model_to_save.attention_heads,
+        'n_labels': len(classes),
+        'scaler': scaler,  # Save the preprocessing scaler
+        'timestamp': time.time()
+    }
+    
+    torch.save(model_data, model_path)
+    
+    print(f"💾 Model saved to: {model_path}")
+    print(f"📊 Model info: {model_to_save.input_dim}D → {len(classes)} classes")
+    print(f"🏗️  Architecture: {model_to_save.transformer_layers} layers, {model_to_save.attention_heads} heads, {model_to_save.latent_dim}D latent")
+    print(f"🎯 Evaluation: Use 'python src/evaluate_transformer.py --log-type {log_type}' for full evaluation")
+    
+    return model_path
+
+def calculate_comprehensive_metrics(binary_predictions: np.ndarray, classes: List[str], 
+                                  y_true: np.ndarray = None, probs: np.ndarray = None) -> Dict[str, Any]:
+    """
+    Calculate comprehensive metrics for multi-label classification
+    
+    Args:
+        binary_predictions: Binary predictions (n_samples, n_classes)
+        classes: List of class names
+        y_true: True labels if available (n_samples, n_classes)
+        probs: Prediction probabilities if available (n_samples, n_classes)
+    
+    Returns:
+        Dictionary of metrics including real sklearn metrics when true labels are available
+    """
+    from sklearn.metrics import (
+        precision_recall_fscore_support, f1_score, accuracy_score, 
+        hamming_loss, jaccard_score, balanced_accuracy_score, multilabel_confusion_matrix,
+        precision_score, recall_score
+    )
+    
+    metrics = {}
+    
+    # Sample-level metrics
+    labels_per_sample = binary_predictions.sum(axis=1)
+    metrics['avg_labels_per_sample'] = float(labels_per_sample.mean())
+    metrics['std_labels_per_sample'] = float(labels_per_sample.std())
+    metrics['min_labels_per_sample'] = int(labels_per_sample.min())
+    metrics['max_labels_per_sample'] = int(labels_per_sample.max())
+    
+    # Class-level metrics
+    class_counts = binary_predictions.sum(axis=0)
+    metrics['class_counts'] = class_counts.tolist()
+    metrics['most_frequent_classes'] = []
+    
+    # Get top 10 most frequent classes
+    if len(classes) > 0:
+        class_freq_pairs = list(zip(classes, class_counts))
+        class_freq_pairs.sort(key=lambda x: x[1], reverse=True)
+        metrics['most_frequent_classes'] = [
+            {'class': cls, 'count': int(count), 'percentage': float(count/len(binary_predictions)*100)}
+            for cls, count in class_freq_pairs[:10]
+        ]
+    
+    # Multi-label specific metrics
+    metrics['samples_with_no_labels'] = int((labels_per_sample == 0).sum())
+    metrics['samples_with_one_label'] = int((labels_per_sample == 1).sum())
+    metrics['samples_with_multiple_labels'] = int((labels_per_sample > 1).sum())
+    
+    # Real metrics when true labels are available
+    if y_true is not None:
+        # Per-class metrics
+        prec_c, rec_c, f1_c, support_c = precision_recall_fscore_support(
+            y_true, binary_predictions, average=None, zero_division=0
+        )
+        
+        # Store per-class metrics
+        metrics['per_class'] = {}
+        for i, cls in enumerate(classes):
+            metrics['per_class'][cls] = {
+                'support': int(support_c[i]),
+                'precision': float(prec_c[i]),
+                'recall': float(rec_c[i]),
+                'f1-score': float(f1_c[i])
+            }
+        
+        # Overall metrics
+        metrics['macro_f1'] = float(f1_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['micro_f1'] = float(f1_score(y_true, binary_predictions, average='micro', zero_division=0))
+        metrics['weighted_f1'] = float(f1_score(y_true, binary_predictions, average='weighted', zero_division=0))
+        metrics['samples_f1'] = float(f1_score(y_true, binary_predictions, average='samples', zero_division=0))
+        
+        # Subset accuracy (exact match)
+        metrics['subset_accuracy'] = float(accuracy_score(y_true, binary_predictions))
+        
+        # Hamming loss
+        metrics['hamming_loss'] = float(hamming_loss(y_true, binary_predictions))
+        
+        # Jaccard score (similarity)
+        metrics['jaccard_score_macro'] = float(jaccard_score(y_true, binary_predictions, average='macro', zero_division=0))
+        metrics['jaccard_score_micro'] = float(jaccard_score(y_true, binary_predictions, average='micro', zero_division=0))
+        
+        # Per-class balanced accuracy
+        balanced_acc_per_class = []
+        for c in range(y_true.shape[1]):
+            y_c = y_true[:, c]
+            yp_c = binary_predictions[:, c]
+            
+            # Skip if no samples for this class
+            if y_c.sum() == 0 and (1 - y_c).sum() == 0:
+                balanced_acc_per_class.append(0.0)
+                continue
+                
+            # Calculate balanced accuracy for this class
+            ba = balanced_accuracy_score(y_c, yp_c)
+            balanced_acc_per_class.append(float(ba))
+        
+        metrics['balanced_accuracy_per_class'] = balanced_acc_per_class
+        metrics['mean_balanced_accuracy'] = float(np.mean(balanced_acc_per_class))
+        
+        # Confusion matrix counts per class
+        confusion_per_class = {}
+        for i, cls in enumerate(classes):
+            y_c = y_true[:, i]
+            yp_c = binary_predictions[:, i]
+            
+            tp = int(np.sum((yp_c == 1) & (y_c == 1)))
+            fp = int(np.sum((yp_c == 1) & (y_c == 0)))
+            fn = int(np.sum((yp_c == 0) & (y_c == 1)))
+            tn = int(np.sum((yp_c == 0) & (y_c == 0)))
+            
+            confusion_per_class[cls] = {
+                'true_positives': tp,
+                'false_positives': fp,
+                'false_negatives': fn,
+                'true_negatives': tn
+            }
+        
+        metrics['confusion_per_class'] = confusion_per_class
+        
+        # Prediction confidence metrics (if probabilities available)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # Confidence of correct predictions
+            correct_mask = (binary_predictions == y_true)
+            correct_confidences = probs[correct_mask]
+            incorrect_confidences = probs[~correct_mask]
+            
+            metrics['correct_prediction_confidence_mean'] = float(correct_confidences.mean()) if len(correct_confidences) > 0 else 0.0
+            metrics['incorrect_prediction_confidence_mean'] = float(incorrect_confidences.mean()) if len(incorrect_confidences) > 0 else 0.0
+    else:
+        # No true labels - use placeholder values
+        metrics['macro_f1'] = None
+        metrics['micro_f1'] = None
+        metrics['weighted_f1'] = None
+        metrics['samples_f1'] = None
+        metrics['subset_accuracy'] = None
+        metrics['hamming_loss'] = None
+        metrics['jaccard_score_macro'] = None
+        metrics['jaccard_score_micro'] = None
+        metrics['mean_balanced_accuracy'] = None
+        
+        # Prediction confidence metrics (unsupervised)
+        if probs is not None:
+            metrics['prediction_confidence_mean'] = float(probs.mean())
+            metrics['prediction_confidence_std'] = float(probs.std())
+            
+            # High confidence predictions
+            high_conf_mask = probs > 0.7
+            metrics['high_confidence_predictions'] = int(high_conf_mask.sum())
+            metrics['high_confidence_percentage'] = float(high_conf_mask.sum() / probs.size * 100)
+    
+    return metrics
+
+
+
+
+def create_comprehensive_visualizations(embeddings: np.ndarray, predictions: np.ndarray, 
+                                      binary_predictions: np.ndarray, classes: List[str],
+                                      output_dir: Path, log_type: str, config: SystemConfig):
+    """
+    Create comprehensive visualizations for classification analysis
+    
+    Args:
+        embeddings: Input embeddings
+        predictions: Predicted probabilities
+        binary_predictions: Binary predictions
+        classes: List of class names
+        output_dir: Output directory for plots
+        log_type: Type of log being processed
+        config: System configuration
+    """
+    
+    try:
+        # Sample for visualization if too large
+        if len(embeddings) > 2000:
+            idx = np.random.choice(len(embeddings), 2000, replace=False)
+            embeddings_viz = embeddings[idx]
+            predictions_viz = predictions[idx]
+            binary_viz = binary_predictions[idx]
+        else:
+            embeddings_viz = embeddings
+            predictions_viz = predictions
+            binary_viz = binary_predictions
+        
+        # Create multiple visualizations
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle(f'Transformer Classification Analysis - {log_type.upper()}', fontsize=16)
+        
+        # 1. Number of labels per sample distribution
+        labels_per_sample = binary_viz.sum(axis=1)
+        axes[0, 0].hist(labels_per_sample, bins=range(min(labels_per_sample), max(labels_per_sample) + 2), 
+                       alpha=0.7, edgecolor='black')
+        axes[0, 0].set_title('Labels per Sample Distribution')
+        axes[0, 0].set_xlabel('Number of Labels')
+        axes[0, 0].set_ylabel('Frequency')
+        
+        # 2. Class frequency (top 15)
+        class_counts = binary_viz.sum(axis=0)
+        top_indices = np.argsort(class_counts)[-15:][::-1]
+        top_classes = [classes[i] for i in top_indices]
+        top_counts = class_counts[top_indices]
+        
+        axes[0, 1].barh(range(len(top_classes)), top_counts)
+        axes[0, 1].set_yticks(range(len(top_classes)))
+        axes[0, 1].set_yticklabels(top_classes)
+        axes[0, 1].set_title('Top 15 Most Predicted Classes')
+        axes[0, 1].set_xlabel('Number of Predictions')
+        
+        # 3. Prediction confidence distribution
+        axes[0, 2].hist(predictions_viz.flatten(), bins=50, alpha=0.7, edgecolor='black')
+        axes[0, 2].set_title('Prediction Confidence Distribution')
+        axes[0, 2].set_xlabel('Confidence Score')
+        axes[0, 2].set_ylabel('Frequency')
+        axes[0, 2].axvline(x=0.5, color='red', linestyle='--', label='Threshold')
+        axes[0, 2].legend()
+        
+        # 4. t-SNE visualization of embeddings colored by number of labels
+        try:
+            from sklearn.manifold import TSNE
+            tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+            embeddings_2d = tsne.fit_transform(embeddings_viz)
+            
+            scatter = axes[1, 0].scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+                                       c=labels_per_sample, cmap='viridis', alpha=0.6, s=20)
+            axes[1, 0].set_title('t-SNE: Embeddings by Label Count')
+            plt.colorbar(scatter, ax=axes[1, 0])
+        except Exception as e:
+            axes[1, 0].text(0.5, 0.5, f't-SNE failed:\n{str(e)}', 
+                           ha='center', va='center', transform=axes[1, 0].transAxes)
+            axes[1, 0].set_title('t-SNE Visualization (Failed)')
+        
+        # 5. Average confidence per class
+        avg_confidence_per_class = predictions_viz.mean(axis=0)
+        top_conf_indices = np.argsort(avg_confidence_per_class)[-15:][::-1]
+        top_conf_classes = [classes[i] for i in top_conf_indices]
+        top_conf_values = avg_confidence_per_class[top_conf_indices]
+        
+        axes[1, 1].barh(range(len(top_conf_classes)), top_conf_values)
+        axes[1, 1].set_yticks(range(len(top_conf_classes)))
+        axes[1, 1].set_yticklabels(top_conf_classes)
+        axes[1, 1].set_title('Top 15 Classes by Average Confidence')
+        axes[1, 1].set_xlabel('Average Confidence')
+        
+        # 6. Prediction matrix heatmap (sample of classes)
+        if len(classes) <= 20:
+            # Show all classes
+            heatmap_data = binary_viz.T
+            class_labels = classes
+        else:
+            # Show top 20 classes
+            top_indices = np.argsort(class_counts)[-20:][::-1]
+            heatmap_data = binary_viz[:, top_indices].T
+            class_labels = [classes[i] for i in top_indices]
+        
+        # Sample rows for visualization
+        if heatmap_data.shape[1] > 100:
+            sample_indices = np.random.choice(heatmap_data.shape[1], 100, replace=False)
+            heatmap_data = heatmap_data[:, sample_indices]
+        
+        im = axes[1, 2].imshow(heatmap_data, cmap='Blues', aspect='auto')
+        axes[1, 2].set_title('Prediction Matrix (Sample)')
+        axes[1, 2].set_xlabel('Samples')
+        axes[1, 2].set_ylabel('Classes')
+        
+        # Set y-axis labels for classes
+        if len(class_labels) <= 10:
+            axes[1, 2].set_yticks(range(len(class_labels)))
+            axes[1, 2].set_yticklabels(class_labels, fontsize=8)
+        
+        plt.colorbar(im, ax=axes[1, 2])
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f'classification_analysis_{log_type}_{config.node_name}_{config.job_id}.png', 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+
+
+
+def save_model_after_training(model: UnsupervisedMultiLabelTransformer, 
+                             classes: List[str], config: SystemConfig, 
+                             log_type: str, training_time: float = 0.0, 
+                             scaler: 'StandardScaler' = None) -> Path:
+    """
+    Save the trained model after training completes
+    """
+    
+    # Save the trained model for later evaluation
+    return save_trained_model(model, classes, config, log_type, training_time, scaler)
+
+def create_visualization(embeddings: np.ndarray, predictions: np.ndarray, 
+                        classes: List[str], output_dir: Path, log_type: str, config: SystemConfig):
+    """
+    Create visualizations
+    """
+    try:
+        # Sample for t-SNE if too large
+        if len(embeddings) > 1000:  # Reduced sample size
+            idx = np.random.choice(len(embeddings), 1000, replace=False)
+            embeddings_viz = embeddings[idx]
+            predictions_viz = predictions[idx]
+        else:
+            embeddings_viz = embeddings
+            predictions_viz = predictions
+        
+        # t-SNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+        embeddings_2d = tsne.fit_transform(embeddings_viz)
+        
+        # Plot
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Number of labels
+        n_labels = predictions_viz.sum(axis=1)
+        scatter = ax1.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+                             c=n_labels, cmap='viridis', alpha=0.6, s=20)
+        ax1.set_title('Number of Predicted Labels')
+        plt.colorbar(scatter, ax=ax1)
+        
+        # Max confidence
+        max_conf = predictions_viz.max(axis=1)
+        scatter = ax2.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+                             c=max_conf, cmap='plasma', alpha=0.6, s=20)
+        ax2.set_title('Maximum Prediction Confidence')
+        plt.colorbar(scatter, ax=ax2)
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f'visualization_{log_type}_{config.node_name}_{config.job_id}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+
+def ensemble_consistency_loss(branch_predictions: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Encourage consistency between ensemble branches
+    """
+    if len(branch_predictions) < 2:
+        return torch.tensor(0.0, device=branch_predictions[0].device)
+    
+    consistency_loss = 0.0
+    n_pairs = 0
+    
+    for i in range(len(branch_predictions)):
+        for j in range(i + 1, len(branch_predictions)):
+            pred_i = torch.sigmoid(branch_predictions[i])
+            pred_j = torch.sigmoid(branch_predictions[j])
+            consistency_loss += F.mse_loss(pred_i, pred_j)
+            n_pairs += 1
+    
+    return consistency_loss / max(n_pairs, 1)
+
+def curriculum_weight_scheduler(epoch: int, total_epochs: int) -> Dict[str, float]:
+    """
+    Curriculum learning: gradually increase difficulty of learning with reduced weights for stability
+    """
+    progress = epoch / total_epochs
+    
+    # Start with simple reconstruction, gradually add complex losses
+    # Reduced weights to prevent numerical overflow
+    weights = {
+        'recon': max(0.1, 0.2 - 0.1 * progress),  # Decrease reconstruction importance
+        'label': min(0.3, 0.1 + 0.2 * progress),  # Increase label importance
+        'cluster': 0.05,  # Reduced
+        'contrastive': min(0.1, 0.05 + 0.05 * progress),  # Gradually add contrastive
+        'mutual': min(0.1, 0.02 + 0.08 * progress),  # Gradually add mutual
+        'confidence': min(0.15, 0.05 + 0.1 * progress),  # Gradually add confidence
+        'ensemble': min(0.1, 0.0 + 0.1 * progress)  # Add ensemble consistency later
+    }
+    
+    return weights
+
+def advanced_pseudo_label_generation(embeddings: np.ndarray, classes: List[str], 
+                                   true_labels: np.ndarray = None, 
+                                   epoch: int = 0, total_epochs: int = 50) -> np.ndarray:
+    """
+    Advanced pseudo-label generation with curriculum learning and confidence boosting
+    """
+    if not classes:
+        # If no classes, create a single 'normal' class with high confidence
+        confidence = 0.7 + 0.2 * (epoch / max(total_epochs, 1))  # Increase confidence over time
+        return np.ones((len(embeddings), 1), dtype=np.float32) * confidence
+    
+    n_samples = len(embeddings)
+    n_classes = len(classes)
+    
+    # Curriculum learning: start conservative, become more aggressive
+    progress = epoch / max(total_epochs, 1)
+    
+    if true_labels is not None:
+        # Use true labels as strong supervision
+        pseudo_labels = true_labels.astype(np.float32)
+        
+        # Apply curriculum noise reduction
+        noise_factor = max(0.02, 0.1 - 0.08 * progress)
+        noise = np.random.rand(n_samples, n_classes) * noise_factor
+        pseudo_labels = pseudo_labels * (0.95 + 0.05 * progress) + noise * (1 - progress)
+        
+        # For unlabeled samples, use confident initialization
+        unlabeled_mask = (true_labels.sum(axis=1) == 0)
+        if np.any(unlabeled_mask):
+            n_unlabeled = np.sum(unlabeled_mask)
+            # More confident initialization as training progresses
+            base_confidence = 0.3 + 0.4 * progress
+            confident_labels = np.random.rand(n_unlabeled, n_classes)
+            confident_labels = (confident_labels > (1 - base_confidence)).astype(float) * 0.8 + 0.1
+            pseudo_labels[unlabeled_mask] = confident_labels
+    else:
+        # Start with moderate confidence, increase over time
+        base_confidence = 0.2 + 0.5 * progress
+        pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
+        pseudo_labels = (pseudo_labels > (1 - base_confidence)).astype(float) * 0.7 + 0.15
+    
+    # Advanced similarity-based propagation
+    embeddings_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+    
+    # Adaptive similarity threshold based on curriculum
+    similarity_threshold = 0.75 + 0.1 * progress  # Start at 0.75, go to 0.85
+    
+    # Multi-scale propagation with different neighborhood sizes
+    for scale in [500, 1000, 2000]:  # Different scales
+        chunk_size = min(scale, n_samples)
+        
+        for i in range(0, n_samples, chunk_size):
+            end_i = min(i + chunk_size, n_samples)
+            chunk_i = embeddings_norm[i:end_i]
+            
+            similarities = np.dot(chunk_i, embeddings_norm.T)
+            
+            for j in range(len(chunk_i)):
+                global_idx = i + j
+                
+                # Find top-k similar samples (adaptive k)
+                k_neighbors = min(20 + int(10 * progress), n_samples // 10)
+                top_k_indices = np.argsort(similarities[j])[-k_neighbors:]
+                top_k_similarities = similarities[j][top_k_indices]
+                
+                # Only use highly similar samples
+                valid_mask = top_k_similarities > similarity_threshold
+                if np.any(valid_mask):
+                    valid_indices = top_k_indices[valid_mask]
+                    valid_similarities = top_k_similarities[valid_mask]
+                    
+                    # Weighted propagation
                     propagated_labels = np.average(pseudo_labels[valid_indices], axis=0, weights=weights)
                     
                     # Adaptive momentum based on curriculum
