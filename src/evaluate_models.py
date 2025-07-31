@@ -12,8 +12,8 @@ Clean, focused evaluation of trained transformer models using the direct approac
 5. Optional per-class threshold optimization
 
 Usage:
-    python src/evaluate_transformer.py --log-type wp-error
-    python src/evaluate_transformer.py --log-type wp-error --optimize-thresholds
+    python src/evaluate_models.py --log-type wp-error
+    python src/evaluate_models.py --log-type wp-error --optimize-thresholds
 """
 
 import argparse
@@ -532,6 +532,8 @@ def main():
                        help="Path to trained model (auto-detected if not provided)")
     parser.add_argument("--batch-size", type=int, default=64,
                        help="Batch size for inference")
+    parser.add_argument("--optimize-thresholds", action="store_true",
+                       help="Optimize per-class thresholds for better performance")
     
     args = parser.parse_args()
     
@@ -582,6 +584,13 @@ def main():
                     data_classes = classes
                 
                 optimized_thresholds = None
+                
+                # Apply threshold optimization if requested
+                if args.optimize_thresholds:
+                    evaluator = TransformerEvaluator(config)
+                    optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
+                    y_pred = (probs >= optimized_thresholds).astype(int)
+                    print(f"Applied optimized thresholds")
                 
             else:
                 print(f"Running full model evaluation for {log_type}")
