@@ -206,6 +206,157 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 # =============================================================================
+# Advanced Unsupervised Learning Components
+# =============================================================================
+
+class VariationalEncoder(nn.Module):
+    """Variational encoder for VAE-style latent space learning"""
+    def __init__(self, input_dim: int, latent_dim: int, hidden_dims: List[int] = None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [input_dim // 2, input_dim // 4]
+        
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ])
+            prev_dim = hidden_dim
+        
+        self.encoder = nn.Sequential(*layers)
+        self.mu_layer = nn.Linear(prev_dim, latent_dim)
+        self.logvar_layer = nn.Linear(prev_dim, latent_dim)
+    
+    def forward(self, x):
+        h = self.encoder(x)
+        mu = self.mu_layer(h)
+        logvar = self.logvar_layer(h)
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+class MomentumEncoder(nn.Module):
+    """Momentum encoder for BYOL/MoCo style self-supervised learning"""
+    def __init__(self, base_encoder: nn.Module, momentum: float = 0.999):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.momentum = momentum
+        
+        # Create momentum encoder as copy of base encoder
+        self.momentum_encoder = copy.deepcopy(base_encoder)
+        
+        # Disable gradients for momentum encoder
+        for param in self.momentum_encoder.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        return self.base_encoder(x)
+    
+    def forward_momentum(self, x):
+        with torch.no_grad():
+            return self.momentum_encoder(x)
+    
+    def update_momentum_encoder(self):
+        """Update momentum encoder using EMA"""
+        with torch.no_grad():
+            for param_base, param_momentum in zip(
+                self.base_encoder.parameters(), 
+                self.momentum_encoder.parameters()
+            ):
+                param_momentum.data = (
+                    self.momentum * param_momentum.data + 
+                    (1 - self.momentum) * param_base.data
+                )
+
+class SwAVPrototypes(nn.Module):
+    """SwAV-style prototypes for clustering-based self-supervision"""
+    def __init__(self, feature_dim: int, num_prototypes: int, temperature: float = 0.1):
+        super().__init__()
+        self.num_prototypes = num_prototypes
+        self.temperature = temperature
+        
+        # Learnable prototypes
+        self.prototypes = nn.Linear(feature_dim, num_prototypes, bias=False)
+        # Initialize prototypes with Xavier uniform
+        nn.init.xavier_uniform_(self.prototypes.weight)
+        
+    def forward(self, features):
+        # Normalize features and prototypes
+        features = F.normalize(features, dim=1)
+        prototypes = F.normalize(self.prototypes.weight, dim=0)
+        
+        # Compute assignment scores
+        scores = torch.matmul(features, prototypes) / self.temperature
+        return scores
+    
+    def sinkhorn_algorithm(self, scores, num_iters: int = 3, epsilon: float = 0.05):
+        """Sinkhorn-Knopp algorithm for optimal transport"""
+        Q = torch.exp(scores / epsilon).t()  # [num_prototypes, batch_size]
+        
+        for _ in range(num_iters):
+            # Normalize rows
+            Q = Q / Q.sum(dim=1, keepdim=True)
+            # Normalize columns
+            Q = Q / Q.sum(dim=0, keepdim=True)
+        
+        return Q.t()  # [batch_size, num_prototypes]
+
+class DynamicAugmentation(nn.Module):
+    """Dynamic augmentation based on sample difficulty"""
+    def __init__(self, input_dim: int, max_noise: float = 0.1, max_dropout: float = 0.3):
+        super().__init__()
+        self.input_dim = input_dim
+        self.max_noise = max_noise
+        self.max_dropout = max_dropout
+        
+        # Difficulty predictor
+        self.difficulty_predictor = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 4),
+            nn.ReLU(),
+            nn.Linear(input_dim // 4, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, training: bool = True):
+        if not training:
+            return x
+        
+        batch_size = x.shape[0]
+        
+        # Predict difficulty (0 = easy, 1 = hard)
+        with torch.no_grad():
+            difficulty = self.difficulty_predictor(x).squeeze()
+        
+        # Apply augmentation based on difficulty
+        augmented = x.clone()
+        
+        for i in range(batch_size):
+            diff_score = difficulty[i].item()
+            
+            # Easier samples get stronger augmentation
+            noise_factor = self.max_noise * (1 - diff_score)
+            dropout_rate = self.max_dropout * (1 - diff_score)
+            
+            # Add noise
+            if noise_factor > 0:
+                noise = torch.randn_like(augmented[i]) * noise_factor
+                augmented[i] = augmented[i] + noise
+            
+            # Apply dropout
+            if dropout_rate > 0:
+                dropout_mask = (torch.rand_like(augmented[i]) > dropout_rate).float()
+                augmented[i] = augmented[i] * dropout_mask
+        
+        return augmented
+
+# =============================================================================
 # UMTL Enhancement Functions
 # =============================================================================
 
@@ -386,15 +537,17 @@ def class_balance_regularization(predictions: torch.Tensor, target_distribution:
     return kl_loss
 
 def multilabel_contrastive_loss(embeddings: torch.Tensor, predictions: torch.Tensor, 
-                               temperature: float = 0.1) -> torch.Tensor:
+                               temperature: float = 0.1, margin: float = 0.5) -> torch.Tensor:
     """
-    Contrastive loss that considers multi-label similarity
-    Samples with similar label patterns should have similar embeddings
+    Contrastive loss that considers multi-label similarity, explicitly defining positive and negative pairs.
+    Samples with similar label patterns should have similar embeddings (positive pairs),
+    while samples with no shared labels should have dissimilar embeddings (negative pairs).
     
     Args:
         embeddings: Latent embeddings (batch_size, embed_dim)
         predictions: Predicted labels (batch_size, n_classes)
-        temperature: Temperature for contrastive loss
+        temperature: Temperature for scaling similarities
+        margin: Margin for negative pairs in triplet-like loss
     
     Returns:
         Multi-label aware contrastive loss
@@ -404,35 +557,63 @@ def multilabel_contrastive_loss(embeddings: torch.Tensor, predictions: torch.Ten
     # Normalize embeddings
     embeddings = F.normalize(embeddings, dim=1)
     
-    # Calculate label similarities (Jaccard similarity for binary predictions)
-    pred_probs = torch.sigmoid(predictions)
-    pred_binary = (pred_probs > 0.5).float()
+    # Convert predictions to binary pseudo-labels
+    pred_binary = (torch.sigmoid(predictions) > 0.5).float()
     
-    # Jaccard similarity: |A ∩ B| / |A ∪ B|
-    intersection = torch.matmul(pred_binary, pred_binary.T)
-    union = pred_binary.sum(dim=1, keepdim=True) + pred_binary.sum(dim=1, keepdim=False) - intersection
-    label_similarity = intersection / (union + 1e-8)
+    # Compute cosine similarity between all embedding pairs
+    cosine_sim = torch.matmul(embeddings, embeddings.T)
     
-    # Embedding similarities
-    embed_similarity = torch.matmul(embeddings, embeddings.T) / temperature
+    # Initialize loss
+    loss = 0.0
     
-    # Encourage embedding similarity to match label similarity
-    # Use label similarity as soft targets for embedding similarity
-    
-    # Apply softmax to embedding similarities
-    embed_sim_softmax = F.softmax(embed_similarity, dim=1)
-    
-    # Use label similarity as soft targets (normalize to sum to 1)
-    label_targets = label_similarity / (label_similarity.sum(dim=1, keepdim=True) + 1e-8)
-    
-    # KL divergence loss
-    contrastive_loss = F.kl_div(
-        torch.log(embed_sim_softmax + 1e-8),
-        label_targets,
-        reduction='batchmean'
-    )
-    
-    return contrastive_loss
+    for i in range(batch_size):
+        anchor_labels = pred_binary[i]
+        anchor_embedding = embeddings[i]
+        
+        # Positive samples: samples that share at least one common pseudo-label with the anchor
+        # Exclude self-similarity
+        positive_mask = ((torch.matmul(anchor_labels, pred_binary.T) > 0) & (torch.arange(batch_size, device=embeddings.device) != i)).float()
+        
+        # Negative samples: samples that share NO common pseudo-labels with the anchor
+        negative_mask = ((torch.matmul(anchor_labels, pred_binary.T) == 0) & (torch.arange(batch_size, device=embeddings.device) != i)).float()
+        
+        # If no positive samples, skip this anchor (or handle with a different loss)
+        if positive_mask.sum() == 0:
+            continue
+        
+        # Get similarities for positive and negative pairs
+        pos_sim = cosine_sim[i] * positive_mask
+        neg_sim = cosine_sim[i] * negative_mask
+        
+        # Compute InfoNCE-like loss for positive pairs
+        # Numerator: similarity of anchor to positive samples
+        # Denominator: sum of exp(similarity / temperature) over all samples (including anchor)
+        
+        # For positive pairs, we want high similarity
+        # For negative pairs, we want low similarity (below margin)
+        
+        # Triplet-like loss: max(0, neg_sim - pos_sim + margin)
+        # Find the hardest positive and hardest negative
+        
+        # Ensure there are actual positive and negative samples to compare
+        if positive_mask.sum() > 0 and negative_mask.sum() > 0:
+            # Hardest positive: largest similarity among positive pairs
+            hardest_pos_sim = pos_sim[pos_sim > 0].max()
+            
+            # Hardest negative: largest similarity among negative pairs
+            hardest_neg_sim = neg_sim[neg_sim > 0].max() if neg_sim.sum() > 0 else -1.0 # Use -1.0 if no negatives
+            
+            # Triplet loss component
+            triplet_component = F.relu(hardest_neg_sim - hardest_pos_sim + margin)
+            loss += triplet_component
+        elif positive_mask.sum() > 0:
+            # Only positive samples, encourage them to be close
+            # This can be done by maximizing the similarity of positive pairs
+            # For example, using a simple MSE to target 1.0 similarity
+            loss += F.mse_loss(pos_sim[pos_sim > 0], torch.ones_like(pos_sim[pos_sim > 0]))
+        # If only negative samples, or no samples, loss is 0 for this anchor
+            
+    return loss / batch_size if batch_size > 0 else 0.0
 
 def adaptive_pseudo_labeling(predictions: torch.Tensor, confidence_threshold: float = 0.8,
                            diversity_weight: float = 0.1) -> torch.Tensor:
@@ -806,7 +987,15 @@ class OptimizedTransformerBlock(nn.Module):
 # Log type classifier removed - each log file can only be one type
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
-    """Ultra-powerful transformer for unsupervised multi-label learning optimized for H100 GPU
+    """Ultra-powerful transformer for unsupervised multi-label learning with advanced techniques
+    
+    Features:
+    - VAE-style variational encoding for better latent representations
+    - BYOL-style momentum learning for self-supervision
+    - SwAV-style prototype clustering
+    - Dynamic augmentation based on sample difficulty
+    - Memory-efficient attention with gradient accumulation
+    - Advanced anomaly detection capabilities
     
     Automatically adapts to different embedding dimensions:
     - 300D: FastText embeddings
@@ -816,7 +1005,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
     
     def __init__(self, input_dim: int, latent_dim: int, n_labels: int, 
                  n_clusters: int, dropout: float = 0.1, 
-                 transformer_layers: int = 12, attention_heads: int = 16):
+                 transformer_layers: int = 12, attention_heads: int = 16,
+                 use_vae: bool = True, use_byol: bool = True, use_swav: bool = True,
+                 num_prototypes: int = 256, gradient_accumulation_steps: int = 1):
         super().__init__()
         
         self.input_dim = input_dim
@@ -824,14 +1015,30 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.n_labels = n_labels
         self.transformer_layers = transformer_layers
         self.attention_heads = attention_heads
+        self.use_vae = use_vae
+        self.use_byol = use_byol
+        self.use_swav = use_swav
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Much deeper and more powerful encoder
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        # Enhanced input projection with optional VAE
+        if self.use_vae:
+            self.vae_encoder = VariationalEncoder(input_dim, latent_dim)
+            self.input_proj = nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
+        
+        # Dynamic augmentation
+        self.dynamic_aug = DynamicAugmentation(input_dim)
         
         # Dynamic encoder with configurable transformer blocks and skip connections
         self.encoder_blocks = nn.ModuleList([
@@ -896,7 +1103,8 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             nn.Linear(latent_dim // 2, n_clusters)
         )
         
-        # Very sophisticated contrastive projection head
+        # Enhanced contrastive learning components
+        contrastive_proj_dim = 512
         self.contrastive_head = nn.Sequential(
             nn.Linear(latent_dim, latent_dim * 2),
             nn.BatchNorm1d(latent_dim * 2),
@@ -906,7 +1114,25 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             nn.BatchNorm1d(latent_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(latent_dim, 512)  # Much larger projection space
+            nn.Linear(latent_dim, contrastive_proj_dim)
+        )
+        
+        # BYOL momentum encoder
+        if self.use_byol:
+            self.momentum_encoder = MomentumEncoder(self.contrastive_head)
+        
+        # SwAV prototypes
+        if self.use_swav:
+            self.swav_prototypes = SwAVPrototypes(contrastive_proj_dim, num_prototypes)
+        
+        # Advanced anomaly detection head
+        self.anomaly_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim // 2, 1),
+            nn.Sigmoid()
         )
         
         # Label relationship modeling
@@ -946,11 +1172,23 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         elif isinstance(module, nn.MultiheadAttention):
             nn.init.kaiming_normal_(module.in_proj_weight, mode='fan_out', nonlinearity='relu')
         
-    def forward(self, x):
+    def forward(self, x, return_vae_params: bool = False, apply_augmentation: bool = True):
         batch_size = x.shape[0]
         
-        # Enhanced input processing
-        z = self.input_proj(x)
+        # Apply dynamic augmentation if enabled
+        if apply_augmentation and self.training:
+            x = self.dynamic_aug(x, training=True)
+        
+        # VAE encoding if enabled
+        vae_mu, vae_logvar = None, None
+        if self.use_vae:
+            vae_mu, vae_logvar = self.vae_encoder(x)
+            # Reparameterization trick
+            z_vae = self.vae_encoder.reparameterize(vae_mu, vae_logvar)
+            z = self.input_proj(z_vae)
+        else:
+            z = self.input_proj(x)
+        
         z = z.unsqueeze(1)  # Add sequence dimension
         
         # Very deep encoder with residual connections every 3 blocks
@@ -1002,23 +1240,55 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         # Cluster prediction
         clusters = self.cluster_head(z_fused)
         
-        # Enhanced contrastive projection
+        # Enhanced contrastive learning
         z_contrastive = self.contrastive_head(z_fused)
         z_contrastive = F.normalize(z_contrastive, dim=1)
+        
+        # BYOL momentum features
+        z_momentum = None
+        if self.use_byol and hasattr(self, 'momentum_encoder'):
+            z_momentum = self.momentum_encoder.forward_momentum(z_fused)
+            z_momentum = F.normalize(z_momentum, dim=1)
+        
+        # SwAV prototype assignments
+        swav_scores = None
+        if self.use_swav and hasattr(self, 'swav_prototypes'):
+            swav_scores = self.swav_prototypes(z_contrastive)
+        
+        # Anomaly detection scores
+        anomaly_scores = self.anomaly_head(z_fused)
         
         # UMTL Enhancement: Prototype features
         z_prototype = self.prototype_head(z_fused)
         z_prototype = F.normalize(z_prototype, dim=1)
         
-        return {
+        outputs = {
             'latent': z_fused,
             'reconstructed': x_recon,
             'labels': labels,
             'clusters': clusters,
             'contrastive': z_contrastive,
-            'prototype': z_prototype,  # Added for margin loss
-            'branch_predictions': branch_predictions  # For additional loss
+            'prototype': z_prototype,
+            'branch_predictions': branch_predictions,
+            'anomaly_scores': anomaly_scores
         }
+        
+        # Add VAE parameters if requested
+        if return_vae_params and self.use_vae:
+            outputs.update({
+                'vae_mu': vae_mu,
+                'vae_logvar': vae_logvar
+            })
+        
+        # Add BYOL momentum features
+        if z_momentum is not None:
+            outputs['momentum'] = z_momentum
+        
+        # Add SwAV scores
+        if swav_scores is not None:
+            outputs['swav_scores'] = swav_scores
+        
+        return outputs
 
 # =============================================================================
 # Training and Data Management
