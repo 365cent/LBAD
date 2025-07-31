@@ -867,7 +867,7 @@ def generate_reconstruction_anomaly_scores(
                             )
 
                         except Exception as sub_e:
-                            print(f"⚠️  Sub-batch also failed: {sub_e}")
+                            
                             # Final fallback: random anomaly scores
                             fallback_scores = np.random.uniform(
                                 0.0, 1.0, min(sub_batch_size, len(embeddings) - j)
@@ -877,13 +877,13 @@ def generate_reconstruction_anomaly_scores(
                     raise e
 
     if not recon_errors:
-        print("⚠️  No reconstruction errors computed, using random scores...")
+        
         return np.random.uniform(0.0, 1.0, len(embeddings))
 
     try:
         return np.concatenate(recon_errors)
     except Exception as e:
-        print(f"⚠️  Error concatenating results: {e}, using mean values...")
+        
         # Fallback: return mean of successful computations
         mean_val = np.mean([arr.mean() for arr in recon_errors if len(arr) > 0])
         return np.full(len(embeddings), mean_val)
@@ -1793,67 +1793,6 @@ def load_and_preprocess_data(
             },
         )
 
-    # Adaptive subsampling based on embedding type and device capabilities
-    if embedding_dim <= 300:  # FastText
-        if config.device == "cuda":
-            samples_per_gb = min(
-                800, int(config.gpu_memory_gb * 8)
-            )  # Conservative for CUDA
-        else:
-            samples_per_gb = 1000
-    elif embedding_dim <= 768:  # Standard BERT
-        if config.device == "cuda":
-            samples_per_gb = min(
-                400, int(config.gpu_memory_gb * 4)
-            )  # Conservative for CUDA
-        else:
-            samples_per_gb = 500
-    else:  # Enhanced LogBERT (2314D)
-        if config.device == "cuda":
-            samples_per_gb = min(
-                200, int(config.gpu_memory_gb * 2)
-            )  # Increased from 100 to 200
-        else:
-            samples_per_gb = 150
-
-    # Disable automatic memory-based subsampling to use all data
-    # Only apply if explicitly requested via sample_size parameter
-    apply_auto_subsampling = False  # Disabled to use full dataset
-
-    if apply_auto_subsampling and sample_size is None and len(embeddings) > 100000:
-        # Apply more conservative limits for CUDA to prevent OOM - but only for very large datasets
-        if config.device == "cuda":
-            max_samples = min(
-                50000, int(config.gpu_memory_gb * samples_per_gb)
-            )  # Increased max
-        else:
-            max_samples = min(100000, int(config.gpu_memory_gb * samples_per_gb))
-
-        if len(embeddings) > max_samples:
-            print(f"📊 Large dataset detected ({len(embeddings):,} samples)")
-            print(
-                f"   Automatically subsampling to {max_samples:,} samples for memory efficiency"
-            )
-            print(f"   Use --sample-size to override or process smaller chunks")
-
-            indices = np.random.choice(len(embeddings), max_samples, replace=False)
-            embeddings = embeddings[indices]
-            if true_labels is not None:
-                true_labels = true_labels[indices]
-            tracker.log_step(
-                "Automatic Data Subsampling",
-                {
-                    "original_size": len(embeddings),
-                    "subsampled_size": max_samples,
-                    "memory_gb": embeddings.nbytes / (1024**3),
-                    "embedding_dim": embedding_dim,
-                    "embedding_type": embedding_type,
-                    "samples_per_gb": samples_per_gb,
-                    "device_type": config.device,
-                    "reason": "Large dataset auto-subsampling",
-                },
-            )
-
     # Apply explicit sample size limit if specified
     if sample_size is not None and sample_size < len(embeddings):
         print(f"🎯 Limiting dataset to {sample_size:,} samples as requested...")
@@ -2574,7 +2513,7 @@ def train_model(
         os.environ["CUDA_LAUNCH_BLOCKING"] = (
             "1"  # Enable synchronous CUDA for better error tracing
         )
-        print(f"🔧 CUDA_LAUNCH_BLOCKING=1 enabled for debugging")
+        
 
     print(f"🚀 ENHANCED SUPERCOMPUTER TRAINING - {log_type}")
     # Calculate model complexity
@@ -2790,7 +2729,7 @@ def train_model(
         num_workers=0,  # Disable multiprocessing to avoid alignment issues
         pin_memory=False,  # Disable pin_memory to prevent CUDA misalignment
     )
-    print("Data loader initialized.")
+    
 
     # Advanced training setup - adjusted for longer training
     optimizer = optim.AdamW(
@@ -3148,7 +3087,7 @@ def train_model(
             supervised_loss = torch.tensor(0.0, device=device)
 
             try:
-                print("    Attempting data transfer to GPU...")
+                
                 # Ensure tensors are contiguous before GPU transfer to avoid misalignment
                 if not x_batch.is_contiguous():
                     x_batch = x_batch.contiguous()
@@ -3252,7 +3191,7 @@ def train_model(
 
                         continue
 
-                    print("    Calculating losses...")
+
                     # Advanced multi-component loss with curriculum learning
                     recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
 
@@ -3408,9 +3347,7 @@ def train_model(
                     skip_batch = False
                     for loss_name, loss_val in loss_dict.items():
                         if torch.isnan(loss_val) or torch.isinf(loss_val):
-                            print(
-                                f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}"
-                            )
+                            
                             skip_batch = True
 
                     if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -3424,9 +3361,7 @@ def train_model(
 
                         continue
 
-                print(
-                    "    Performing backward pass (scaler.scale(total_loss).backward())..."
-                )
+                
                 scaler.scale(total_loss).backward()
                 print("    Backward pass successful.")
 
@@ -3436,7 +3371,7 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 print("    Gradient clipping applied.")
 
-                print("    Performing optimizer step (scaler.step(optimizer))...")
+                
                 scaler.step(optimizer)
                 scaler.update()
                 print("    Optimizer step successful.")
@@ -3452,7 +3387,6 @@ def train_model(
                 print("    Class prototypes updated.")
 
             else:
-                print("    Performing forward pass (autocast disabled)...")
                 try:
                     # Strong augmentation for student (same as scaler branch)
                     x_strong = strong_augment(x_batch)
@@ -3466,7 +3400,7 @@ def train_model(
                     clear_gpu_memory()
                     continue
 
-                print("    Calculating losses...")
+                
                 recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
 
                 # Enhanced focal loss with distribution-balanced weights and class weighting
@@ -3619,9 +3553,7 @@ def train_model(
                 skip_batch = False
                 for loss_name, loss_val in loss_dict.items():
                     if torch.isnan(loss_val) or torch.isinf(loss_val):
-                        print(
-                            f"Warning: NaN/Inf detected in {loss_name} loss. Value: {loss_val.item()}"
-                        )
+                        
                         skip_batch = True
 
                 if skip_batch or torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -3635,7 +3567,7 @@ def train_model(
 
                     continue
 
-                print("    Performing backward pass (total_loss.backward())...")
+                
                 total_loss.backward()
                 print("    Backward pass successful.")
 
@@ -3644,7 +3576,7 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 print("    Gradient clipping applied.")
 
-                print("    Performing optimizer step (optimizer.step())...")
+                
                 optimizer.step()
                 print("    Optimizer step successful.")
 
@@ -3734,12 +3666,8 @@ def train_model(
                         eta_str = f"{eta_seconds:.0f}s"
 
                     # Enhanced progress for supercomputer
-                    print(
-                        f"💾 Checkpoint {progress_pct:.1f}% | ETA: {eta_str} | Loss: {avg_loss:.4f}"
-                    )
-                    print(
-                        f"   ⚡ Epoch {epoch + 1}/{total_epochs} | {elapsed_time / 60:.1f}min elapsed | {time_per_epoch:.1f}s/epoch"
-                    )
+                    
+                    
 
                 save_training_checkpoint(
                     log_type,
