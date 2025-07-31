@@ -1350,6 +1350,43 @@ def clear_gpu_memory():
     gc.collect()
 
 
+def weak_augment(x: torch.Tensor, noise_factor: float = 0.01) -> torch.Tensor:
+    """
+    Weak augmentation for teacher network predictions (FixMatch-style)
+
+    Args:
+        x: Input embeddings
+        noise_factor: Gaussian noise standard deviation
+
+    Returns:
+        Weakly augmented embeddings
+    """
+    return x + noise_factor * torch.randn_like(x)
+
+
+def strong_augment(
+    x: torch.Tensor, dropout_rate: float = 0.15, noise_factor: float = 0.05
+) -> torch.Tensor:
+    """
+    Strong augmentation for student network training (FixMatch-style)
+
+    Args:
+        x: Input embeddings
+        dropout_rate: Feature dropout rate
+        noise_factor: Gaussian noise standard deviation
+
+    Returns:
+        Strongly augmented embeddings
+    """
+    # Feature dropout (simulate missing features)
+    mask = (torch.rand_like(x) > dropout_rate).float()
+    x_augmented = x * mask
+
+    # Add noise
+    x_augmented = x_augmented + noise_factor * torch.randn_like(x)
+
+    return x_augmented
+
 def train_model(
     embeddings: np.ndarray,
     classes: List[str],
