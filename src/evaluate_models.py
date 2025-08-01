@@ -100,22 +100,27 @@ class TransformerEvaluator:
             raise ValueError(f"Could not determine input dimension from model checkpoint. "
                            f"Available model keys (first 10): {model_keys}")
         
-        # Rebuild model with same architecture
+        # Rebuild model with same architecture - handle both single and multi-label models
+        n_labels = len(classes)
+        if 'n_labels' in ckpt and ckpt['n_labels'] == 1:
+            # Single-label model (from separate model approach)
+            n_labels = 1
+        
         model = UnsupervisedMultiLabelTransformer(
             input_dim=input_dim,
-            latent_dim=ckpt.get('latent_dim', 256),  # Updated default for multi-label
-            n_labels=len(classes),
+            latent_dim=ckpt.get('latent_dim', 256),
+            n_labels=n_labels,
             n_clusters=min(8, len(classes)),
-            dropout=0.05,  # Updated default for multi-label
-            transformer_layers=ckpt.get('transformer_layers', 2),  # Updated default for multi-label
-            attention_heads=ckpt.get('attention_heads', 4)  # Updated default for multi-label
+            dropout=ckpt.get('dropout', 0.1),
+            transformer_layers=ckpt.get('transformer_layers', 2),
+            attention_heads=ckpt.get('attention_heads', 4)
         )
         
         # Load weights
         model.load_state_dict(ckpt['model_state_dict'])
         model.to(self.device).eval()
         
-        print(f"Model loaded: {input_dim}D → {len(classes)} classes")
+        print(f"Model loaded: {input_dim}D → {len(classes)} classes (n_labels={n_labels})")
         
         # Extract saved scaler if available
         saved_scaler = ckpt.get('scaler', None)
