@@ -1574,6 +1574,9 @@ def train_model(
         model.parameters(), lr=2e-4, weight_decay=1e-4  # Higher LR for faster convergence
     )
 
+    # Get true labels from tracker for class weight computation
+    true_labels = getattr(tracker, "true_labels", None)
+
     # Compute class weights for balanced training if true labels available
     if true_labels is not None:
         # Calculate inverse frequency weights for class balance
@@ -1709,6 +1712,9 @@ def train_model(
     optimizer = optim.AdamW(
         model.parameters(), lr=2e-4, weight_decay=1e-4  # Higher LR for faster convergence
     )
+
+    # Get true labels from tracker for class weight computation
+    true_labels = getattr(tracker, "true_labels", None)
 
     # Compute class weights for balanced training if true labels available
     if true_labels is not None:
