@@ -243,8 +243,8 @@ class SimpleBlock(nn.Module):
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
     """
-    Ultra-simplified autoencoder for maximum speed and stability.
-    No attention mechanisms to prevent hanging issues.
+    One-vs-Rest Transformer for unsupervised attack type detection.
+    Trains separate models for each attack type (normal vs attack).
     """
 
     def __init__(
@@ -254,9 +254,10 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         n_labels: int,
         n_clusters: int,  # Kept for API compatibility
         dropout: float = 0.1,
-        transformer_layers: int = 1,  # Ultra minimal
-        attention_heads: int = 4,  # Ignored in simple version
-        **kwargs,  # Absorb unused args from config
+        transformer_layers: int = 2,
+        attention_heads: int = 8,
+        attack_type_idx: int = 0,  # Which attack type this model handles
+        **kwargs,
     ):
         super().__init__()
 
@@ -264,16 +265,30 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.n_labels = n_labels
         self.n_clusters = n_clusters
-        self.transformer_layers = transformer_layers  # Store for model saving
-        self.attention_heads = attention_heads  # Store for model saving
-        self.dropout = dropout  # Store for model saving
+        self.transformer_layers = transformer_layers
+        self.attention_heads = attention_heads
+        self.dropout = dropout
+        self.attack_type_idx = attack_type_idx  # Which attack type this model handles
 
-        # Ultra-minimal single layers to prevent hanging
-        self.encoder = nn.Linear(input_dim, latent_dim)
+        # Input projection
+        self.input_projection = nn.Linear(input_dim, latent_dim)
+        
+        # Transformer layers with attention
+        self.transformer_blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=attention_heads,
+                dim_feedforward=latent_dim * 4,
+                dropout=dropout,
+                batch_first=True
+            ) for _ in range(transformer_layers)
+        ])
+        
+        # Output heads - binary classification for this attack type
         self.decoder = nn.Linear(latent_dim, input_dim)
-        self.classifier = nn.Linear(latent_dim, n_labels)
-
-        # Simple weight initialization
+        self.classifier = nn.Linear(latent_dim, 1)  # Binary: normal vs attack for this type
+        
+        # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -291,17 +306,32 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             )
 
     def forward(self, x, **kwargs):
-        """Ultra-minimal forward pass - just linear layers"""
-        # Encode with ReLU activation
-        z = F.relu(self.encoder(x))
+        """Forward pass for multi-label classification"""
+        # Input projection
+        encoded = self.input_projection(x)
         
-        # Decode and classify
-        reconstructed = self.decoder(z)
-        labels = self.classifier(z)
+        # Transformer layers
+        for transformer_block in self.transformer_blocks:
+            encoded = transformer_block(encoded)
+        
+        # Output heads
+        decoded = self.decoder(encoded)
+        
+        # Multi-label classification: output one score per class
+        # Use global average pooling over sequence dimension
+        if len(encoded.shape) == 3:  # [batch, seq_len, features]
+            pooled = torch.mean(encoded, dim=1)  # [batch, features]
+        else:
+            pooled = encoded  # Already pooled
+            
+        # Multi-label classifier outputs one score per class
+        multi_label_scores = self.classifier(pooled)  # [batch, n_labels]
         
         return {
-                "reconstructed": reconstructed,
-                "labels": labels,
+            "reconstructed": decoded,
+            "multi_label_scores": multi_label_scores,  # Scores for all classes
+            "encoded": encoded,
+            "pooled": pooled
         }
     
     def _safe_fallback_output(self, x):
@@ -1011,7 +1041,7 @@ def generate_pseudo_labels(
     k: int = 3,
     true_labels: np.ndarray = None,
 ) -> np.ndarray:
-    """Generate pseudo-labels using self-supervised mutual learning approach with higher confidence"""
+    """Generate pseudo-labels for multi-label classification using self-supervised mutual learning"""
     if not classes:
         # If no classes, create a single 'normal' class
         return np.ones((len(embeddings), 1), dtype=np.float32) * 0.8
@@ -1019,39 +1049,34 @@ def generate_pseudo_labels(
     n_samples = len(embeddings)
     n_classes = len(classes)
 
-    # Initialize pseudo-labels with higher confidence
+    # Initialize pseudo-labels for multi-label structure
     if true_labels is not None:
-        # If we have true labels, use them with higher confidence
+        # If we have true labels, use them as starting point
         pseudo_labels = true_labels.astype(np.float32)
-        # Add less noise to maintain higher confidence
-        noise = np.random.rand(n_samples, n_classes) * 0.05  # Reduced noise
-        pseudo_labels = (
-            pseudo_labels * 0.9 + noise * 0.1
-        )  # Higher weight for true labels
+        # Add small noise to maintain some uncertainty
+        noise = np.random.rand(n_samples, n_classes) * 0.1
+        pseudo_labels = pseudo_labels * 0.85 + noise * 0.15
 
-        # For unlabeled samples, initialize with more confident random values
+        # For samples with no labels (normal logs), initialize with low confidence
         unlabeled_mask = true_labels.sum(axis=1) == 0
         if np.any(unlabeled_mask):
-            # Generate more confident initial labels
-            confident_labels = np.random.rand(np.sum(unlabeled_mask), n_classes)
-            # Make them more binary-like (closer to 0 or 1)
-            confident_labels = (confident_labels > 0.3).astype(float) * 0.8 + 0.1
-            pseudo_labels[unlabeled_mask] = confident_labels
+            # Initialize normal samples with low confidence for all classes
+            pseudo_labels[unlabeled_mask] = np.random.rand(np.sum(unlabeled_mask), n_classes) * 0.2
     else:
-        # Initialize with more confident random values
+        # Initialize with random multi-label structure
+        # Each sample can have multiple positive labels
         pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
-        # Make initial labels more confident
-        pseudo_labels = (pseudo_labels > 0.4).astype(float) * 0.7 + 0.15
+        # Make it more sparse (most samples have few positive labels)
+        threshold = 0.3
+        pseudo_labels = (pseudo_labels > threshold).astype(float) * 0.7 + 0.1
 
-    # 1. Compute pairwise similarities with higher threshold
+    # Normalize embeddings for similarity computation
     embeddings_norm = embeddings / (
         np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
     )
 
-    # Use higher similarity threshold for more confident propagation
-    similarity_threshold = 0.8  # Increased from 0.7
-
-    # 2. Propagate labels with confidence weighting
+    # Multi-label similarity propagation
+    similarity_threshold = 0.7
     chunk_size = min(1000, n_samples)
 
     for i in range(0, n_samples, chunk_size):
@@ -1063,48 +1088,51 @@ def generate_pseudo_labels(
         for j in range(len(chunk_i)):
             global_idx = i + j
 
-            # Find highly similar samples
+            # Find similar samples
             similar_indices = np.where(similarities[j] > similarity_threshold)[0]
 
             if len(similar_indices) > 1:
-                # Weight by similarity for more confident propagation
+                # Weight by similarity
                 sim_weights = similarities[j][similar_indices]
                 sim_weights = sim_weights / sim_weights.sum()
 
-                # Weighted average with confidence boost
+                # Weighted average of similar samples' labels
                 similar_labels = np.average(
                     pseudo_labels[similar_indices], axis=0, weights=sim_weights
                 )
 
-                # Higher momentum for more confident updates
-                momentum = 0.8  # Increased from 0.7-0.9
+                # Update with momentum
+                momentum = 0.7
                 pseudo_labels[global_idx] = (
                     momentum * pseudo_labels[global_idx]
                     + (1 - momentum) * similar_labels
                 )
 
-    # --- NEW ADDITION: Reinforce "opposite" class predictions ---
-    # For each sample, if a class is confidently *not* present, and others are, reinforce the negative.
-    negative_reinforce_threshold = 0.1  # If pseudo-label for a class is below this
-    positive_presence_threshold = 0.7  # If other pseudo-labels are above this
-
+    # Multi-label consistency: if similar samples have different label patterns,
+    # adjust confidence based on label co-occurrence
     for i in range(n_samples):
-        for c in range(n_classes):
-            if pseudo_labels[i, c] < negative_reinforce_threshold:
-                # Check if other classes are confidently present
-                other_classes_present = False
-                for other_c in range(n_classes):
-                    if (
-                        other_c != c
-                        and pseudo_labels[i, other_c] > positive_presence_threshold
-                    ):
-                        other_classes_present = True
-                        break
+        # Find similar samples for this sample
+        sample_embedding = embeddings_norm[i:i+1]
+        similarities = np.dot(sample_embedding, embeddings_norm.T)[0]
+        similar_indices = np.where(similarities > 0.6)[0]
+        
+        if len(similar_indices) > 1:
+            # Get label patterns of similar samples
+            similar_label_patterns = pseudo_labels[similar_indices]
+            
+            # Calculate label co-occurrence
+            label_cooccurrence = np.mean(similar_label_patterns, axis=0)
+            
+            # Adjust confidence based on co-occurrence
+            for c in range(n_classes):
+                if label_cooccurrence[c] > 0.5:
+                    # If this class is common among similar samples, increase confidence
+                    pseudo_labels[i, c] = min(0.9, pseudo_labels[i, c] * 1.2)
+                elif label_cooccurrence[c] < 0.2:
+                    # If this class is rare among similar samples, decrease confidence
+                    pseudo_labels[i, c] = max(0.1, pseudo_labels[i, c] * 0.8)
 
-                if other_classes_present:
-                    # Strongly push this class's pseudo-label towards 0
-                    pseudo_labels[i, c] = pseudo_labels[i, c] * 0.1  # Reduce by 90%
-    # --- END NEW ADDITION ---
+    return pseudo_labels
 
     # 3. Apply confidence boosting
     # Enhance the most confident predictions
@@ -1354,7 +1382,7 @@ def train_model(
     tracker: ProgressTracker,
     log_type: str,
     scaler: "StandardScaler" = None,
-) -> Tuple[UnsupervisedMultiLabelTransformer, "StandardScaler"]:
+) -> Tuple[List[UnsupervisedMultiLabelTransformer], "StandardScaler"]:
     """Simplified, high-performance training optimized for speed and precision"""
 
     device = torch.device(config.device)
@@ -1382,19 +1410,20 @@ def train_model(
         transformer_layers = 1  # Minimal for maximum speed
         attention_heads = 4  # Reduced for speed
 
-    # Simplified model setup - no complex features
+    # Single multi-label model - outputs one prediction per class
     model = UnsupervisedMultiLabelTransformer(
         input_dim=embedding_dim,
         latent_dim=latent_dim,
-        n_labels=n_labels,
+        n_labels=n_labels,  # Number of classes (attack types)
         n_clusters=n_clusters,
         dropout=0.05,  # Reduced dropout for speed
         transformer_layers=transformer_layers,
         attention_heads=attention_heads,
+        attack_type_idx=0,  # Not used in multi-label approach
     ).to(device)
-
-    # Remove complex teacher-student network for speed
-    # No teacher network, no EMA, no FixMatch complexity
+    
+    print(f"🎯 Training single multi-label model for {n_labels} attack types")
+    print(f"📊 Attack types: {classes}")
 
     # Detect and log embedding type
     embedding_type = "Unknown"
@@ -1415,7 +1444,7 @@ def train_model(
             "attention_heads": attention_heads,
             "training_hash": training_hash,
             "note": "Model automatically adapts to input embedding type",
-            "training_mode": "Fully unsupervised generative model - using all data for training",
+            "training_mode": "Multi-label classification - single model for all classes",
         },
     )
 
@@ -1787,30 +1816,68 @@ def train_model(
         # Simplified training - no complex anomaly scoring for speed
         # Advanced pseudo-label refinement with curriculum learning disabled for speed
 
-                # Simplified training loop
-        for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            # Move tensors to device
+        # Multi-label training loop - train single model for all classes
+        print(f"    🎯 Training multi-label model for {len(classes)} attack types")
+        
+        # Use pseudo-labels for training
+        pseudo_labels_tensor = torch.from_numpy(current_pseudo_labels).float().to(device)
+        
+        # Create dataset with multi-label structure
+        multi_label_dataset = TensorDataset(
+            torch.from_numpy(embeddings).float(),
+            pseudo_labels_tensor
+        )
+        multi_label_dataloader = DataLoader(
+            multi_label_dataset, batch_size=batch_size, shuffle=True
+        )
+        
+        # Train the multi-label model
+        model.train()
+        for batch_idx, (x_batch, y_batch) in enumerate(multi_label_dataloader):
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
             
-            # Training step
+            # Forward pass
             optimizer.zero_grad()
             outputs = model(x_batch)
             
-            # Compute losses
+            # Compute losses for multi-label classification
             recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
-            label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
-            total_loss = recon_loss + label_loss
+            
+            # Multi-label classification loss
+            # Use sigmoid + binary cross entropy for multi-label
+            multi_label_scores = outputs["multi_label_scores"]  # [batch, n_labels]
+            multi_label_loss = F.binary_cross_entropy_with_logits(
+                multi_label_scores, y_batch
+            )
+            
+            # Add class weights if available
+            if class_weights is not None:
+                # Apply class weights to multi-label loss
+                weighted_loss = 0
+                for i in range(len(classes)):
+                    class_loss = F.binary_cross_entropy_with_logits(
+                        multi_label_scores[:, i], y_batch[:, i], 
+                        pos_weight=class_weights[i]
+                    )
+                    weighted_loss += class_loss
+                multi_label_loss = weighted_loss / len(classes)
+            
+            total_loss = recon_loss + multi_label_loss
             
             # Backward and optimize
             if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 epoch_losses.append(total_loss.item())
-                print(f"    Batch {batch_idx+1}/{len(dataloader)}: Loss={total_loss.item():.4f}")
+                
+                # Progress tracking
+                if batch_idx % 10 == 0:
+                    print(f"      Batch {batch_idx+1}: Loss={total_loss.item():.4f} "
+                          f"(recon={recon_loss.item():.4f}, ml={multi_label_loss.item():.4f})")
             else:
-                print(f"    ⚠️ Invalid loss at batch {batch_idx+1}, skipping")
+                print(f"      ⚠️ Invalid loss for batch {batch_idx+1}")
 
         scheduler.step()
 
@@ -1868,11 +1935,20 @@ def train_model(
             # Generate sample IDs
             ids = np.arange(len(embeddings))
 
-            # Generate predictions on training embeddings
+            # Generate predictions by combining all one-vs-rest models
             with torch.no_grad():
                 embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
-                logits = model(embeddings_tensor)["labels"]
-                probs = torch.sigmoid(logits).cpu().numpy()
+                
+                # Get predictions from each model
+                all_predictions = []
+                for attack_type_idx, model in enumerate(models):
+                    model.eval()
+                    outputs = model(embeddings_tensor)
+                    attack_scores = torch.sigmoid(outputs["attack_score"]).cpu().numpy()
+                    all_predictions.append(attack_scores)
+                
+                # Combine predictions: [attack_type_0, attack_type_1, attack_type_2, ...]
+                probs = np.concatenate(all_predictions, axis=1)  # Shape: (n_samples, n_attack_types)
                 preds = (probs >= 0.5).astype(int)
 
             # Prepare prediction dictionary
@@ -1897,7 +1973,7 @@ def train_model(
         except Exception as e:
             print(f"⚠️  Failed to save predictions: {e}")
 
-        return model, scaler  # Return the scaler used for preprocessing
+        return [model], scaler  # Return the list with single model and scaler used for preprocessing
 
 
 # Log type classifier function removed - each log file can only be one type
@@ -3683,7 +3759,7 @@ def evaluate_transformer_model(
         for i in range(0, len(embeddings), batch_size):
             batch = torch.from_numpy(embeddings[i : i + batch_size]).float().to(device)
             outputs = model(batch)
-            probs = torch.sigmoid(outputs["labels"])
+            probs = torch.sigmoid(outputs["multi_label_scores"])
             predictions.append(probs.cpu().numpy())
 
     predictions = np.vstack(predictions)
@@ -4842,7 +4918,7 @@ def process_log_type_with_args(
         print(
             f"\n🚀 Starting training for {log_type}. Detailed progress will be shown below..."
         )
-        model, _ = train_model(
+        models, _ = train_model(
             embeddings, classes, C, config, tracker, log_type, scaler
         )
         print(f"✅ Training completed for {log_type}")
@@ -4855,7 +4931,7 @@ def process_log_type_with_args(
         import torch
         with torch.no_grad():
             embeddings_tensor = torch.from_numpy(embeddings).float().to(config.device)
-            logits = model(embeddings_tensor)["labels"]
+            logits = models[0](embeddings_tensor)["multi_label_scores"]
             probs = torch.sigmoid(logits).cpu().numpy()
             
             # Use default thresholds for now
@@ -4878,15 +4954,18 @@ def process_log_type_with_args(
             
             print(f"✅ Predictions saved to {prediction_file}")
 
-        # Save trained model
+        # Save trained models (one for each attack type)
         if config.rank == 0:
             with Halo(
-                text=f"Saving model for {log_type}...", spinner="dots"
+                text=f"Saving models for {log_type}...", spinner="dots"
             ) as spinner:
-                model_path = save_model_after_training(
-                    model, classes, config, log_type, total_training_time, scaler
-                )
-                spinner.succeed(f"Model saved successfully")
+                model_paths = []
+                for attack_type_idx, model in enumerate(models):
+                    model_path = save_model_after_training(
+                        model, classes, config, log_type, total_training_time, scaler
+                    )
+                    model_paths.append(model_path)
+                spinner.succeed(f"All {len(models)} models saved successfully")
 
         tracker.log_step(
             "Completion", {"status": "success", "training_time": total_training_time}
