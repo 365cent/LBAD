@@ -1416,11 +1416,13 @@ def train_model(
         },
     )
 
-    # Multi-GPU setup
+    # Multi-GPU setup - TEMPORARILY DISABLED FOR DEBUGGING
+    print(f"[DEBUG] Multi-GPU setup: distributed={config.is_distributed}, n_gpus={config.n_gpus}")
     if config.is_distributed:
         model = DDP(model, device_ids=[config.rank])
     elif config.n_gpus > 1:
-        model = nn.DataParallel(model)
+        print(f"[DEBUG] SKIPPING DataParallel for debugging (would use {config.n_gpus} GPUs)")
+        # model = nn.DataParallel(model)  # TEMPORARILY DISABLED
 
     # Training information and CUDA warnings
     use_mixed_precision = config.device == "cuda"  # Mixed precision only on CUDA
@@ -1815,11 +1817,8 @@ def train_model(
             optimizer.zero_grad()
 
             print(f"[DEBUG] Calling ULTRA-MINIMAL model forward pass...")
-            
-            # Handle DataParallel wrapper properly
-            actual_model = model.module if hasattr(model, 'module') else model
             print(f"[DEBUG] Model type: {type(model).__name__}")
-            print(f"[DEBUG] Actual model: encoder={type(actual_model.encoder).__name__}, decoder={type(actual_model.decoder).__name__}")
+            print(f"[DEBUG] Model components: encoder={type(model.encoder).__name__}, decoder={type(model.decoder).__name__}")
             
             forward_start = time.time()
             outputs = model(x_batch)
