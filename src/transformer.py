@@ -1063,12 +1063,22 @@ def generate_pseudo_labels(
             # Initialize normal samples with low confidence for all classes
             pseudo_labels[unlabeled_mask] = np.random.rand(np.sum(unlabeled_mask), n_classes) * 0.2
     else:
-        # Initialize with random multi-label structure
+        # Initialize with better multi-label structure
         # Each sample can have multiple positive labels
         pseudo_labels = np.random.rand(n_samples, n_classes).astype(np.float32)
-        # Make it more sparse (most samples have few positive labels)
-        threshold = 0.3
-        pseudo_labels = (pseudo_labels > threshold).astype(float) * 0.7 + 0.1
+        
+        # Create more realistic multi-label distribution
+        # Most samples should have 1-3 positive labels, not all or none
+        for i in range(n_samples):
+            # Randomly select 1-3 classes to be positive
+            num_positive = np.random.randint(1, min(4, n_classes + 1))
+            positive_indices = np.random.choice(n_classes, num_positive, replace=False)
+            
+            # Set positive classes with high confidence
+            pseudo_labels[i, positive_indices] = np.random.uniform(0.7, 0.9, num_positive)
+            # Set negative classes with low confidence
+            negative_indices = np.setdiff1d(np.arange(n_classes), positive_indices)
+            pseudo_labels[i, negative_indices] = np.random.uniform(0.1, 0.3, len(negative_indices))
 
     # Normalize embeddings for similarity computation
     embeddings_norm = embeddings / (
@@ -1844,26 +1854,34 @@ def train_model(
             # Compute losses for multi-label classification
             recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             
-            # Multi-label classification loss
-            # Use sigmoid + binary cross entropy for multi-label
+            # Multi-label classification loss with improved handling
             multi_label_scores = outputs["multi_label_scores"]  # [batch, n_labels]
-            multi_label_loss = F.binary_cross_entropy_with_logits(
-                multi_label_scores, y_batch
-            )
             
-            # Add class weights if available
+            # Use focal loss for better handling of class imbalance
             if class_weights is not None:
-                # Apply class weights to multi-label loss
-                weighted_loss = 0
-                for i in range(len(classes)):
-                    class_loss = F.binary_cross_entropy_with_logits(
-                        multi_label_scores[:, i], y_batch[:, i], 
-                        pos_weight=class_weights[i]
-                    )
-                    weighted_loss += class_loss
-                multi_label_loss = weighted_loss / len(classes)
+                # Apply focal loss with class weights for multi-label
+                focal_loss_val = enhanced_focal_loss(
+                    multi_label_scores, y_batch, class_weights=class_weights, gamma=2.0
+                )
+                multi_label_loss = focal_loss_val
+            else:
+                # Standard binary cross entropy with logits
+                multi_label_loss = F.binary_cross_entropy_with_logits(
+                    multi_label_scores, y_batch
+                )
             
-            total_loss = recon_loss + multi_label_loss
+            # Add regularization to encourage multi-label predictions
+            # Penalize if model predicts only one class for all samples
+            predictions = torch.sigmoid(multi_label_scores)
+            class_prediction_rates = predictions.mean(dim=0)  # Average prediction rate per class
+            
+            # Diversity penalty: encourage model to predict multiple classes
+            diversity_penalty = torch.var(class_prediction_rates) * 0.1  # Small penalty for variance
+            
+            # Balance penalty: discourage extreme imbalance in predictions
+            balance_penalty = torch.abs(class_prediction_rates.max() - class_prediction_rates.min()) * 0.05
+            
+            total_loss = recon_loss + multi_label_loss + diversity_penalty + balance_penalty
             
             # Backward and optimize
             if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
