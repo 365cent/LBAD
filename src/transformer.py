@@ -1493,9 +1493,11 @@ def train_model(
     current_pseudo_labels = pseudo_labels.copy()
 
     # Data setup - use ALL data for training (no splitting)
-    # Ensure tensors are contiguous to prevent CUDA alignment issues
-    embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
-    labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
+    # Create tensors on device directly to avoid expensive transfers
+    print(f"[DEBUG] Creating tensors directly on {device}...")
+    embeddings_tensor = torch.from_numpy(embeddings).float().contiguous().to(device)
+    labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous().to(device)
+    print(f"[DEBUG] Tensors created on device: embeddings={embeddings_tensor.shape}, labels={labels_tensor.shape}")
 
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
@@ -1796,10 +1798,7 @@ def train_model(
             sampler.set_epoch(epoch)
 
         # Simplified training - no complex anomaly scoring for speed
-
-        # Advanced pseudo-label refinement with curriculum learning
-        # Simplified training - no complex pseudo-label refinement for speed
-        pass
+        # Advanced pseudo-label refinement with curriculum learning disabled for speed
 
         # Ultra-minimal training loop with detailed debugging
         print(f"🔄 Starting epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
@@ -1811,10 +1810,8 @@ def train_model(
             batch_start = time.time()
             print(f"[{time.strftime('%H:%M:%S')}] 📊 Processing batch {batch_idx+1}/{len(dataloader)}")
             
-            print(f"[DEBUG] Moving tensors to device...")
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            print(f"[DEBUG] Tensors moved. Shapes: x={x_batch.shape}, y={y_batch.shape}")
+            print(f"[DEBUG] Tensors already on device: x={x_batch.shape}, y={y_batch.shape}")
+            print(f"[DEBUG] Device check: x_batch.device={x_batch.device}, y_batch.device={y_batch.device}")
             
             print(f"[DEBUG] Calling optimizer.zero_grad()...")
             optimizer.zero_grad()
