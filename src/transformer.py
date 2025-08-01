@@ -229,22 +229,16 @@ def cleanup_distributed():
 
 
 class SimpleBlock(nn.Module):
-    """Ultra-simple block to prevent hanging issues"""
+    """Minimal block - just a linear layer to prevent any hanging"""
 
     def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_model * 2)
-        self.linear2 = nn.Linear(d_model * 2, d_model)
-        self.norm = nn.LayerNorm(d_model)
+        self.linear = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # Ultra-simple feedforward block without attention to prevent hanging
-        residual = x
-        x = self.norm(x)
-        x = self.linear2(F.gelu(self.linear1(x)))
-        x = self.dropout(x)
-        return residual + x
+        # Just pass through with minimal processing
+        return self.dropout(self.linear(x))
 
 
 class UnsupervisedMultiLabelTransformer(nn.Module):
@@ -271,38 +265,10 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.n_labels = n_labels
         self.n_clusters = n_clusters
 
-        # Ultra-simple encoder (no attention)
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, latent_dim * 2),
-            nn.LayerNorm(latent_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-        )
-
-        # Simple processing blocks (no attention)
-        self.blocks = nn.ModuleList([
-            SimpleBlock(latent_dim, dropout) for _ in range(transformer_layers)
-        ])
-
-        # Ultra-simple decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.LayerNorm(latent_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim * 2, input_dim),
-        )
-
-        # Simple classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim // 2, n_labels),
-        )
+        # Ultra-minimal single layers to prevent hanging
+        self.encoder = nn.Linear(input_dim, latent_dim)
+        self.decoder = nn.Linear(latent_dim, input_dim)
+        self.classifier = nn.Linear(latent_dim, n_labels)
 
         # Simple weight initialization
         self.apply(self._init_weights)
@@ -322,22 +288,17 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             )
 
     def forward(self, x, **kwargs):
-        """Ultra-simple forward pass without complex logic"""
-        # Simple encode
-        z = self.encoder(x)
-        
-        # Process through simple blocks
-        for block in self.blocks:
-                    z = block(z)
+        """Ultra-minimal forward pass - just linear layers"""
+        # Encode with ReLU activation
+        z = F.relu(self.encoder(x))
         
         # Decode and classify
         reconstructed = self.decoder(z)
         labels = self.classifier(z)
         
-        # Return minimal required outputs
         return {
-                "reconstructed": reconstructed,
-                "labels": labels,
+            "reconstructed": reconstructed,
+            "labels": labels,
         }
     
     def _safe_fallback_output(self, x):
@@ -1853,7 +1814,8 @@ def train_model(
             print(f"[DEBUG] Calling optimizer.zero_grad()...")
             optimizer.zero_grad()
 
-            print(f"[DEBUG] Calling model forward pass...")
+            print(f"[DEBUG] Calling ULTRA-MINIMAL model forward pass...")
+            print(f"[DEBUG] Model: encoder={type(model.encoder).__name__}, decoder={type(model.decoder).__name__}")
             forward_start = time.time()
             outputs = model(x_batch)
             forward_time = time.time() - forward_start
