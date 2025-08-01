@@ -1872,7 +1872,7 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 print(f"[DEBUG] Optimizer step...")
                 optimizer.step()
-            epoch_losses.append(total_loss.item())
+                epoch_losses.append(total_loss.item())
                 batch_time = time.time() - batch_start
                 print(f"      ✅ Loss: {total_loss.item():.4f} (batch time: {batch_time:.3f}s)")
             else:
