@@ -67,8 +67,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import time
-import signal
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -302,8 +300,8 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         labels = self.classifier(z)
         
         return {
-            "reconstructed": reconstructed,
-            "labels": labels,
+                "reconstructed": reconstructed,
+                "labels": labels,
         }
     
     def _safe_fallback_output(self, x):
@@ -1358,15 +1356,6 @@ def train_model(
     scaler: "StandardScaler" = None,
 ) -> Tuple[UnsupervisedMultiLabelTransformer, "StandardScaler"]:
     """Simplified, high-performance training optimized for speed and precision"""
-    
-    # Add signal handler to allow Ctrl+C to work
-    def signal_handler(sig, frame):
-        print('\n🛑 Training interrupted by user (Ctrl+C)')
-        print('💾 Attempting to save current progress...')
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    print("🔧 Signal handler installed - Ctrl+C will work to stop training")
 
     device = torch.device(config.device)
     n_labels = len(classes) if classes else 1
@@ -1431,11 +1420,9 @@ def train_model(
     )
 
     # Multi-GPU setup
-    print(f"[DEBUG] Multi-GPU setup: distributed={config.is_distributed}, n_gpus={config.n_gpus}")
     if config.is_distributed:
         model = DDP(model, device_ids=[config.rank])
     elif config.n_gpus > 1:
-        print(f"[DEBUG] Using DataParallel with {config.n_gpus} GPUs")
         model = nn.DataParallel(model)
 
     # Training information and CUDA warnings
@@ -1503,32 +1490,10 @@ def train_model(
     # Store initial pseudo-labels for refinement
     current_pseudo_labels = pseudo_labels.copy()
 
-    # Data setup - use ALL data for training (no splitting)
-    # Create tensors on device directly to avoid expensive transfers
-    print(f"[DEBUG] Creating tensors directly on {device}...")
-    
-    # Add timeout for tensor creation
-    start_time = time.time()
-    try:
-        embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
-        print(f"[DEBUG] NumPy->Torch conversion completed in {time.time()-start_time:.3f}s")
-        
-        start_time = time.time()
-        embeddings_tensor = embeddings_tensor.to(device)
-        print(f"[DEBUG] Tensor moved to {device} in {time.time()-start_time:.3f}s")
-        
-        start_time = time.time()
-        labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous().to(device)
-        print(f"[DEBUG] Labels tensor created in {time.time()-start_time:.3f}s")
-        
-        print(f"[DEBUG] Tensors created successfully: embeddings={embeddings_tensor.shape}, labels={labels_tensor.shape}")
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR in tensor creation: {e}")
-        print("🔄 Falling back to CPU mode...")
-        device = torch.device("cpu")
-        embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
-        labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
-
+    # Data setup - keep tensors on CPU for DataLoader
+    # DataParallel will handle device placement
+    embeddings_tensor = torch.from_numpy(embeddings).float()
+    labels_tensor = torch.from_numpy(current_pseudo_labels).float()
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
     sampler = DistributedSampler(dataset) if config.is_distributed else None
@@ -1795,18 +1760,12 @@ def train_model(
     print("⚙️ Training setup complete. Entering main training loop...")
 
     # Training loop with progress tracking, early stopping, and checkpointing
-    print(f"[DEBUG] Setting model to train mode...")
     model.train()
     total_epochs = 30  # Reduced epochs for faster training with higher LR
 
     # Initialize progress tracking with batch information
-    print(f"[DEBUG] Checking dataloader length...")
     total_batches_per_epoch = len(dataloader)
-    print(f"[DEBUG] Dataloader has {total_batches_per_epoch} batches")
-    
-    print(f"[DEBUG] Starting progress tracker...")
     tracker.start_training(total_epochs, total_batches_per_epoch)
-    print(f"[DEBUG] Progress tracker started")
 
     refinement_interval = 999  # Disable pseudo-label refinement for speed  
     checkpoint_interval = 10  # Less frequent checkpointing for speed  # Save checkpoint every 5 epochs (5% progress)
@@ -1815,9 +1774,7 @@ def train_model(
     patience_counter = 0
     min_delta = 1e-5  # Smaller minimum improvement threshold
 
-    print(f"[DEBUG] About to start epoch loop: {start_epoch} to {total_epochs}")
     for epoch in range(start_epoch, total_epochs):
-        print(f"[DEBUG] Starting epoch {epoch}")
         epoch_start = time.time()
         epoch_losses = []
 
@@ -1830,64 +1787,33 @@ def train_model(
         # Simplified training - no complex anomaly scoring for speed
         # Advanced pseudo-label refinement with curriculum learning disabled for speed
 
-        # Ultra-minimal training loop with detailed debugging
-        print(f"🔄 Starting epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
-        
-        dataloader_start = time.time()
-        print(f"[DEBUG] About to iterate dataloader at {time.strftime('%H:%M:%S')}")
-        
-        # Add safety timeout for DataLoader iteration
-        dataloader_timeout = 30  # 30 seconds max per batch
-        
+        # Simplified training loop
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            iteration_start = time.time()
+            # Move tensors to device
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
             
-            # Check for timeout on DataLoader iteration
-            if time.time() - dataloader_start > dataloader_timeout:
-                print(f"⚠️ DataLoader iteration timeout after {dataloader_timeout}s - breaking loop")
-                break
-            batch_start = time.time()
-            print(f"[{time.strftime('%H:%M:%S')}] 📊 Processing batch {batch_idx+1}/{len(dataloader)}")
-            
-            print(f"[DEBUG] Tensors already on device: x={x_batch.shape}, y={y_batch.shape}")
-            print(f"[DEBUG] Device check: x_batch.device={x_batch.device}, y_batch.device={y_batch.device}")
-            
-            print(f"[DEBUG] Calling optimizer.zero_grad()...")
+            # Training step
             optimizer.zero_grad()
-
-            print(f"[DEBUG] Calling ULTRA-MINIMAL model forward pass...")
-            print(f"[DEBUG] Model type: {type(model).__name__}")
-            
-            # Handle DataParallel wrapper for debug info
-            actual_model = model.module if hasattr(model, 'module') else model
-            print(f"[DEBUG] Model components: encoder={type(actual_model.encoder).__name__}, decoder={type(actual_model.decoder).__name__}")
-            
-            forward_start = time.time()
             outputs = model(x_batch)
-            forward_time = time.time() - forward_start
-            print(f"[DEBUG] Forward pass completed in {forward_time:.3f}s")
             
-            print(f"[DEBUG] Computing losses...")
-            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+            # Compute losses
+                    recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
             total_loss = recon_loss + label_loss
-            print(f"[DEBUG] Losses computed: recon={recon_loss.item():.4f}, label={label_loss.item():.4f}")
             
+            # Backward and optimize
             if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
-                print(f"[DEBUG] Starting backward pass...")
                 total_loss.backward()
-                print(f"[DEBUG] Gradient clipping...")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                print(f"[DEBUG] Optimizer step...")
                 optimizer.step()
-                epoch_losses.append(total_loss.item())
-                batch_time = time.time() - batch_start
-                print(f"      ✅ Loss: {total_loss.item():.4f} (batch time: {batch_time:.3f}s)")
+            epoch_losses.append(total_loss.item())
+
+                # Progress output every 50 batches
+                if batch_idx % 50 == 0:
+                    print(f"    Batch {batch_idx}/{len(dataloader)}: Loss={total_loss.item():.4f}")
             else:
-                print(f"      ⚠️ Invalid loss, skipping batch")
-        
-        dataloader_time = time.time() - dataloader_start
-        print(f"[DEBUG] Dataloader iteration completed in {dataloader_time:.3f}s")
+                print(f"    ⚠️ Invalid loss at batch {batch_idx}, skipping")
 
         scheduler.step()
 
