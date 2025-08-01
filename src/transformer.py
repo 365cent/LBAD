@@ -1798,7 +1798,7 @@ def train_model(
             outputs = model(x_batch)
             
             # Compute losses
-                    recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
             total_loss = recon_loss + label_loss
             
@@ -1810,7 +1810,7 @@ def train_model(
             epoch_losses.append(total_loss.item())
 
                 # Progress output every 50 batches
-                if batch_idx % 50 == 0:
+            if batch_idx % 50 == 0:
                     print(f"    Batch {batch_idx}/{len(dataloader)}: Loss={total_loss.item():.4f}")
             else:
                 print(f"    ⚠️ Invalid loss at batch {batch_idx}, skipping")
