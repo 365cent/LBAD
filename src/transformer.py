@@ -307,6 +307,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             nn.Linear(latent_dim, n_labels)
         )
         
+        # Pooling projection layer for enhanced feature representation
+        self.pooling_projection = nn.Linear(latent_dim * 2, latent_dim)
+        
         # Initialize weights
         self.apply(self._init_weights)
 
@@ -342,8 +345,8 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             mean_pooled = torch.mean(encoded, dim=1)  # [batch, features]
             max_pooled = torch.max(encoded, dim=1)[0]  # [batch, features]
             pooled = torch.cat([mean_pooled, max_pooled], dim=1)  # [batch, features*2]
-            # Project back to original latent dimension
-            pooled = nn.Linear(pooled.shape[1], self.latent_dim).to(pooled.device)(pooled)
+            # Project back to original latent dimension using the model's projection layer
+            pooled = self.pooling_projection(pooled)
         else:
             pooled = encoded  # Already pooled
             
@@ -1416,6 +1419,459 @@ def train_model(
     log_type: str,
     scaler: "StandardScaler" = None,
 ) -> Tuple[List[UnsupervisedMultiLabelTransformer], "StandardScaler"]:
+    """
+    Train separate models for each attack type using normal log data, then combine results.
+    This approach is much better for unsupervised learning than multi-label training.
+    """
+
+    device = torch.device(config.device)
+    n_labels = len(classes) if classes else 1
+    n_clusters = C.shape[1] if C is not None else 1
+
+    # Generate training hash for checkpoint validation
+    training_hash = generate_training_hash(embeddings, classes)
+
+    # Clear memory before starting training
+    clear_gpu_memory()
+
+    # Enhanced architecture for better performance
+    embedding_dim = embeddings.shape[1]
+    if embedding_dim <= 300:  # FastText
+        latent_dim = 256
+        transformer_layers = 3
+        attention_heads = 8
+    elif embedding_dim <= 768:  # Standard BERT
+        latent_dim = 384
+        transformer_layers = 4
+        attention_heads = 8
+    else:  # Enhanced LogBERT (2314D)
+        latent_dim = 512
+        transformer_layers = 6
+        attention_heads = 16
+
+    print(f"🎯 Training separate models for each attack type using normal log data")
+    print(f"📊 Attack types: {classes}")
+    print(f"📈 Approach: One-vs-Rest with normal log data for each attack type")
+
+    # Detect and log embedding type
+    embedding_type = "Unknown"
+    if embedding_dim == 300:
+        embedding_type = "FastText (300D)"
+    elif embedding_dim == 768:
+        embedding_type = "BERT CLS only (768D)"
+    elif embedding_dim == 2314:
+        embedding_type = "Enhanced LogBERT (2314D)"
+
+    tracker.log_step(
+        "Separate Model Training Approach",
+        {
+            "embedding_dim": embedding_dim,
+            "embedding_type": embedding_type,
+            "latent_dim": latent_dim,
+            "transformer_layers": transformer_layers,
+            "attention_heads": attention_heads,
+            "training_hash": training_hash,
+            "note": "Training separate models for each attack type using normal log data",
+            "training_mode": "One-vs-Rest with normal log data for each attack type",
+        },
+    )
+
+    # Multi-GPU setup
+    if config.is_distributed:
+        print("⚠️  Distributed training not supported for separate model approach")
+        config.is_distributed = False
+
+    # Training information
+    use_mixed_precision = config.device == "cuda"
+    patience = 30
+    class_weights = None
+
+    # Set CUDA debugging environment
+    if device.type == "cuda":
+        import os
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    print(f"🚀 SEPARATE MODEL TRAINING - {log_type}")
+    
+    # Get true labels from tracker for class weight computation
+    true_labels = getattr(tracker, "true_labels", None)
+
+    # Train separate models for each attack type
+    models = []
+    all_predictions = []
+    all_probabilities = []
+    
+    for attack_idx, attack_type in enumerate(classes):
+        print(f"\n{'='*60}")
+        print(f"🎯 Training model for attack type: {attack_type}")
+        print(f"{'='*60}")
+        
+        # Create binary labels for this attack type (1 for this attack, 0 for normal)
+        if true_labels is not None:
+            # Use true labels if available
+            binary_labels = true_labels[:, attack_idx].astype(np.float32)
+        else:
+            # Create pseudo-labels for this attack type using clustering
+            binary_labels = generate_pseudo_labels_for_attack_type(
+                embeddings, attack_type, attack_idx, n_samples=len(embeddings)
+            )
+        
+        # Create single-class model for this attack type
+        model = UnsupervisedMultiLabelTransformer(
+            input_dim=embedding_dim,
+            latent_dim=latent_dim,
+            n_labels=1,  # Single class: this attack vs normal
+            n_clusters=n_clusters,
+            dropout=0.1,
+            transformer_layers=transformer_layers,
+            attention_heads=attention_heads,
+        ).to(device)
+        
+        # Multi-GPU setup for this model
+        if config.n_gpus > 1:
+            model = nn.DataParallel(model)
+        
+        # Train this model
+        trained_model = train_single_attack_model(
+            model, embeddings, binary_labels, attack_type, config, tracker, log_type
+        )
+        
+        # Generate predictions for this attack type
+        trained_model.eval()
+        with torch.no_grad():
+            embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
+            outputs = trained_model(embeddings_tensor)
+            attack_scores = outputs["multi_label_scores"]  # [batch, 1]
+            attack_probs = torch.sigmoid(attack_scores).cpu().numpy().flatten()  # [batch]
+            attack_preds = (attack_probs >= 0.5).astype(int)
+        
+        # Store results
+        models.append(trained_model)
+        all_probabilities.append(attack_probs)
+        all_predictions.append(attack_preds)
+        
+        print(f"✅ Completed training for {attack_type}")
+        print(f"📊 Predictions: {np.sum(attack_preds)}/{len(attack_preds)} samples classified as {attack_type}")
+    
+    # Combine results from all models
+    print(f"\n{'='*60}")
+    print(f"🔗 Combining results from {len(models)} models")
+    print(f"{'='*60}")
+    
+    # Stack all predictions and probabilities
+    combined_predictions = np.column_stack(all_predictions)  # [n_samples, n_attack_types]
+    combined_probabilities = np.column_stack(all_probabilities)  # [n_samples, n_attack_types]
+    
+    print(f"📊 Combined predictions shape: {combined_predictions.shape}")
+    print(f"📈 Combined probabilities shape: {combined_probabilities.shape}")
+    
+    # Save combined results
+    if config.rank == 0:
+        print(f"💾 Saving combined prediction results for {log_type}...")
+        try:
+            import pickle
+            import os
+
+            # Generate sample IDs
+            ids = np.arange(len(embeddings))
+
+            # Prepare prediction dictionary
+            prediction_data = {
+                "ids": ids,
+                "probs": combined_probabilities,
+                "preds": combined_predictions,
+                "classes": classes,
+                "thresholds": np.ones(len(classes)) * 0.5,  # Default thresholds
+            }
+            if true_labels is not None:
+                prediction_data["true_labels"] = true_labels
+
+            # Create results directory and save predictions
+            os.makedirs(f"results/{log_type}", exist_ok=True)
+            prediction_file = f"results/{log_type}/predictions.pkl"
+
+            with open(prediction_file, "wb") as f:
+                pickle.dump(prediction_data, f)
+
+            print(f"✅ Combined predictions saved to {prediction_file}")
+        except Exception as e:
+            print(f"❌ Failed to save combined predictions: {e}")
+
+    return models, scaler
+
+
+def generate_pseudo_labels_for_attack_type(
+    embeddings: np.ndarray, 
+    attack_type: str, 
+    attack_idx: int, 
+    n_samples: int
+) -> np.ndarray:
+    """
+    Generate pseudo-labels for a specific attack type using clustering.
+    Returns binary labels: 1 for this attack type, 0 for normal.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.preprocessing import StandardScaler
+    
+    print(f"🔍 Generating pseudo-labels for {attack_type}...")
+    
+    # Normalize embeddings for better clustering
+    scaler = StandardScaler()
+    normalized_embeddings = scaler.fit_transform(embeddings)
+    
+    # Use K-means clustering to find natural groupings
+    n_clusters = min(5, n_samples // 20)  # Fewer clusters for binary classification
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42 + attack_idx, n_init=10)
+    cluster_labels = kmeans.fit_predict(normalized_embeddings)
+    
+    # Initialize binary labels
+    binary_labels = np.zeros(n_samples, dtype=np.float32)
+    
+    # Assign pseudo-labels based on clustering
+    for sample_idx in range(n_samples):
+        cluster_id = cluster_labels[sample_idx]
+        
+        # Calculate similarity to cluster centroid
+        cluster_centroid = kmeans.cluster_centers_[cluster_id]
+        similarity = cosine_similarity(
+            normalized_embeddings[sample_idx:sample_idx+1], 
+            cluster_centroid.reshape(1, -1)
+        )[0, 0]
+        
+        # Assign pseudo-label based on cluster characteristics
+        # Higher similarity = higher confidence in attack classification
+        if cluster_id == attack_idx % n_clusters:  # Assign specific cluster to this attack
+            base_prob = 0.7  # High probability for attack
+        else:
+            base_prob = 0.2  # Low probability for attack
+        
+        # Adjust based on similarity
+        similarity_bonus = similarity * 0.3
+        
+        # Add some randomness for diversity
+        random_factor = np.random.uniform(-0.1, 0.1)
+        
+        # Combine factors
+        final_prob = base_prob + similarity_bonus + random_factor
+        binary_labels[sample_idx] = np.clip(final_prob, 0.05, 0.95)
+    
+    # Apply label smoothing
+    binary_labels = binary_labels * 0.9 + 0.05
+    
+    # Add controlled noise
+    noise = np.random.normal(0, 0.02, binary_labels.shape)
+    binary_labels = np.clip(binary_labels + noise, 0, 1)
+    
+    print(f"✅ Generated pseudo-labels for {attack_type}")
+    print(f"📊 Attack samples: {np.sum(binary_labels > 0.5)}/{len(binary_labels)}")
+    
+    return binary_labels
+
+
+def train_single_attack_model(
+    model: UnsupervisedMultiLabelTransformer,
+    embeddings: np.ndarray,
+    binary_labels: np.ndarray,
+    attack_type: str,
+    config: SystemConfig,
+    tracker: ProgressTracker,
+    log_type: str,
+) -> UnsupervisedMultiLabelTransformer:
+    """
+    Train a single model for one attack type using normal log data.
+    """
+    device = torch.device(config.device)
+    
+    # Enhanced architecture parameters
+    embedding_dim = embeddings.shape[1]
+    if embedding_dim <= 300:  # FastText
+        latent_dim = 256
+        transformer_layers = 3
+        attention_heads = 8
+    elif embedding_dim <= 768:  # Standard BERT
+        latent_dim = 384
+        transformer_layers = 4
+        attention_heads = 8
+    else:  # Enhanced LogBERT (2314D)
+        latent_dim = 512
+        transformer_layers = 6
+        attention_heads = 16
+
+    # Optimized batch sizes
+    if config.device == "mps":
+        if embedding_dim <= 300:
+            batch_size = min(128, max(32, int(config.gpu_memory_gb * 2)))
+        elif embedding_dim <= 768:
+            batch_size = min(64, max(16, int(config.gpu_memory_gb * 1.5)))
+        else:
+            batch_size = min(32, max(8, int(config.gpu_memory_gb * 1)))
+    elif config.device == "cuda":
+        if embedding_dim <= 300:
+            batch_size = min(32, max(8, int(config.gpu_memory_gb * 0.5)))
+        elif embedding_dim <= 768:
+            batch_size = min(16, max(4, int(config.gpu_memory_gb * 0.3)))
+        else:
+            batch_size = min(8, max(2, int(config.gpu_memory_gb * 0.2)))
+    else:
+        if embedding_dim <= 300:
+            batch_size = min(64, max(16, int(config.gpu_memory_gb * 1.5)))
+        elif embedding_dim <= 768:
+            batch_size = min(32, max(8, int(config.gpu_memory_gb * 1)))
+        else:
+            batch_size = min(16, max(4, int(config.gpu_memory_gb * 0.5)))
+
+    # Data setup
+    embeddings_tensor = torch.from_numpy(embeddings).float()
+    labels_tensor = torch.from_numpy(binary_labels).float().unsqueeze(1)  # [batch, 1]
+    dataset = TensorDataset(embeddings_tensor, labels_tensor)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    # Training setup
+    optimizer = optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=1e-5
+    )
+    
+    scaler = GradScaler() if config.device == "cuda" else None
+
+    # Enhanced scheduler
+    def lr_lambda(epoch):
+        warmup_epochs = 20
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        else:
+            return 0.5 * (
+                1 + np.cos(np.pi * (epoch - warmup_epochs) / (200 - warmup_epochs))
+            )
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    max_grad_norm = 0.5
+
+    # Training loop
+    model.train()
+    total_epochs = 200
+    patience = 20
+    patience_counter = 0
+    best_loss = float("inf")
+    best_model_state = None
+
+    print(f"🎯 Training {attack_type} model for {total_epochs} epochs")
+
+    for epoch in range(total_epochs):
+        epoch_start = time.time()
+        epoch_losses = []
+        epoch_recon_losses = []
+        epoch_class_losses = []
+
+        model.train()
+        for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = model(x_batch)
+            
+            # Enhanced loss computation
+            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+            
+            # Binary classification loss for this attack type
+            attack_scores = outputs["multi_label_scores"]  # [batch, 1]
+            
+            # Enhanced binary cross entropy with label smoothing
+            smoothed_targets = y_batch * 0.9 + 0.05
+            class_loss = F.binary_cross_entropy_with_logits(
+                attack_scores, smoothed_targets, reduction='mean'
+            )
+            
+            # Enhanced regularization
+            predictions = torch.sigmoid(attack_scores)
+            
+            # Confidence regularization
+            confidence_loss = torch.mean((predictions - 0.5).abs()) * 0.05
+            
+            # Entropy regularization
+            entropy_loss = -torch.mean(predictions * torch.log(predictions + 1e-8) + 
+                                     (1 - predictions) * torch.log(1 - predictions + 1e-8)) * 0.01
+            
+            # Total loss
+            total_loss = recon_loss + class_loss + confidence_loss + entropy_loss
+            
+            # Backward and optimize
+            if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                
+                epoch_losses.append(total_loss.item())
+                epoch_recon_losses.append(recon_loss.item())
+                epoch_class_losses.append(class_loss.item())
+                
+                # Progress tracking
+                if batch_idx % 20 == 0:
+                    progress_text = f"{attack_type} | Epoch {epoch+1}/{total_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {total_loss.item():.4f}"
+                    if hasattr(tracker, '_progress_spinner'):
+                        tracker._progress_spinner.text = progress_text
+                    else:
+                        tracker._progress_spinner = Halo(text=progress_text, spinner='dots')
+                        tracker._progress_spinner.start()
+            else:
+                print(f"      ⚠️ Invalid loss for batch {batch_idx+1}")
+
+        scheduler.step()
+
+        # Calculate epoch metrics
+        epoch_time = time.time() - epoch_start
+        avg_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
+        avg_recon_loss = np.mean(epoch_recon_losses) if epoch_recon_losses else float("nan")
+        avg_class_loss = np.mean(epoch_class_losses) if epoch_class_losses else float("nan")
+        
+        # Clean up progress spinner
+        if hasattr(tracker, '_progress_spinner'):
+            tracker._progress_spinner.stop()
+            delattr(tracker, '_progress_spinner')
+        
+        # Print progress every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print(f"✅ {attack_type} | Epoch {epoch+1}/{total_epochs} completed in {epoch_time:.1f}s")
+            print(f"📊 Loss: {avg_loss:.4f} | Recon: {avg_recon_loss:.4f} | Class: {avg_class_loss:.4f}")
+        
+        # Early stopping check
+        if not np.isnan(avg_loss) and avg_loss < best_loss - 1e-4:
+            best_loss = avg_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"🛑 Early stopping triggered for {attack_type} at epoch {epoch + 1}")
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+                print(f"✅ Restored best model for {attack_type} with loss: {best_loss:.4f}")
+            break
+
+    print(f"✅ Completed training for {attack_type}")
+    return model
+
+
+def train_model(
+    embeddings: np.ndarray,
+    classes: List[str],
+    C: np.ndarray,
+    config: SystemConfig,
+    tracker: ProgressTracker,
+    log_type: str,
+    scaler: "StandardScaler" = None,
+) -> Tuple[List[UnsupervisedMultiLabelTransformer], "StandardScaler"]:
     """Enhanced training with improved pseudo-label generation and model architecture"""
 
     device = torch.device(config.device)
@@ -1522,9 +1978,7 @@ def train_model(
     n_samples, n_classes = len(embeddings), len(classes) if classes else 1
     
     # Enhanced pseudo-label generation using multiple clustering approaches
-    from sklearn.cluster import KMeans, DBSCAN
-    from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.preprocessing import StandardScaler
+    # Note: sklearn imports are already available at the top of the file
     
     # Normalize embeddings for better clustering
     scaler = StandardScaler()
