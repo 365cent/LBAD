@@ -1826,137 +1826,30 @@ def train_model(
         # Simplified training - no complex pseudo-label refinement for speed
         pass
 
-        # Progress tracking for batches
+        # Ultra-minimal training loop to prevent hanging
         print(f"🔄 Starting epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            batch_start_time = time.time()
+            print(f"   📊 Processing batch {batch_idx+1}/{len(dataloader)}")
             
-            # Simplified progress logging every 50 batches for speed
-            if batch_idx % 50 == 0:
-                progress = (batch_idx + 1) / len(dataloader) * 100
-                print(f"   📊 {progress:.1f}% ({batch_idx+1}/{len(dataloader)} batches)")
-
-            # Add batch timeout protection
-            batch_timeout = 120  # 2 minutes per batch max
-            start_time = time.time()
-
-            # Initialize default loss variables in case batch is skipped
-            total_loss = torch.tensor(0.0, device=device)
-            recon_loss = torch.tensor(0.0, device=device)
-            label_loss = torch.tensor(0.0, device=device)
-            supervised_loss = torch.tensor(0.0, device=device)
-
-            try:
-                
-                # Ensure tensors are contiguous before GPU transfer to avoid misalignment
-                if not x_batch.is_contiguous():
-                    x_batch = x_batch.contiguous()
-                if not y_batch.is_contiguous():
-                    y_batch = y_batch.contiguous()
-
-                # Safe GPU transfer with error handling
-                try:
-                    x_batch = x_batch.to(device, non_blocking=False)
-                    y_batch = y_batch.to(device, non_blocking=False)
-                except RuntimeError as gpu_error:
-                    if "misaligned address" in str(gpu_error) or "CUDA" in str(gpu_error):
-                        # Force tensor alignment by cloning
-                        x_batch = x_batch.clone().contiguous().to(device, non_blocking=False)
-                        y_batch = y_batch.clone().contiguous().to(device, non_blocking=False)
-                    else:
-                        raise gpu_error
-
-                # Skip synchronization to prevent hanging
-                # CUDA sync removed to prevent blocking
-
-            except RuntimeError as batch_error:
-                if "misaligned address" in str(batch_error) or "out of memory" in str(batch_error):
-                    # Clear any corrupted GPU memory
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                        # torch.cuda.synchronize() removed to prevent hanging
-
-                    # Still track progress for skipped batch
-                    batch_time = time.time() - batch_start_time
-                    loss_info = {"total": 0.0, "skipped": True}
-                    
-                    continue  # Skip this batch and continue with next
-                else:
-                    raise batch_error
-
+            # Ensure data is on correct device
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            
+            # Simple training step
             optimizer.zero_grad()
-
-            # Clear memory periodically during training for CUDA
-            if config.device == "cuda" and batch_idx % 20 == 0:
-                clear_gpu_memory()
-
-            # Simplified training - no teacher network or FixMatch complexity
-
-            if scaler:
-                with autocast():
-                    # Simplified forward pass for maximum speed
-                    outputs = model(x_batch)  # No augmentation for speed
-                            
-                    # Simple loss computation for speed
-                    recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
-                    label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
-                    
-                    # Basic combined loss for speed and precision
-                    total_loss = recon_loss + label_loss
-
-                    # Simple loss validation for speed
-                    if torch.isnan(total_loss) or torch.isinf(total_loss):
-                        optimizer.zero_grad()
-                        continue
-
-                # Streamlined backward pass
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Simple clipping
-                scaler.step(optimizer)
-                scaler.update()
-
-                # No teacher network updates for speed
-
-            else:
-                # Simplified forward pass without mixed precision
-                outputs = model(x_batch)
-                
-                # Simple loss computation
-                recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
-                label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
-                total_loss = recon_loss + label_loss
-
-                # Simple validation
-                if torch.isnan(total_loss) or torch.isinf(total_loss):
-                    optimizer.zero_grad()
-                    continue
-
-                # Simple backward pass
+            outputs = model(x_batch)
+            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+            label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
+            total_loss = recon_loss + label_loss
+            
+            if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-
-            epoch_losses.append(total_loss.item())
-
-            # Calculate batch processing time and update progress tracking
-            batch_time = time.time() - batch_start_time
-
-            # Prepare loss info for progress display - safely handle undefined variables
-            loss_info = {
-                "total": total_loss.item(),
-            }
-
-            # Add individual loss components if they exist
-            if "recon_loss" in locals() and recon_loss is not None:
-                loss_info["recon"] = recon_loss.item()
-            if "label_loss" in locals() and label_loss is not None:
-                loss_info["label"] = label_loss.item()
-            if "supervised_loss" in locals() and supervised_loss is not None:
-                loss_info["sup"] = supervised_loss.item()
-
-            # Update batch progress with detailed tracking
-            
+                epoch_losses.append(total_loss.item())
+                print(f"      ✅ Loss: {total_loss.item():.4f}")
+            else:
+                print(f"      ⚠️ Invalid loss, skipping batch")
 
         scheduler.step()
 
