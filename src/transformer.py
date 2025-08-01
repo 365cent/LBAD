@@ -1787,7 +1787,7 @@ def train_model(
         # Simplified training - no complex anomaly scoring for speed
         # Advanced pseudo-label refinement with curriculum learning disabled for speed
 
-        # Simplified training loop
+                # Simplified training loop
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
             # Move tensors to device
             x_batch = x_batch.to(device)
@@ -1807,182 +1807,45 @@ def train_model(
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-            epoch_losses.append(total_loss.item())
-
-                # Progress output every 50 batches
-            if batch_idx % 50 == 0:
-                    print(f"    Batch {batch_idx}/{len(dataloader)}: Loss={total_loss.item():.4f}")
+                epoch_losses.append(total_loss.item())
+                print(f"    Batch {batch_idx+1}/{len(dataloader)}: Loss={total_loss.item():.4f}")
             else:
-                print(f"    ⚠️ Invalid loss at batch {batch_idx}, skipping")
+                print(f"    ⚠️ Invalid loss at batch {batch_idx+1}, skipping")
 
         scheduler.step()
 
-        # Calculate epoch time and update progress
+        # Calculate epoch metrics
         epoch_time = time.time() - epoch_start
-        progress_info = tracker.update_epoch_progress(epoch, epoch_time)
-
-        # Log metrics - handle case where no batches were successfully processed
-        if epoch_losses:
-            avg_loss = np.mean(epoch_losses)
-            successful_batches = len(epoch_losses)
-        else:
-            avg_loss = float("nan")  # Explicitly set NaN when no successful batches
-            successful_batches = 0
-
-        # Count total attempted batches
-        total_attempted_batches = len(dataloader)
-        skipped_batches = total_attempted_batches - successful_batches
-
-        # Early stopping check - only if we have valid losses
+        avg_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
+        
+        # Early stopping check
         if not np.isnan(avg_loss) and avg_loss < best_loss - min_delta:
             best_loss = avg_loss
             patience_counter = 0
-            # Save best model state
             best_model_state = model.state_dict().copy()
         else:
             patience_counter += 1
+            
+        print(f"✅ Epoch {epoch+1}/{total_epochs} completed in {epoch_time:.1f}s - Avg Loss: {avg_loss:.4f}")
 
-        # Enhanced checkpointing for supercomputer environments (every 5%)
-        progress_pct = ((epoch + 1) / total_epochs) * 100
-        if config.rank == 0 and (epoch + 1) % checkpoint_interval == 0:
+        # Simple checkpointing every 10 epochs
+        if (epoch + 1) % 10 == 0:
             try:
                 model_to_save = model.module if hasattr(model, "module") else model
-                checkpoint_metrics = {
-                    "avg_loss": avg_loss,
-                    "best_loss": best_loss,
-                    "patience_counter": patience_counter,
-                    "progress_pct": progress_pct,
-                    "epoch": epoch,
-                }
-
-                # Time estimation for supercomputer environment
-                if epoch > 0:
-                    elapsed_time = time.time() - tracker.start_time
-                    time_per_epoch = elapsed_time / (epoch + 1)
-                    remaining_epochs = total_epochs - (epoch + 1)
-                    eta_seconds = remaining_epochs * time_per_epoch
-
-                    if eta_seconds > 3600:
-                        eta_str = f"{eta_seconds / 3600:.1f}h"
-                    elif eta_seconds > 60:
-                        eta_str = f"{eta_seconds / 60:.1f}m"
-                    else:
-                        eta_str = f"{eta_seconds:.0f}s"
-
-                    # Enhanced progress for supercomputer
-                    
-                    
-
                 save_training_checkpoint(
-                    log_type,
-                    epoch,
-                    model_to_save.state_dict(),
-                    optimizer.state_dict(),
-                    checkpoint_metrics,
-                    training_hash,
-                    config,
+                    log_type, epoch, model_to_save.state_dict(),
+                    optimizer.state_dict(), {"avg_loss": avg_loss}, training_hash, config
                 )
-
-                # Save detailed progress information
-                additional_progress_info = {
-                    "checkpoint_saved": True,
-                    "checkpoint_epoch": epoch + 1,
-                    "n_batches_per_epoch": len(dataloader),
-                    "avg_batch_time": np.mean(tracker.batch_times[-100:])
-                    if len(tracker.batch_times) >= 10
-                    else 0,
-                }
-                tracker.save_checkpoint_progress(
-                    epoch, avg_loss, additional_progress_info
-                )
-
-                
             except Exception as e:
                 print(f"⚠️  Failed to save checkpoint: {e}")
 
-        # Log metrics with enhanced progress tracking
-        tracker.log_metrics(
-            epoch,
-            {
-                "avg_loss": avg_loss,
-                "best_loss": best_loss,
-                "patience_counter": patience_counter,
-                "learning_rate": scheduler.get_last_lr()[0],
-                "epoch_time": epoch_time,
-                "total_batches": total_attempted_batches,
-                "successful_batches": successful_batches,
-                "skipped_batches": skipped_batches,
-                "batch_success_rate": successful_batches / total_attempted_batches
-                if total_attempted_batches > 0
-                else 0.0,
-            },
-        )
-
-        # Print epoch summary for unsupervised learning
-        if successful_batches > 0:
-            print(
-                f"Epoch {epoch + 1}/50 - Loss: {avg_loss:.4f} - Batches: {successful_batches}/{total_attempted_batches} - Time: {epoch_time:.2f}s"
-            )
-        else:
-            print(
-                f"Epoch {epoch + 1}/50 - Training failed (all {skipped_batches} batches skipped) - Time: {epoch_time:.2f}s"
-            )
-
+        # Early stopping check
         if patience_counter >= patience:
-            if config.rank == 0:
-                if successful_batches == 0:
-                    print(
-                        f"Early stopping triggered at epoch {epoch + 1} - No valid training achieved"
-                    )
-                else:
-                    print(f"Early stopping triggered at epoch {epoch + 1}")
-            # Restore best model if we have one
+            print(f"🛑 Early stopping triggered at epoch {epoch + 1}")
             if best_model_state is not None:
                 model.load_state_dict(best_model_state)
-                if best_loss < float("inf"):
-                    print(f"Restored best model from epoch with loss: {best_loss:.4f}")
-                else:
-                    print(f"Restored best model (no valid loss recorded)")
-            else:
-                print(f"No best model saved - using current model")
+                print(f"✅ Restored best model with loss: {best_loss:.4f}")
             break
-
-        # Only log detailed loss components if we have valid training
-        if (
-            config.rank == 0 and successful_batches > 0
-        ):  # Only log from main process and if training occurred
-            # Create meaningful unsupervised metrics dictionary
-            unsupervised_metrics = {
-                "epoch": epoch,
-                "avg_loss": avg_loss,
-                "successful_batches": successful_batches,
-                "skipped_batches": skipped_batches,
-                "batch_success_rate": successful_batches / total_attempted_batches,
-                "lr": scheduler.get_last_lr()[0],
-                "epoch_time": epoch_time,
-                "status": "training" if successful_batches > 0 else "failed",
-            }
-
-            # Add loss components if they were computed
-            if "recon_loss" in locals() and not np.isnan(avg_loss):
-                unsupervised_metrics.update(
-                    {
-                        "recon_loss": recon_loss.item()
-                        if "recon_loss" in locals()
-                        else 0.0,
-                        "label_loss": label_loss.item()
-                        if "label_loss" in locals()
-                        else 0.0,
-                        "contrastive_loss": 0.0
-                        if "contrast_loss" not in locals()
-                        else contrast_loss.item(),
-                        "confidence_loss": confidence_loss.item()
-                        if "confidence_loss" in locals()
-                        else 0.0,
-                    }
-                )
-
-            tracker.log_metrics(epoch, unsupervised_metrics)
 
     # Clean up training checkpoints after completion (remove all temporary checkpoints)
     if config.rank == 0:
