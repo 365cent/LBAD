@@ -3,11 +3,11 @@
 Transformer Model Evaluation Pipeline
 ====================================
 
-Clean, focused evaluation of trained transformer models using the direct approach:
+Clean, focused evaluation of trained multi-label transformer models using the direct approach:
 
-1. Load trained UnsupervisedMultiLabelTransformer model
+1. Load trained UnsupervisedMultiLabelTransformer model (single model for all classes)
 2. Load LogBERT embeddings and true labels  
-3. Run forward pass through model to get predictions
+3. Run forward pass through model to get multi-label predictions
 4. Compute standard supervised metrics (F1, Hamming loss, etc.)
 5. Optional per-class threshold optimization
 
@@ -44,7 +44,7 @@ from src.transformer import UnsupervisedMultiLabelTransformer, SystemConfig, det
 
 
 class TransformerEvaluator:
-    """Clean transformer model evaluator using direct supervised approach"""
+    """Clean multi-label transformer model evaluator using direct supervised approach"""
     
     def __init__(self, config: SystemConfig):
         self.config = config
@@ -103,12 +103,12 @@ class TransformerEvaluator:
         # Rebuild model with same architecture
         model = UnsupervisedMultiLabelTransformer(
             input_dim=input_dim,
-            latent_dim=ckpt.get('latent_dim', 512),
+            latent_dim=ckpt.get('latent_dim', 256),  # Updated default for multi-label
             n_labels=len(classes),
             n_clusters=min(8, len(classes)),
-            dropout=0.1,
-            transformer_layers=ckpt.get('transformer_layers', 12),
-            attention_heads=ckpt.get('attention_heads', 16)
+            dropout=0.05,  # Updated default for multi-label
+            transformer_layers=ckpt.get('transformer_layers', 2),  # Updated default for multi-label
+            attention_heads=ckpt.get('attention_heads', 4)  # Updated default for multi-label
         )
         
         # Load weights
@@ -172,7 +172,7 @@ class TransformerEvaluator:
     
     def predict(self, model: UnsupervisedMultiLabelTransformer, X: np.ndarray, 
                 batch_size: int = 64) -> Tuple[np.ndarray, np.ndarray]:
-        """Run forward pass and get predictions"""
+        """Run forward pass and get multi-label predictions"""
         print(f"🤖 Generating predictions...")
         
         predictions = []
@@ -182,7 +182,7 @@ class TransformerEvaluator:
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
                 batch = torch.from_numpy(X[i:i+batch_size]).float().to(self.device)
-                logits = model(batch)["labels"]
+                logits = model(batch)["multi_label_scores"]
                 batch_probs = torch.sigmoid(logits).cpu().numpy()
                 
                 probs.append(batch_probs)
@@ -197,6 +197,9 @@ class TransformerEvaluator:
                           classes: List[str]) -> np.ndarray:
         """
         Advanced per-class threshold optimization for highly imbalanced multi-label classification.
+        
+        Optimizes thresholds for each class independently in multi-label setting where
+        each sample can have multiple positive labels.
         
         Implements multiple strategies:
         1. F1-based optimization with fine-grained search
@@ -381,8 +384,7 @@ class TransformerEvaluator:
         print(f"\nEVALUATION RESULTS")
         print("-" * 40)
         print(f"Test samples: {metrics['n_samples']:,} | Classes: {len(classes)}")
-        print("
-PERFORMANCE METRICS:")
+        print("\nPERFORMANCE METRICS:")
         print(f"  Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
         print(f"  Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f}")
         print(f"  Hamming Loss:     {metrics['hamming_loss']:.4f}")
@@ -394,8 +396,7 @@ PERFORMANCE METRICS:")
         print(f"  Micro Recall:     {metrics['micro_recall']:.4f}")
         print(f"  Macro Recall:     {metrics['macro_recall']:.4f}")
         
-        print("
-PER-CLASS METRICS:")
+        print("\nPER-CLASS METRICS:")
         print("-" * 60)
         print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
         print("-" * 60)
@@ -407,14 +408,12 @@ PER-CLASS METRICS:")
             support = metrics['per_class_support'][i]
             print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8}")
         
-        print("
-CLASSIFICATION REPORT:")
+        print("\nCLASSIFICATION REPORT:")
         print("-" * 60)
         report = classification_report(y_true, y_pred, target_names=classes, zero_division=0, digits=3)
         print(report)
         
-        print("
-ADDITIONAL ANALYSIS:")
+        print("\nADDITIONAL ANALYSIS:")
         print(f"  Average Predicted Labels per Sample: {metrics['avg_predicted_labels']:.2f}")
         print(f"  Average True Labels per Sample:    {metrics['avg_true_labels']:.2f}")
         print(f"  Samples with No Predicted Labels:  {metrics['samples_no_pred_labels']:,}")
@@ -525,7 +524,7 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained transformer model(s)")
+    parser = argparse.ArgumentParser(description="Evaluate trained multi-label transformer model(s)")
     parser.add_argument("--log-type", type=str, 
                        help="Log type to evaluate (e.g., wp-access, wp-error). If not specified, evaluates all available types.")
     parser.add_argument("--model-path", type=str, 
@@ -550,7 +549,7 @@ def main():
             print("Expected structure: embeddings/<log-type>/log_<log-type>.pkl and label_<log-type>.pkl")
             return
     
-    print("Transformer Model Evaluation")
+    print("Multi-Label Transformer Model Evaluation")
     print("=" * 60)
     print(f"Log types: {', '.join(log_types)}")
     print(f"Device: {config.device} | Node: {config.node_name}")
