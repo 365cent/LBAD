@@ -256,7 +256,7 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         dropout: float = 0.1,
         transformer_layers: int = 2,
         attention_heads: int = 8,
-        attack_type_idx: int = 0,  # Which attack type this model handles
+        # attack_type_idx parameter removed - not needed for multi-label approach
         **kwargs,
     ):
         super().__init__()
@@ -268,7 +268,7 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.transformer_layers = transformer_layers
         self.attention_heads = attention_heads
         self.dropout = dropout
-        self.attack_type_idx = attack_type_idx  # Which attack type this model handles
+        # attack_type_idx removed - not needed for multi-label approach
 
         # Input projection
         self.input_projection = nn.Linear(input_dim, latent_dim)
@@ -284,9 +284,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
             ) for _ in range(transformer_layers)
         ])
         
-        # Output heads - binary classification for this attack type
+        # Output heads - multi-label classification for all attack types
         self.decoder = nn.Linear(latent_dim, input_dim)
-        self.classifier = nn.Linear(latent_dim, 1)  # Binary: normal vs attack for this type
+        self.classifier = nn.Linear(latent_dim, n_labels)  # Multi-label: one output per class
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -347,7 +347,7 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         return {
             "latent": latent,
             "reconstructed": reconstructed,
-            "labels": labels,
+            "multi_label_scores": labels,  # Multi-label scores
             "clusters": torch.zeros(batch_size, self.n_clusters, device=device),
             "contrastive": latent,
             "prototype": latent,
@@ -1419,7 +1419,7 @@ def train_model(
         dropout=0.05,  # Reduced dropout for speed
         transformer_layers=transformer_layers,
         attention_heads=attention_heads,
-        attack_type_idx=0,  # Not used in multi-label approach
+        # attack_type_idx parameter removed - not needed for multi-label approach
     ).to(device)
     
     print(f"🎯 Training single multi-label model for {n_labels} attack types")
@@ -1939,16 +1939,12 @@ def train_model(
             with torch.no_grad():
                 embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
                 
-                # Get predictions from each model
-                all_predictions = []
-                for attack_type_idx, model in enumerate(models):
-                    model.eval()
-                    outputs = model(embeddings_tensor)
-                    attack_scores = torch.sigmoid(outputs["attack_score"]).cpu().numpy()
-                    all_predictions.append(attack_scores)
-                
-                # Combine predictions: [attack_type_0, attack_type_1, attack_type_2, ...]
-                probs = np.concatenate(all_predictions, axis=1)  # Shape: (n_samples, n_attack_types)
+                # Get predictions from single multi-label model
+                model = models[0]  # Single model for all classes
+                model.eval()
+                outputs = model(embeddings_tensor)
+                multi_label_scores = outputs["multi_label_scores"]  # [batch, n_labels]
+                probs = torch.sigmoid(multi_label_scores).cpu().numpy()  # Shape: (n_samples, n_labels)
                 preds = (probs >= 0.5).astype(int)
 
             # Prepare prediction dictionary
@@ -4960,12 +4956,12 @@ def process_log_type_with_args(
                 text=f"Saving models for {log_type}...", spinner="dots"
             ) as spinner:
                 model_paths = []
-                for attack_type_idx, model in enumerate(models):
-                    model_path = save_model_after_training(
-                        model, classes, config, log_type, total_training_time, scaler
-                    )
-                    model_paths.append(model_path)
-                spinner.succeed(f"All {len(models)} models saved successfully")
+                model = models[0]  # Single multi-label model
+                model_path = save_model_after_training(
+                    model, classes, config, log_type, total_training_time, scaler
+                )
+                model_paths.append(model_path)
+                spinner.succeed(f"Multi-label model saved successfully")
 
         tracker.log_step(
             "Completion", {"status": "success", "training_time": total_training_time}
