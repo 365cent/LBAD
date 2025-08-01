@@ -66,6 +66,7 @@ from datetime import datetime
 from dataclasses import dataclass
 
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -327,7 +328,7 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         
         # Process through simple blocks
         for block in self.blocks:
-            z = block(z)
+                    z = block(z)
         
         # Decode and classify
         reconstructed = self.decoder(z)
@@ -335,8 +336,8 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         
         # Return minimal required outputs
         return {
-            "reconstructed": reconstructed,
-            "labels": labels,
+                "reconstructed": reconstructed,
+                "labels": labels,
         }
     
     def _safe_fallback_output(self, x):
@@ -1835,7 +1836,6 @@ def train_model(
         pass
 
         # Ultra-minimal training loop with detailed debugging
-        import time
         print(f"🔄 Starting epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
         
         dataloader_start = time.time()
@@ -1852,7 +1852,7 @@ def train_model(
             
             print(f"[DEBUG] Calling optimizer.zero_grad()...")
             optimizer.zero_grad()
-            
+
             print(f"[DEBUG] Calling model forward pass...")
             forward_start = time.time()
             outputs = model(x_batch)
@@ -1860,7 +1860,7 @@ def train_model(
             print(f"[DEBUG] Forward pass completed in {forward_time:.3f}s")
             
             print(f"[DEBUG] Computing losses...")
-            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+                    recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
             total_loss = recon_loss + label_loss
             print(f"[DEBUG] Losses computed: recon={recon_loss.item():.4f}, label={label_loss.item():.4f}")
@@ -1872,7 +1872,7 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 print(f"[DEBUG] Optimizer step...")
                 optimizer.step()
-                epoch_losses.append(total_loss.item())
+            epoch_losses.append(total_loss.item())
                 batch_time = time.time() - batch_start
                 print(f"      ✅ Loss: {total_loss.item():.4f} (batch time: {batch_time:.3f}s)")
             else:
