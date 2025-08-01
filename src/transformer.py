@@ -67,6 +67,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import time
+import signal
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1356,6 +1358,15 @@ def train_model(
     scaler: "StandardScaler" = None,
 ) -> Tuple[UnsupervisedMultiLabelTransformer, "StandardScaler"]:
     """Simplified, high-performance training optimized for speed and precision"""
+    
+    # Add signal handler to allow Ctrl+C to work
+    def signal_handler(sig, frame):
+        print('\n🛑 Training interrupted by user (Ctrl+C)')
+        print('💾 Attempting to save current progress...')
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    print("🔧 Signal handler installed - Ctrl+C will work to stop training")
 
     device = torch.device(config.device)
     n_labels = len(classes) if classes else 1
@@ -1495,9 +1506,28 @@ def train_model(
     # Data setup - use ALL data for training (no splitting)
     # Create tensors on device directly to avoid expensive transfers
     print(f"[DEBUG] Creating tensors directly on {device}...")
-    embeddings_tensor = torch.from_numpy(embeddings).float().contiguous().to(device)
-    labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous().to(device)
-    print(f"[DEBUG] Tensors created on device: embeddings={embeddings_tensor.shape}, labels={labels_tensor.shape}")
+    
+    # Add timeout for tensor creation
+    start_time = time.time()
+    try:
+        embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
+        print(f"[DEBUG] NumPy->Torch conversion completed in {time.time()-start_time:.3f}s")
+        
+        start_time = time.time()
+        embeddings_tensor = embeddings_tensor.to(device)
+        print(f"[DEBUG] Tensor moved to {device} in {time.time()-start_time:.3f}s")
+        
+        start_time = time.time()
+        labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous().to(device)
+        print(f"[DEBUG] Labels tensor created in {time.time()-start_time:.3f}s")
+        
+        print(f"[DEBUG] Tensors created successfully: embeddings={embeddings_tensor.shape}, labels={labels_tensor.shape}")
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR in tensor creation: {e}")
+        print("🔄 Falling back to CPU mode...")
+        device = torch.device("cpu")
+        embeddings_tensor = torch.from_numpy(embeddings).float().contiguous()
+        labels_tensor = torch.from_numpy(current_pseudo_labels).float().contiguous()
 
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
@@ -1806,7 +1836,16 @@ def train_model(
         dataloader_start = time.time()
         print(f"[DEBUG] About to iterate dataloader at {time.strftime('%H:%M:%S')}")
         
+        # Add safety timeout for DataLoader iteration
+        dataloader_timeout = 30  # 30 seconds max per batch
+        
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+            iteration_start = time.time()
+            
+            # Check for timeout on DataLoader iteration
+            if time.time() - dataloader_start > dataloader_timeout:
+                print(f"⚠️ DataLoader iteration timeout after {dataloader_timeout}s - breaking loop")
+                break
             batch_start = time.time()
             print(f"[{time.strftime('%H:%M:%S')}] 📊 Processing batch {batch_idx+1}/{len(dataloader)}")
             
