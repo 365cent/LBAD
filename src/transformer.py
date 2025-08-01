@@ -264,6 +264,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.n_labels = n_labels
         self.n_clusters = n_clusters
+        self.transformer_layers = transformer_layers  # Store for model saving
+        self.attention_heads = attention_heads  # Store for model saving
+        self.dropout = dropout  # Store for model saving
 
         # Ultra-minimal single layers to prevent hanging
         self.encoder = nn.Linear(input_dim, latent_dim)
@@ -1416,13 +1419,13 @@ def train_model(
         },
     )
 
-    # Multi-GPU setup - TEMPORARILY DISABLED FOR DEBUGGING
+    # Multi-GPU setup
     print(f"[DEBUG] Multi-GPU setup: distributed={config.is_distributed}, n_gpus={config.n_gpus}")
     if config.is_distributed:
         model = DDP(model, device_ids=[config.rank])
     elif config.n_gpus > 1:
-        print(f"[DEBUG] SKIPPING DataParallel for debugging (would use {config.n_gpus} GPUs)")
-        # model = nn.DataParallel(model)  # TEMPORARILY DISABLED
+        print(f"[DEBUG] Using DataParallel with {config.n_gpus} GPUs")
+        model = nn.DataParallel(model)
 
     # Training information and CUDA warnings
     use_mixed_precision = config.device == "cuda"  # Mixed precision only on CUDA
@@ -1818,7 +1821,10 @@ def train_model(
 
             print(f"[DEBUG] Calling ULTRA-MINIMAL model forward pass...")
             print(f"[DEBUG] Model type: {type(model).__name__}")
-            print(f"[DEBUG] Model components: encoder={type(model.encoder).__name__}, decoder={type(model.decoder).__name__}")
+            
+            # Handle DataParallel wrapper for debug info
+            actual_model = model.module if hasattr(model, 'module') else model
+            print(f"[DEBUG] Model components: encoder={type(actual_model.encoder).__name__}, decoder={type(actual_model.decoder).__name__}")
             
             forward_start = time.time()
             outputs = model(x_batch)
