@@ -1800,7 +1800,7 @@ def train_model(
 
     # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
-    total_epochs = 200
+    total_epochs = 500  # Increased epochs for better convergence
 
     # Initialize progress tracking with batch information
     total_batches_per_epoch = len(dataloader)
@@ -1811,7 +1811,9 @@ def train_model(
 
     # Early stopping parameters - more patient for longer training
     patience_counter = 0
-    min_delta = 1e-5  # Smaller minimum improvement threshold
+    patience = 50  # Increased patience for longer training
+    min_delta = 1e-4  # Minimum improvement threshold
+    best_loss = float("inf")
 
     for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
@@ -1890,10 +1892,14 @@ def train_model(
                 optimizer.step()
                 epoch_losses.append(total_loss.item())
                 
-                # Progress tracking
-                if batch_idx % 10 == 0:
-                    print(f"      Batch {batch_idx+1}: Loss={total_loss.item():.4f} "
-                          f"(recon={recon_loss.item():.4f}, ml={multi_label_loss.item():.4f})")
+                # Progress tracking with Halo spinner
+                if batch_idx % 50 == 0:  # Update less frequently
+                    progress_text = f"Epoch {epoch+1}/{total_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {total_loss.item():.4f}"
+                    if hasattr(tracker, '_progress_spinner'):
+                        tracker._progress_spinner.text = progress_text
+                    else:
+                        tracker._progress_spinner = Halo(text=progress_text, spinner='dots')
+                        tracker._progress_spinner.start()
             else:
                 print(f"      ⚠️ Invalid loss for batch {batch_idx+1}")
 
@@ -1903,15 +1909,24 @@ def train_model(
         epoch_time = time.time() - epoch_start
         avg_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
         
+
+            
+        # Clean up progress spinner
+        if hasattr(tracker, '_progress_spinner'):
+            tracker._progress_spinner.stop()
+            delattr(tracker, '_progress_spinner')
+        
+        print(f"✅ Epoch {epoch+1}/{total_epochs} completed in {epoch_time:.1f}s - Avg Loss: {avg_loss:.4f}")
+        
         # Early stopping check
         if not np.isnan(avg_loss) and avg_loss < best_loss - min_delta:
             best_loss = avg_loss
             patience_counter = 0
             best_model_state = model.state_dict().copy()
+            print(f"🎯 New best loss: {best_loss:.4f}")
         else:
             patience_counter += 1
-            
-        print(f"✅ Epoch {epoch+1}/{total_epochs} completed in {epoch_time:.1f}s - Avg Loss: {avg_loss:.4f}")
+            print(f"⏳ No improvement for {patience_counter} epochs (best: {best_loss:.4f})")
 
         # Simple checkpointing every 10 epochs
         if (epoch + 1) % 10 == 0:
