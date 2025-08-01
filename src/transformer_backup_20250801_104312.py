@@ -1610,7 +1610,9 @@ def generate_pseudo_labels_for_attack_type(
     Generate pseudo-labels for a specific attack type using clustering.
     Returns binary labels: 1 for this attack type, 0 for normal.
     """
-    # Note: sklearn imports are already available at the top of the file
+    from sklearn.cluster import KMeans
+    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.preprocessing import StandardScaler
     
     print(f"🔍 Generating pseudo-labels for {attack_type}...")
     
@@ -1619,7 +1621,7 @@ def generate_pseudo_labels_for_attack_type(
     normalized_embeddings = scaler.fit_transform(embeddings)
     
     # Use K-means clustering to find natural groupings
-    n_clusters = max(2, min(5, n_samples // 20))  # Ensure at least 2 clusters
+    n_clusters = min(5, n_samples // 20)  # Fewer clusters for binary classification
     kmeans = KMeans(n_clusters=n_clusters, random_state=42 + attack_idx, n_init=10)
     cluster_labels = kmeans.fit_predict(normalized_embeddings)
     
@@ -1976,9 +1978,7 @@ def train_model(
     n_samples, n_classes = len(embeddings), len(classes) if classes else 1
     
     # Enhanced pseudo-label generation using multiple clustering approaches
-    from sklearn.cluster import KMeans, DBSCAN
-    from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.preprocessing import StandardScaler
+    # Note: sklearn imports are already available at the top of the file
     
     # Normalize embeddings for better clustering
     scaler = StandardScaler()
@@ -1988,7 +1988,7 @@ def train_model(
     pseudo_labels = np.zeros((n_samples, n_classes), dtype=np.float32)
     
     # Approach 1: K-means clustering
-    n_clusters_kmeans = max(2, min(n_classes * 2, n_samples // 20))  # Ensure at least 2 clusters
+    n_clusters_kmeans = min(n_classes * 2, n_samples // 20)  # More clusters for better coverage
     kmeans = KMeans(n_clusters=n_clusters_kmeans, random_state=42, n_init=10)
     kmeans_labels = kmeans.fit_predict(normalized_embeddings)
     
