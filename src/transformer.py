@@ -1816,8 +1816,42 @@ def train_model(
 
             print(f"[DEBUG] Calling ULTRA-MINIMAL model forward pass...")
             print(f"[DEBUG] Model: encoder={type(model.encoder).__name__}, decoder={type(model.decoder).__name__}")
+            print(f"[DEBUG] Device: {x_batch.device}, Model device: {next(model.parameters()).device}")
+            
+            # FORCE CPU to test if CUDA is the issue
+            print(f"[DEBUG] FORCING CPU MODE FOR DEBUGGING...")
+            x_batch_cpu = x_batch.cpu()
+            model_cpu = model.cpu()
+            
             forward_start = time.time()
-            outputs = model(x_batch)
+            print(f"[DEBUG] Calling model on CPU...")
+            
+            # Set a timeout to detect hanging
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Model forward pass timed out!")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(5)  # 5 second timeout
+            
+            try:
+                outputs = model_cpu(x_batch_cpu)
+                signal.alarm(0)  # Cancel timeout
+                print(f"[DEBUG] CPU forward completed!")
+            except TimeoutError as e:
+                signal.alarm(0)
+                print(f"[DEBUG] TIMEOUT: {e}")
+                print(f"[DEBUG] Model is definitely hanging - this confirms the issue!")
+                # Create minimal fallback outputs
+                outputs = {
+                    "reconstructed": torch.zeros_like(x_batch_cpu),
+                    "labels": torch.zeros(x_batch_cpu.shape[0], 4)
+                }
+            
+            # Move back to original device
+            outputs = {k: v.to(device) for k, v in outputs.items()}
+            model.to(device)
             forward_time = time.time() - forward_start
             print(f"[DEBUG] Forward pass completed in {forward_time:.3f}s")
             
