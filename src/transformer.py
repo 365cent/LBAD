@@ -1800,7 +1800,7 @@ def train_model(
 
     # Training loop with progress tracking, early stopping, and checkpointing
     model.train()
-    total_epochs = 30  # Reduced epochs for faster training with higher LR
+    total_epochs = 200
 
     # Initialize progress tracking with batch information
     total_batches_per_epoch = len(dataloader)
