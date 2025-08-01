@@ -1860,7 +1860,7 @@ def train_model(
             print(f"[DEBUG] Forward pass completed in {forward_time:.3f}s")
             
             print(f"[DEBUG] Computing losses...")
-                    recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
             total_loss = recon_loss + label_loss
             print(f"[DEBUG] Losses computed: recon={recon_loss.item():.4f}, label={label_loss.item():.4f}")
