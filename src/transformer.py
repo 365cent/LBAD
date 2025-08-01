@@ -1796,12 +1796,18 @@ def train_model(
     print("⚙️ Training setup complete. Entering main training loop...")
 
     # Training loop with progress tracking, early stopping, and checkpointing
+    print(f"[DEBUG] Setting model to train mode...")
     model.train()
     total_epochs = 30  # Reduced epochs for faster training with higher LR
 
     # Initialize progress tracking with batch information
+    print(f"[DEBUG] Checking dataloader length...")
     total_batches_per_epoch = len(dataloader)
+    print(f"[DEBUG] Dataloader has {total_batches_per_epoch} batches")
+    
+    print(f"[DEBUG] Starting progress tracker...")
     tracker.start_training(total_epochs, total_batches_per_epoch)
+    print(f"[DEBUG] Progress tracker started")
 
     refinement_interval = 999  # Disable pseudo-label refinement for speed  
     checkpoint_interval = 10  # Less frequent checkpointing for speed  # Save checkpoint every 5 epochs (5% progress)
@@ -1810,7 +1816,9 @@ def train_model(
     patience_counter = 0
     min_delta = 1e-5  # Smaller minimum improvement threshold
 
+    print(f"[DEBUG] About to start epoch loop: {start_epoch} to {total_epochs}")
     for epoch in range(start_epoch, total_epochs):
+        print(f"[DEBUG] Starting epoch {epoch}")
         epoch_start = time.time()
         epoch_losses = []
 
@@ -1826,30 +1834,52 @@ def train_model(
         # Simplified training - no complex pseudo-label refinement for speed
         pass
 
-        # Ultra-minimal training loop to prevent hanging
+        # Ultra-minimal training loop with detailed debugging
+        import time
         print(f"🔄 Starting epoch {epoch+1}/{total_epochs} with {len(dataloader)} batches...")
+        
+        dataloader_start = time.time()
+        print(f"[DEBUG] About to iterate dataloader at {time.strftime('%H:%M:%S')}")
+        
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            print(f"   📊 Processing batch {batch_idx+1}/{len(dataloader)}")
+            batch_start = time.time()
+            print(f"[{time.strftime('%H:%M:%S')}] 📊 Processing batch {batch_idx+1}/{len(dataloader)}")
             
-            # Ensure data is on correct device
+            print(f"[DEBUG] Moving tensors to device...")
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
+            print(f"[DEBUG] Tensors moved. Shapes: x={x_batch.shape}, y={y_batch.shape}")
             
-            # Simple training step
+            print(f"[DEBUG] Calling optimizer.zero_grad()...")
             optimizer.zero_grad()
+            
+            print(f"[DEBUG] Calling model forward pass...")
+            forward_start = time.time()
             outputs = model(x_batch)
+            forward_time = time.time() - forward_start
+            print(f"[DEBUG] Forward pass completed in {forward_time:.3f}s")
+            
+            print(f"[DEBUG] Computing losses...")
             recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
             label_loss = F.binary_cross_entropy_with_logits(outputs["labels"], y_batch)
             total_loss = recon_loss + label_loss
+            print(f"[DEBUG] Losses computed: recon={recon_loss.item():.4f}, label={label_loss.item():.4f}")
             
             if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+                print(f"[DEBUG] Starting backward pass...")
                 total_loss.backward()
+                print(f"[DEBUG] Gradient clipping...")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                print(f"[DEBUG] Optimizer step...")
                 optimizer.step()
                 epoch_losses.append(total_loss.item())
-                print(f"      ✅ Loss: {total_loss.item():.4f}")
+                batch_time = time.time() - batch_start
+                print(f"      ✅ Loss: {total_loss.item():.4f} (batch time: {batch_time:.3f}s)")
             else:
                 print(f"      ⚠️ Invalid loss, skipping batch")
+        
+        dataloader_time = time.time() - dataloader_start
+        print(f"[DEBUG] Dataloader iteration completed in {dataloader_time:.3f}s")
 
         scheduler.step()
 
