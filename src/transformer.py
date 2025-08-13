@@ -1493,22 +1493,76 @@ def train_model(
     all_predictions = []
     all_probabilities = []
     
-    for attack_idx, attack_type in enumerate(classes):
+    # Add a normal/benign class to the attack types
+    all_classes = classes + ['normal']
+    
+    for class_idx, class_type in enumerate(all_classes):
         print(f"\n{'='*60}")
-        print(f"🎯 Training model for attack type: {attack_type}")
+        print(f"🎯 Training model for class: {class_type}")
         print(f"{'='*60}")
         
-        # Create binary labels for this attack type (1 for this attack, 0 for normal)
+        # Create binary labels for this class (1 for this class, 0 for others)
         if true_labels is not None:
-            # Use true labels if available
-            binary_labels = true_labels[:, attack_idx].astype(np.float32)
-            print(f"📊 Using true labels for {attack_type}: {len(binary_labels)} samples")
+            if class_type == 'normal':
+                # Normal class: 1 if no attack present (all zeros), 0 otherwise
+                binary_labels = (np.sum(true_labels, axis=1) == 0).astype(np.float32)
+                print(f"📊 Normal class: {np.sum(binary_labels)} normal samples out of {len(binary_labels)} total")
+                
+                # Handle extreme imbalance for normal class
+                if np.sum(binary_labels) < 10:  # Very few normal samples
+                    print(f"⚠️  Extreme imbalance detected: only {np.sum(binary_labels)} normal samples!")
+                    print(f"🔧 Applying data augmentation for normal class...")
+                    
+                    # Create synthetic normal samples by slightly modifying existing normal samples
+                    normal_indices = np.where(binary_labels == 1)[0]
+                    if len(normal_indices) > 0:
+                        # Multiply normal samples to have at least 100 samples
+                        target_normal_samples = min(100, len(embeddings) // 10)
+                        multiplier = max(1, target_normal_samples // len(normal_indices))
+                        
+                        # Add noise to create variations of normal samples
+                        normal_embeddings = embeddings[normal_indices]
+                        augmented_embeddings = []
+                        augmented_labels = []
+                        
+                        for _ in range(multiplier):
+                            # Add small amount of Gaussian noise
+                            noise = np.random.normal(0, 0.01, normal_embeddings.shape)
+                            noisy_embeddings = normal_embeddings + noise
+                            augmented_embeddings.append(noisy_embeddings)
+                            augmented_labels.extend([1.0] * len(normal_embeddings))
+                        
+                        if augmented_embeddings:
+                            # Update embeddings and labels with augmented data
+                            embeddings = np.vstack([embeddings] + augmented_embeddings)
+                            additional_attack_labels = np.zeros((len(np.vstack(augmented_embeddings)), len(classes)))
+                            true_labels = np.vstack([true_labels, additional_attack_labels])
+                            
+                            # Update binary labels
+                            binary_labels = np.concatenate([binary_labels, augmented_labels])
+                            
+                            print(f"✅ Added {len(np.vstack(augmented_embeddings))} synthetic normal samples")
+                            print(f"📊 New dataset size: {len(embeddings)} samples")
+            else:
+                # Attack class: use the corresponding column
+                attack_idx = classes.index(class_type)
+                binary_labels = true_labels[:, attack_idx].astype(np.float32)
+                print(f"📊 Attack class {class_type}: {np.sum(binary_labels)} attack samples out of {len(binary_labels)} total")
+            
+            print(f"📊 Binary distribution for {class_type}: {np.sum(binary_labels==0)} negative, {np.sum(binary_labels==1)} positive")
+            
+            # Check for extreme imbalance and warn
+            positive_ratio = np.sum(binary_labels) / len(binary_labels)
+            if positive_ratio > 0.95:
+                print(f"⚠️  High positive ratio ({positive_ratio:.1%}) - this class appears in most samples")
+            elif positive_ratio < 0.05:
+                print(f"⚠️  Low positive ratio ({positive_ratio:.1%}) - this class is very rare")
         else:
-            # Create pseudo-labels for this attack type using clustering
+            # Create pseudo-labels for this class type using clustering
             binary_labels = generate_pseudo_labels_for_attack_type(
-                embeddings, attack_type, attack_idx, n_samples=len(embeddings)
+                embeddings, class_type, class_idx, n_samples=len(embeddings)
             )
-            print(f"📊 Using pseudo-labels for {attack_type}: {len(binary_labels)} samples")
+            print(f"📊 Using pseudo-labels for {class_type}: {len(binary_labels)} samples")
         
         print(f"🔍 Debug: embeddings shape {embeddings.shape}, binary_labels shape {binary_labels.shape}")
         
@@ -1557,37 +1611,82 @@ def train_model(
         
         # Train this model
         trained_model = train_single_attack_model(
-            model, embeddings, binary_labels, attack_type, config, tracker, log_type, enhanced_config
+            model, embeddings, binary_labels, class_type, config, tracker, log_type, enhanced_config
         )
         
-        # Generate predictions for this attack type
+        # Generate predictions for this class
         trained_model.eval()
         with torch.no_grad():
             embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
             outputs = trained_model(embeddings_tensor)
-            attack_scores = outputs["multi_label_scores"]  # [batch, 1]
-            attack_probs = torch.sigmoid(attack_scores).cpu().numpy().flatten()  # [batch]
-            attack_preds = (attack_probs >= 0.5).astype(int)
+            class_scores = outputs["multi_label_scores"]  # [batch, 1]
+            class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()  # [batch]
+            class_preds = (class_probs >= 0.5).astype(int)
         
         # Store results
         models.append(trained_model)
-        all_probabilities.append(attack_probs)
-        all_predictions.append(attack_preds)
+        all_probabilities.append(class_probs)
+        all_predictions.append(class_preds)
         
-        print(f"✅ Completed training for {attack_type}")
-        print(f"📊 Predictions: {np.sum(attack_preds)}/{len(attack_preds)} samples classified as {attack_type}")
+        print(f"✅ Completed training for {class_type}")
+        print(f"📊 Predictions: {np.sum(class_preds)}/{len(class_preds)} samples classified as {class_type}")
+        
+        # Show more detailed prediction analysis
+        if true_labels is not None:
+            if class_type == 'normal':
+                actual_normal = np.sum(np.sum(true_labels, axis=1) == 0)
+                predicted_normal = np.sum(class_preds)
+                print(f"📈 Normal class analysis: {actual_normal} actual vs {predicted_normal} predicted")
+            else:
+                attack_idx = classes.index(class_type)
+                actual_attack = np.sum(true_labels[:, attack_idx])
+                predicted_attack = np.sum(class_preds)
+                print(f"📈 {class_type} analysis: {actual_attack} actual vs {predicted_attack} predicted")
     
-    # Combine results from all models
+    # Combine results from all models (including normal class)
     print(f"\n{'='*60}")
-    print(f"🔗 Combining results from {len(models)} models")
+    print(f"🔗 Combining results from {len(models)} models (including normal class)")
     print(f"{'='*60}")
     
-    # Stack all predictions and probabilities
-    combined_predictions = np.column_stack(all_predictions)  # [n_samples, n_attack_types]
-    combined_probabilities = np.column_stack(all_probabilities)  # [n_samples, n_attack_types]
+    # Stack all predictions and probabilities (now includes normal class)
+    combined_predictions_with_normal = np.column_stack(all_predictions)  # [n_samples, n_classes+1]
+    combined_probabilities_with_normal = np.column_stack(all_probabilities)  # [n_samples, n_classes+1]
     
-    print(f"📊 Combined predictions shape: {combined_predictions.shape}")
-    print(f"📈 Combined probabilities shape: {combined_probabilities.shape}")
+    print(f"📊 Combined predictions shape (with normal): {combined_predictions_with_normal.shape}")
+    print(f"📈 Combined probabilities shape (with normal): {combined_probabilities_with_normal.shape}")
+    
+    # For compatibility with original format, create attack-only predictions (exclude normal class)
+    combined_predictions = combined_predictions_with_normal[:, :-1]  # Remove last column (normal)
+    combined_probabilities = combined_probabilities_with_normal[:, :-1]  # Remove last column (normal)
+    
+    # Convert one-vs-rest predictions to proper multi-label format
+    # If normal class is predicted with high confidence, suppress attack predictions
+    normal_probs = combined_probabilities_with_normal[:, -1]  # Last column is normal
+    normal_threshold = 0.7  # High confidence threshold for normal class
+    
+    # Create final multi-label predictions
+    final_predictions = combined_predictions.copy()
+    final_probabilities = combined_probabilities.copy()
+    
+    # If normal class is highly confident, suppress attack predictions
+    high_normal_confidence = normal_probs >= normal_threshold
+    final_predictions[high_normal_confidence] = 0  # Set all attacks to 0 for high normal confidence
+    
+    print(f"📊 Final multi-label predictions shape: {final_predictions.shape}")
+    print(f"📈 Final multi-label probabilities shape: {final_probabilities.shape}")
+    print(f"🔍 Samples with high normal confidence: {np.sum(high_normal_confidence)}/{len(high_normal_confidence)}")
+    
+    # Display prediction summary
+    if true_labels is not None:
+        print(f"\n📈 PREDICTION SUMMARY:")
+        actual_normal = np.sum(np.sum(true_labels, axis=1) == 0)
+        predicted_normal = np.sum(high_normal_confidence)
+        print(f"  Normal samples: {actual_normal} actual vs {predicted_normal} predicted")
+        
+        for i, class_name in enumerate(classes):
+            actual_attack = np.sum(true_labels[:, i])
+            predicted_attack = np.sum(final_predictions[:, i])
+            print(f"  {class_name}: {actual_attack} actual vs {predicted_attack} predicted")
     
     # Save combined results
     if config.rank == 0:
@@ -1599,13 +1698,19 @@ def train_model(
             # Generate sample IDs
             ids = np.arange(len(embeddings))
 
-            # Prepare prediction dictionary
+            # Prepare prediction dictionary with final processed predictions
             prediction_data = {
                 "ids": ids,
-                "probs": combined_probabilities,
-                "preds": combined_predictions,
+                "probs": final_probabilities,  # Use final processed probabilities
+                "preds": final_predictions,    # Use final processed predictions
                 "classes": classes,
                 "thresholds": np.ones(len(classes)) * 0.5,  # Default thresholds
+                # Include additional information for analysis
+                "normal_probs": normal_probs,
+                "high_normal_confidence": high_normal_confidence,
+                "all_classes": all_classes,  # Include normal class info
+                "raw_predictions_with_normal": combined_predictions_with_normal,
+                "raw_probabilities_with_normal": combined_probabilities_with_normal,
             }
             if true_labels is not None:
                 prediction_data["true_labels"] = true_labels
