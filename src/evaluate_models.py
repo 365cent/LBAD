@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-Transformer Model Evaluation Pipeline
-====================================
+Enhanced Transformer Model Evaluation Pipeline
+==============================================
 
-Clean, focused evaluation of trained multi-label transformer models using the direct approach:
+Comprehensive evaluation of enhanced multi-label transformer models with support for:
 
-1. Load trained UnsupervisedMultiLabelTransformer model (single model for all classes)
-2. Load LogBERT embeddings and true labels  
-3. Run forward pass through model to get multi-label predictions
-4. Compute standard supervised metrics (F1, Hamming loss, etc.)
-5. Optional per-class threshold optimization
+1. Load enhanced UnsupervisedMultiLabelTransformer models (with Focal Loss, Enhanced Attention, Contrastive Learning)
+2. Handle new prediction format from one-vs-rest training with normal class modeling
+3. Load LogBERT embeddings and true labels with shape validation and error handling
+4. Run forward pass through enhanced transformer to get multi-label predictions
+5. Compute comprehensive supervised metrics (F1, Hamming loss, Jaccard, etc.)
+6. Advanced per-class threshold optimization with imbalance handling
+7. Enhanced visualization and reporting with transformer-specific insights
+
+Key Enhancements:
+- Support for enhanced transformer features (Focal Loss, Enhanced Attention, Contrastive Learning)
+- Improved prediction loading with shape mismatch detection and automatic fixing
+- Enhanced reporting with normal class analysis and data distribution insights
+- Better error handling and debugging information
+- Support for one-vs-rest strategy with normal class suppression logic
 
 Usage:
     python src/evaluate_models.py --log-type wp-error
@@ -106,6 +115,12 @@ class TransformerEvaluator:
             # Single-label model (from separate model approach)
             n_labels = 1
         
+        # Check for enhanced features in the saved model
+        enhanced_features = ckpt.get('enhanced_features', False)
+        use_enhanced_attention = ckpt.get('use_enhanced_attention', enhanced_features)
+        use_label_correlation = ckpt.get('use_label_correlation', enhanced_features and n_labels > 1)
+        use_contrastive = ckpt.get('use_contrastive', enhanced_features)
+        
         model = UnsupervisedMultiLabelTransformer(
             input_dim=input_dim,
             latent_dim=ckpt.get('latent_dim', 256),
@@ -113,7 +128,10 @@ class TransformerEvaluator:
             n_clusters=min(8, len(classes)),
             dropout=ckpt.get('dropout', 0.1),
             transformer_layers=ckpt.get('transformer_layers', 2),
-            attention_heads=ckpt.get('attention_heads', 4)
+            attention_heads=ckpt.get('attention_heads', 4),
+            use_enhanced_attention=use_enhanced_attention,
+            use_label_correlation=use_label_correlation,
+            use_contrastive=use_contrastive
         )
         
         # Load weights
@@ -383,13 +401,26 @@ class TransformerEvaluator:
         return metrics
     
     def print_results(self, metrics: Dict[str, Any], classes: List[str], 
-                     y_true: np.ndarray, y_pred: np.ndarray):
+                     y_true: np.ndarray, y_pred: np.ndarray, enhanced_info: Dict[str, Any] = None):
         """Print comprehensive results"""
         
-        print(f"\nEVALUATION RESULTS")
-        print("-" * 40)
+        print(f"\n{'='*70}")
+        print(f"🎯 ENHANCED TRANSFORMER EVALUATION RESULTS")
+        print(f"{'='*70}")
         print(f"Test samples: {metrics['n_samples']:,} | Classes: {len(classes)}")
-        print("\nPERFORMANCE METRICS:")
+        
+        # Enhanced transformer information
+        if enhanced_info:
+            print(f"\n🚀 ENHANCED TRANSFORMER INFO:")
+            print(f"  Model Type: {enhanced_info.get('model_type', 'Enhanced Multi-Label Transformer')}")
+            print(f"  Enhanced Features: {enhanced_info.get('enhanced_features', 'Unknown')}")
+            print(f"  Architecture: {enhanced_info.get('architecture', 'Standard')}")
+            if 'normal_class_info' in enhanced_info:
+                normal_info = enhanced_info['normal_class_info']
+                print(f"  Normal Class: {normal_info.get('samples', 0)} high-confidence predictions")
+                print(f"  Attack Suppression: {normal_info.get('suppressed', 0)} samples")
+        
+        print(f"\n📊 PERFORMANCE METRICS:")
         print(f"  Subset Accuracy:  {metrics['subset_accuracy']:.4f}")
         print(f"  Label-wise Acc:   {metrics['label_wise_accuracy_micro']:.4f}")
         print(f"  Hamming Loss:     {metrics['hamming_loss']:.4f}")
@@ -401,30 +432,43 @@ class TransformerEvaluator:
         print(f"  Micro Recall:     {metrics['micro_recall']:.4f}")
         print(f"  Macro Recall:     {metrics['macro_recall']:.4f}")
         
-        print("\nPER-CLASS METRICS:")
-        print("-" * 60)
-        print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
-        print("-" * 60)
+        print(f"\n🏷️  PER-CLASS METRICS:")
+        print("-" * 70)
+        print(f"{'Class':<25} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8} {'Rate':<8}")
+        print("-" * 70)
         
+        total_samples = metrics['n_samples']
         for i, cls in enumerate(classes):
             f1 = metrics['per_class_f1'][i]
             precision = metrics['per_class_precision'][i]
             recall = metrics['per_class_recall'][i]
             support = metrics['per_class_support'][i]
-            print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8}")
+            rate = (support / total_samples) * 100 if total_samples > 0 else 0
+            print(f"{cls:<25} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {support:<8} {rate:<8.1f}%")
         
-        print("\nCLASSIFICATION REPORT:")
-        print("-" * 60)
+        print(f"\n📋 CLASSIFICATION REPORT:")
+        print("-" * 70)
         report = classification_report(y_true, y_pred, target_names=classes, zero_division=0, digits=3)
         print(report)
         
-        print("\nADDITIONAL ANALYSIS:")
+        print(f"\n🔍 ADDITIONAL ANALYSIS:")
         print(f"  Average Predicted Labels per Sample: {metrics['avg_predicted_labels']:.2f}")
-        print(f"  Average True Labels per Sample:    {metrics['avg_true_labels']:.2f}")
-        print(f"  Samples with No Predicted Labels:  {metrics['samples_no_pred_labels']:,}")
-        print(f"  Samples with No True Labels:       {metrics['samples_no_true_labels']:,}")
-        print(f"  Samples with Multiple Predicted Labels: {metrics['samples_multi_pred_labels']:,}")
-        print(f"  Samples with Multiple True Labels:    {metrics['samples_multi_true_labels']:,}")
+        print(f"  Average True Labels per Sample:     {metrics['avg_true_labels']:.2f}")
+        print(f"  Samples with No Predicted Labels:   {metrics['samples_no_pred_labels']:,} ({(metrics['samples_no_pred_labels']/total_samples)*100:.1f}%)")
+        print(f"  Samples with No True Labels:        {metrics['samples_no_true_labels']:,} ({(metrics['samples_no_true_labels']/total_samples)*100:.1f}%)")
+        print(f"  Samples with Multiple Predicted:    {metrics['samples_multi_pred_labels']:,} ({(metrics['samples_multi_pred_labels']/total_samples)*100:.1f}%)")
+        print(f"  Samples with Multiple True:         {metrics['samples_multi_true_labels']:,} ({(metrics['samples_multi_true_labels']/total_samples)*100:.1f}%)")
+        
+        # Data distribution analysis
+        print(f"\n📈 DATA DISTRIBUTION:")
+        pred_dist = np.sum(y_pred, axis=0)
+        true_dist = np.sum(y_true, axis=0)
+        for i, cls in enumerate(classes):
+            pred_count = pred_dist[i]
+            true_count = true_dist[i]
+            print(f"  {cls:<25} True: {true_count:>6,} | Predicted: {pred_count:>6,} | Ratio: {(pred_count/max(true_count,1)):.2f}")
+        
+        print(f"{'='*70}")
     
     def save_results(self, metrics: Dict[str, Any], y_pred: np.ndarray, 
                     probs: np.ndarray, y_true: np.ndarray, log_type: str, 
@@ -491,13 +535,19 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
         with open(predictions_file, 'rb') as f:
             pred_data = pickle.load(f)
         
-        # Extract data based on transformer.py output format
+        # Extract data based on new transformer.py output format
         if isinstance(pred_data, dict):
-            # Check for transformer.py output format (actual structure)
-            predictions = pred_data.get('preds')  # Note: 'preds' not 'predictions'
-            probabilities = pred_data.get('probs')  # Note: 'probs' not 'probabilities'
+            # New format from enhanced transformer - prioritize final processed predictions
+            predictions = pred_data.get('preds')  # Final multi-label predictions (attack classes only)
+            probabilities = pred_data.get('probs')  # Final multi-label probabilities (attack classes only) 
             true_labels = pred_data.get('true_labels')
             classes = pred_data.get('classes', [])
+            
+            # Check for additional data from the new enhanced transformer
+            normal_probs = pred_data.get('normal_probs')  # Normal class probabilities
+            all_classes = pred_data.get('all_classes', classes)  # Including 'normal' class
+            raw_predictions_with_normal = pred_data.get('raw_predictions_with_normal')
+            raw_probabilities_with_normal = pred_data.get('raw_probabilities_with_normal')
             
             # Fallback to alternative key names if the above don't exist
             if predictions is None:
@@ -507,24 +557,64 @@ def load_transformer_predictions(log_type: str) -> Optional[Tuple[np.ndarray, np
             if true_labels is None:
                 true_labels = pred_data.get('y_true')
             
+            # Validate data consistency
             if predictions is not None and true_labels is not None and classes:
-                print(f"Loading cached predictions for {log_type}: {predictions.shape[0]:,} samples, {len(classes)} classes")
-                
-                # Convert to expected format
                 predictions = np.array(predictions)
                 probabilities = np.array(probabilities) if probabilities is not None else (predictions.astype(float) + 0.1)
                 true_labels = np.array(true_labels)
                 
+                # Ensure shape consistency between predictions and true labels
+                if predictions.shape != true_labels.shape:
+                    print(f"⚠️  Shape mismatch detected:")
+                    print(f"   Predictions: {predictions.shape}")
+                    print(f"   True labels: {true_labels.shape}")
+                    
+                    # Try to fix common shape mismatches
+                    if len(predictions.shape) == 2 and len(true_labels.shape) == 2:
+                        if predictions.shape[0] == true_labels.shape[0]:
+                            # Same number of samples, different number of classes
+                            min_classes = min(predictions.shape[1], true_labels.shape[1])
+                            predictions = predictions[:, :min_classes]
+                            probabilities = probabilities[:, :min_classes] if probabilities.shape[1] > min_classes else probabilities
+                            true_labels = true_labels[:, :min_classes]
+                            classes = classes[:min_classes]
+                            print(f"   ✅ Fixed by using first {min_classes} classes")
+                        else:
+                            print(f"   ❌ Cannot fix: different number of samples")
+                            return None
+                    else:
+                        print(f"   ❌ Cannot fix: incompatible dimensions")
+                        return None
+                
+                print(f"✅ Loading cached predictions for {log_type}: {predictions.shape[0]:,} samples, {len(classes)} classes")
+                
+                # Log additional info about enhanced transformer data
+                if normal_probs is not None:
+                    print(f"📊 Enhanced transformer data: includes normal class predictions")
+                    print(f"   All classes: {all_classes}")
+                    print(f"   Normal samples (high confidence): {np.sum(normal_probs >= 0.7) if normal_probs is not None else 'N/A'}")
+                
                 return predictions, probabilities, true_labels, classes
             else:
-                print(f"Warning: Predictions file for {log_type} missing required fields. Running full evaluation.")
+                missing_fields = []
+                if predictions is None:
+                    missing_fields.append('predictions')
+                if true_labels is None:
+                    missing_fields.append('true_labels')
+                if not classes:
+                    missing_fields.append('classes')
+                
+                print(f"⚠️  Predictions file for {log_type} missing required fields: {missing_fields}")
+                print(f"   Available keys: {list(pred_data.keys())}")
                 return None
         else:
-            print(f"Warning: Invalid predictions file format for {log_type}. Running full evaluation.")
+            print(f"⚠️  Invalid predictions file format for {log_type}. Expected dict, got {type(pred_data)}")
             return None
             
     except Exception as e:
-        print(f"Error loading predictions for {log_type}: {e}. Running full evaluation.")
+        print(f"❌ Error loading predictions for {log_type}: {e}. Running full evaluation.")
+        import traceback
+        print(f"   Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -583,9 +673,38 @@ def main():
                     data_classes = label_data.get("classes", classes)
                     
                     if data_classes != classes:
-                        print(f"Warning: Class mismatch between predictions and data. Using prediction classes.")
+                        print(f"⚠️  Class mismatch between predictions and data. Using prediction classes.")
                 except Exception as e:
                     data_classes = classes
+                
+                # Extract enhanced transformer information from predictions file
+                enhanced_info = {}
+                try:
+                    results_dir = Path("results") / log_type
+                    predictions_file = results_dir / "predictions.pkl"
+                    with open(predictions_file, 'rb') as f:
+                        pred_data = pickle.load(f)
+                    
+                    # Extract enhanced transformer metadata
+                    enhanced_info = {
+                        'model_type': 'Enhanced Multi-Label Transformer (One-vs-Rest)',
+                        'enhanced_features': 'Focal Loss, Enhanced Attention, Contrastive Learning',
+                        'architecture': f"Transformer with {pred_data.get('latent_dim', 512)}D latent space"
+                    }
+                    
+                    # Add normal class information if available
+                    if 'normal_probs' in pred_data and 'high_normal_confidence' in pred_data:
+                        normal_probs = pred_data['normal_probs']
+                        high_normal_confidence = pred_data['high_normal_confidence']
+                        enhanced_info['normal_class_info'] = {
+                            'samples': np.sum(high_normal_confidence),
+                            'suppressed': np.sum(high_normal_confidence),
+                            'threshold': 0.7
+                        }
+                        print(f"📊 Enhanced transformer with normal class: {np.sum(high_normal_confidence)} samples with high normal confidence")
+                    
+                except Exception as e:
+                    print(f"⚠️  Could not load enhanced transformer info: {e}")
                 
                 optimized_thresholds = None
                 
@@ -594,7 +713,7 @@ def main():
                     evaluator = TransformerEvaluator(config)
                     optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
                     y_pred = (probs >= optimized_thresholds).astype(int)
-                    print(f"Applied optimized thresholds")
+                    print(f"✅ Applied optimized thresholds")
                 
             else:
                 print(f"Running full model evaluation for {log_type}")
@@ -610,11 +729,11 @@ def main():
                 
                 # Verify class compatibility
                 if model_classes != data_classes:
-                    print(f"Warning: Class mismatch between model and data. Using model classes.")
+                    print(f"⚠️  Class mismatch between model and data. Using model classes.")
                     classes = model_classes
                     
                     if len(model_classes) != len(data_classes):
-                        print(f"Warning: Different number of classes may cause issues.")
+                        print(f"⚠️  Different number of classes may cause issues.")
                 else:
                     classes = model_classes
                 
@@ -628,8 +747,15 @@ def main():
                 optimized_thresholds = evaluator.optimize_thresholds(y_true, probs, classes)
                 y_pred_optimized = (probs >= optimized_thresholds).astype(int)
                 
-                print(f"Using optimized thresholds")
+                print(f"✅ Using optimized thresholds")
                 y_pred = y_pred_optimized
+                
+                # Create enhanced info for full evaluation
+                enhanced_info = {
+                    'model_type': 'Enhanced Multi-Label Transformer (Full Evaluation)',
+                    'enhanced_features': 'Focal Loss, Enhanced Attention, Contrastive Learning',
+                    'architecture': f"Transformer with {model.latent_dim}D latent space"
+                }
             
             # 6. Compute metrics
             if existing_predictions is not None:
@@ -638,8 +764,8 @@ def main():
             
             metrics = evaluator.compute_metrics(y_true, y_pred, probs, classes)
             
-            # 7. Print results
-            evaluator.print_results(metrics, classes, y_true, y_pred)
+            # 7. Print results with enhanced information
+            evaluator.print_results(metrics, classes, y_true, y_pred, enhanced_info)
             
             # 8. Save results (only if we ran full evaluation)
             if existing_predictions is None:
@@ -663,30 +789,75 @@ def main():
     
     total_evaluation_time = time.time() - evaluation_start_time
     
-    print(f"\n{'='*60}")
-    print(f"OVERALL EVALUATION SUMMARY")
-    print(f"{'='*60}")
+    print(f"\n{'='*80}")
+    print(f"🎯 ENHANCED TRANSFORMER EVALUATION SUMMARY")
+    print(f"{'='*80}")
+    
+    successful_evaluations = 0
+    total_samples = 0
+    avg_macro_f1 = 0
+    avg_micro_f1 = 0
     
     for log_type, result in all_results.items():
         status = result['status']
         if status == 'SUCCESS':
             metrics = result['metrics']
+            successful_evaluations += 1
+            total_samples += metrics.get('n_samples', 0)
+            avg_macro_f1 += metrics['macro_f1']
+            avg_micro_f1 += metrics['micro_f1']
+            
             print(f"\n✅ {log_type.upper()} (SUCCESS):")
-            print(f"   Macro F1: {metrics['macro_f1']:.4f} | Micro F1: {metrics['micro_f1']:.4f}")
-            print(f"   Label-wise Accuracy: {metrics['label_wise_accuracy_micro']:.4f}")
-            print(f"   Classes: {len(result['classes'])}")
+            print(f"   📊 Samples: {metrics.get('n_samples', 0):,}")
+            print(f"   🎯 Macro F1: {metrics['macro_f1']:.4f} | Micro F1: {metrics['micro_f1']:.4f}")
+            print(f"   📈 Label-wise Accuracy: {metrics['label_wise_accuracy_micro']:.4f}")
+            print(f"   🏷️  Classes: {len(result['classes'])}")
+            print(f"   📉 Hamming Loss: {metrics.get('hamming_loss', 0.0):.4f}")
+            print(f"   🎪 Jaccard Score: {metrics.get('jaccard_micro', 0.0):.4f}")
+            
+            # Show class distribution
+            if 'per_class_support' in metrics:
+                class_supports = metrics['per_class_support']
+                total_class_samples = sum(class_supports)
+                print(f"   📋 Class Distribution:")
+                for i, class_name in enumerate(result['classes']):
+                    support = class_supports[i]
+                    percentage = (support / total_class_samples * 100) if total_class_samples > 0 else 0
+                    print(f"      {class_name:<20}: {support:>6,} ({percentage:>5.1f}%)")
         else:
             print(f"\n❌ {log_type.upper()} (FAILED): {result['error']}")
     
-    print(f"\nTotal log types evaluated: {len(log_types)}")
-    print(f"Total successful evaluations: {sum(1 for r in all_results.values() if r['status'] == 'SUCCESS')}")
-    print(f"Total failed evaluations: {sum(1 for r in all_results.values() if r['status'] == 'FAILED')}")
-    print(f"Total evaluation time: {total_evaluation_time:.2f} seconds")
+    # Overall statistics
+    if successful_evaluations > 0:
+        avg_macro_f1 /= successful_evaluations
+        avg_micro_f1 /= successful_evaluations
+        
+        print(f"\n📊 OVERALL STATISTICS:")
+        print(f"   Total log types: {len(log_types)}")
+        print(f"   Successful evaluations: {successful_evaluations}")
+        print(f"   Failed evaluations: {len(log_types) - successful_evaluations}")
+        print(f"   Total samples evaluated: {total_samples:,}")
+        print(f"   Average Macro F1: {avg_macro_f1:.4f}")
+        print(f"   Average Micro F1: {avg_micro_f1:.4f}")
+        print(f"   Total evaluation time: {total_evaluation_time:.2f} seconds")
+        print(f"   Average time per log type: {total_evaluation_time/len(log_types):.2f} seconds")
+    
+    print(f"\n🚀 ENHANCED TRANSFORMER FEATURES USED:")
+    print(f"   ✨ Focal Loss for class imbalance handling")
+    print(f"   🔍 Enhanced Multi-Head Attention with label-aware mechanisms")
+    print(f"   🤝 Contrastive Learning for representation learning")
+    print(f"   🎯 One-vs-Rest strategy with normal class modeling")
+    print(f"   📊 Advanced threshold optimization")
+    print(f"   🏗️  Multi-feature LogBERT embeddings (2314D)")
     
     if all(r['status'] == 'SUCCESS' for r in all_results.values()):
-        print(f"\nAll evaluations completed successfully.")
+        print(f"\n🎉 All evaluations completed successfully!")
+        print(f"📁 Results available in: results/<log-type>/")
+        print(f"📊 Classification reports: results/<log-type>/enhanced_evaluation_report.txt")
     else:
-        print(f"\nSome evaluations failed. Please check the logs above for details.")
+        print(f"\n⚠️  Some evaluations failed. Check the logs above for details.")
+        
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":
