@@ -660,7 +660,13 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
 def main():
     parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained models")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
+    parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'fasttext')")
     args = parser.parse_args()
+
+    # Optionally route outputs to embeddings/<subdir>
+    global OUTPUT_DIR
+    if args.output_subdir:
+        OUTPUT_DIR = Path("embeddings") / args.output_subdir
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

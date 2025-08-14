@@ -1419,6 +1419,7 @@ def main():
     parser.add_argument("--force-restart", action="store_true", help="Force restart processing (ignore existing outputs)")
     parser.add_argument("--clean-checkpoints", action="store_true", help="Clean up all checkpoints before starting")
     parser.add_argument("--clean-incremental", action="store_true", help="Clean up incremental checkpoints only")
+    parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'logbert')")
     args = parser.parse_args()
     
     print("🔄 Auto-Resume System: Saves every 5%, auto-recovers from crashes, perfect for compute nodes")
@@ -1441,6 +1442,9 @@ def main():
         print("🔄 Force restart enabled - will reprocess all data")
 
     # Ensure output directories exist
+    global OUTPUT_DIR
+    if args.output_subdir:
+        OUTPUT_DIR = Path("embeddings") / args.output_subdir
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     # Get device
