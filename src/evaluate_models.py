@@ -157,7 +157,16 @@ class TransformerEvaluator:
         
         print(f"Loading embeddings: {log_file}")
         with open(log_file, 'rb') as f:
-            X = pickle.load(f)
+            X_loaded = pickle.load(f)
+            # Backward compatible: support descriptor dict or memmap pickled objects
+            if isinstance(X_loaded, dict) and 'memmap_path' in X_loaded:
+                desc = X_loaded
+                memmap_path = desc['memmap_path']
+                shape = tuple(desc['shape'])
+                dtype = np.dtype(desc.get('dtype', 'float32'))
+                X = np.memmap(memmap_path, dtype=dtype, mode='r', shape=shape)
+            else:
+                X = X_loaded
         
         # Load labels
         label_file = embeddings_dir / f"label_{log_type}.pkl"

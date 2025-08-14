@@ -1747,7 +1747,12 @@ def load_and_preprocess_data(
         raise FileNotFoundError(f"Embeddings not found: {log_file}")
     
     with open(log_file, 'rb') as f:
-        embeddings = pickle.load(f)
+        loaded = pickle.load(f)
+        if isinstance(loaded, dict) and 'memmap_path' in loaded:
+            desc = loaded
+            embeddings = np.memmap(desc['memmap_path'], dtype=np.dtype(desc.get('dtype','float32')), mode='r', shape=tuple(desc['shape']))
+        else:
+            embeddings = loaded
     
     # Load labels
     label_file = embeddings_dir / f"label_{log_type}.pkl"

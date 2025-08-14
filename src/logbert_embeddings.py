@@ -93,45 +93,57 @@ _cleanup_functions = []
 def signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT by saving emergency checkpoint."""
     print(f"\n⚠️  Received signal {signum} - saving emergency checkpoint...")
-    
+
     if _current_checkpoint_state:
         try:
-            log_type = _current_checkpoint_state['log_type']
-            data_hash = _current_checkpoint_state['data_hash']
-            all_cls_embeddings = _current_checkpoint_state['all_cls_embeddings']
-            all_mean_embeddings = _current_checkpoint_state['all_mean_embeddings']
-            all_max_embeddings = _current_checkpoint_state['all_max_embeddings']
-            all_attention_features = _current_checkpoint_state['all_attention_features']
-            batch_idx = _current_checkpoint_state['batch_idx']
-            processed_entries = _current_checkpoint_state['processed_entries']
-            
-            # Calculate progress
+            log_type = _current_checkpoint_state.get('log_type')
+            data_hash = _current_checkpoint_state.get('data_hash')
+            batch_idx = _current_checkpoint_state.get('batch_idx', 0)
+            processed_entries = _current_checkpoint_state.get('processed_entries', 0)
             total_entries = _current_checkpoint_state.get('total_entries', 0)
             progress_pct = int((processed_entries / total_entries) * 100) if total_entries > 0 else 0
-            
-            # Save emergency checkpoint
-            checkpoint_file = save_incremental_checkpoint(
-                log_type, data_hash, progress_pct,
-                all_cls_embeddings, all_mean_embeddings,
-                all_max_embeddings, all_attention_features,
-                batch_idx, processed_entries
-            )
-            
-            if checkpoint_file:
-                print(f"✅ Emergency checkpoint saved: {checkpoint_file.name}")
+
+            # If we're using streaming memmap embeddings, flush and save lightweight progress
+            memmap_path = _current_checkpoint_state.get('memmap_path')
+            if memmap_path is not None:
+                try:
+                    memmap_obj = _current_checkpoint_state.get('memmap_obj')
+                    if memmap_obj is not None:
+                        memmap_obj.flush()
+                    save_memmap_progress(log_type, data_hash, progress_pct, batch_idx, processed_entries)
+                    print(f"✅ Emergency memmap progress saved: {progress_pct}%")
+                except Exception as e:
+                    print(f"❌ Failed to save memmap progress: {e}")
             else:
-                print("❌ Failed to save emergency checkpoint")
-                
+                # Legacy path (kept for backward compatibility)
+                try:
+                    all_cls_embeddings = _current_checkpoint_state['all_cls_embeddings']
+                    all_mean_embeddings = _current_checkpoint_state['all_mean_embeddings']
+                    all_max_embeddings = _current_checkpoint_state['all_max_embeddings']
+                    all_attention_features = _current_checkpoint_state['all_attention_features']
+                    checkpoint_file = save_incremental_checkpoint(
+                        log_type, data_hash, progress_pct,
+                        all_cls_embeddings, all_mean_embeddings,
+                        all_max_embeddings, all_attention_features,
+                        batch_idx, processed_entries
+                    )
+                    if checkpoint_file:
+                        print(f"✅ Emergency checkpoint saved: {checkpoint_file.name}")
+                    else:
+                        print("❌ Failed to save emergency checkpoint")
+                except Exception as e:
+                    print(f"❌ Error saving emergency checkpoint (legacy): {e}")
+
         except Exception as e:
-            print(f"❌ Error saving emergency checkpoint: {e}")
-    
+            print(f"❌ Error in emergency checkpoint handler: {e}")
+
     # Run cleanup functions
     for cleanup_func in _cleanup_functions:
         try:
             cleanup_func()
         except:
             pass
-    
+
     print("🔄 Emergency checkpoint complete. Exiting...")
     sys.exit(1)
 
@@ -178,6 +190,68 @@ def get_available_gpu_memory(device):
     elif device.type == "mps":
         return 8192  # Assume 8GB for M2 GPU
     return 0
+
+
+def get_memmap_paths(log_type: str, data_hash: str):
+    """Return paths for memmap data file and progress metadata for a run."""
+    target_dir = (OUTPUT_DIR / log_type) if log_type else OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    memmap_path = target_dir / f"log_{log_type}_{data_hash}.dat"
+    progress_path = target_dir / f"log_{log_type}_{data_hash}.progress.json"
+    return memmap_path, progress_path
+
+
+def save_memmap_progress(log_type: str, data_hash: str, progress_pct: int, batch_idx: int, processed_entries: int):
+    """Persist lightweight progress metadata for streaming memmap embedding writes."""
+    try:
+        _, progress_path = get_memmap_paths(log_type, data_hash)
+        meta = {
+            'log_type': log_type,
+            'data_hash': data_hash,
+            'progress_pct': int(progress_pct),
+            'batch_idx': int(batch_idx),
+            'processed_entries': int(processed_entries),
+            'timestamp': time.time(),
+            'vector_size': VECTOR_SIZE,
+        }
+        with open(progress_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+    except Exception as e:
+        print(f"⚠️  Failed to save memmap progress: {e}")
+
+
+def load_memmap_progress(log_type: str, data_hash: str):
+    """Load memmap progress metadata if present."""
+    _, progress_path = get_memmap_paths(log_type, data_hash)
+    if progress_path.exists():
+        try:
+            with open(progress_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️  Failed to load memmap progress: {e}")
+    return None
+
+
+def find_latest_legacy_checkpoint_pct(log_type: str) -> int:
+    """Best-effort: infer resume percent from legacy incremental checkpoint filenames."""
+    if not CHECKPOINT_DIR.exists():
+        return 0
+    pattern_any_hash = f"{log_type}_incremental_*pct_*.pkl"
+    all_checkpoints = list(CHECKPOINT_DIR.glob(pattern_any_hash))
+    best = 0
+    for cp in all_checkpoints:
+        stem = cp.stem
+        parts = stem.split('_')
+        for p in parts:
+            if p.endswith('pct'):
+                try:
+                    pct = int(p[:-3])
+                    best = max(best, pct)
+                except:
+                    pass
+    if best > 0:
+        print(f"🔄 Legacy checkpoints found, resuming approximately from {best}%")
+    return best
 
 
 def adjust_batch_size_for_memory(initial_batch_size, device):
@@ -609,302 +683,269 @@ class LogBERTEmbeddingDataset(Dataset):
 
 
 def extract_bert_embeddings(df, device, performance_config=None, log_type=None, data_hash=None):
-    """Extract enhanced BERT embeddings capturing multiple features for better anomaly detection."""
+    """Extract enhanced BERT embeddings and stream them to a memory-mapped array on disk.
+
+    This avoids holding the full embedding matrix in RAM for very large datasets
+    and eliminates the OOM that caused the OS to kill the process.
+    Returns the absolute path to the created memmap data file.
+    """
     global _current_checkpoint_state
-    
+
     if performance_config is None:
         performance_config = {'batch_size': BATCH_SIZE, 'workers': NUM_WORKERS, 'clear_freq': 50}
-    
+
     num_entries = len(df)
     batch_size = performance_config['batch_size']
     num_workers = performance_config['workers']
     clear_freq = performance_config['clear_freq']
-    
-    # Check for incremental checkpoint
+
+    # On MPS, avoid pin_memory warning and semaphore leaks by using single-worker, no pinning
+    if device.type == 'mps':
+        num_workers = 0
+
+    # Resolve memmap file location (under embeddings/<log_type>) and ensure directory exists
+    if not log_type or not data_hash:
+        raise ValueError("log_type and data_hash are required for memmap-based extraction")
+    memmap_path, progress_path = get_memmap_paths(log_type, data_hash)
+    memmap_path = memmap_path.resolve()
+
+    # Determine resume information (prefer memmap progress, else legacy filename heuristic)
     start_batch_idx = 0
-    all_cls_embeddings = []
-    all_mean_embeddings = []
-    all_max_embeddings = []
-    all_attention_features = []
-    
-    if log_type and data_hash:
-        incremental_checkpoint = load_incremental_checkpoint_tolerant(log_type, data_hash)
-        if incremental_checkpoint:
-            print(f"🔄 Resuming embedding extraction from {incremental_checkpoint['progress_pct']}% checkpoint")
-            start_batch_idx = incremental_checkpoint['batch_idx'] + 1
-            all_cls_embeddings = incremental_checkpoint['cls_embeddings']
-            all_mean_embeddings = incremental_checkpoint['mean_embeddings']
-            all_max_embeddings = incremental_checkpoint['max_embeddings']
-            all_attention_features = incremental_checkpoint['attention_features']
-            print(f"✅ Loaded {len(all_cls_embeddings)} existing embedding batches")
-    
-    # Estimate processing time
-    remaining_entries = num_entries - (start_batch_idx * batch_size)
+    mem_progress = load_memmap_progress(log_type, data_hash)
+    if mem_progress and Path(memmap_path).exists():
+        start_batch_idx = int(mem_progress.get('batch_idx', 0)) + 1
+        print(f"🔄 Resuming (memmap) from batch {start_batch_idx}")
+    else:
+        # No memmap progress available; start from scratch to guarantee correctness
+        start_batch_idx = 0
+
+    # Estimate processing time from remaining entries
+    remaining_entries = max(num_entries - (start_batch_idx * batch_size), 0)
     time_estimate = estimate_processing_time(remaining_entries, batch_size, device.type)
-    
+
     spinner = Halo(text=f'Initializing BERT model (ETA: {time_estimate})', spinner='dots')
     spinner.start()
-    
+
     # Clear memory before loading model
     clear_memory(device)
-    
-    # Load pre-trained BERT model and tokenizer with attention implementation fix
+
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     model = BertModel.from_pretrained('bert-base-uncased', attn_implementation="eager").to(device)
     model.eval()
-    
-    # Clear memory after loading model
+
     clear_memory(device)
-    
+
     # Adjust batch size based on available GPU memory
     adjusted_batch_size = adjust_batch_size_for_memory(batch_size, device)
     if adjusted_batch_size != batch_size:
         print(f"Adjusted batch size from {batch_size} to {adjusted_batch_size} due to memory constraints")
         batch_size = adjusted_batch_size
-    
+
+    # Create or open memmap for streaming writes (use float16 to reduce memory footprint)
+    vector_dtype = np.float32
+    mode = 'r+' if memmap_path.exists() else 'w+'
+    memmap_embeddings = np.memmap(memmap_path, dtype=vector_dtype, mode=mode, shape=(num_entries, VECTOR_SIZE))
+
     spinner.succeed(f"BERT model loaded - Processing {num_entries:,} entries (batch_size={batch_size}, workers={num_workers})")
-    
+
     # Create dataset and dataloader with optimized settings
     dataset = LogBERTEmbeddingDataset(df['log'].tolist(), tokenizer)
     dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
+        dataset,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=device.type in ["cuda", "mps"],
-        persistent_workers=num_workers > 0
+        pin_memory=(device.type == "cuda"),  # disable pinning on MPS to avoid warning
+        persistent_workers=(num_workers > 0)
     )
-    
+
     # Initialize timing
     start_time = time.time()
-    
+
     spinner = Halo(text=f'Extracting enhanced BERT embeddings (ETA: {time_estimate})', spinner='dots')
     spinner.start()
-    
-    # Handle resumed processing by iterating through dataloader and skipping processed batches
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             actual_batch_idx = batch_idx
-            
-            # Skip batches if resuming from checkpoint
+            # Skip already processed batches if resuming
             if actual_batch_idx < start_batch_idx:
                 continue
-            current_processed_entries = actual_batch_idx * batch_size
-            
-            # Update progress with time estimation
+
+            current_processed_entries = min(actual_batch_idx * batch_size, num_entries)
+
+            # Update progress text periodically
             if actual_batch_idx % 10 == 0 and actual_batch_idx >= start_batch_idx:
                 elapsed = time.time() - start_time
-                processed_batches = actual_batch_idx - start_batch_idx + 1
-                if processed_batches > 0:
-                    rate = (processed_batches * batch_size) / elapsed
-                    remaining_entries = num_entries - current_processed_entries
-                    eta_seconds = remaining_entries / rate if rate > 0 else 0
-                    
-                    if eta_seconds < 60:
-                        eta_str = f"{eta_seconds:.0f}s"
-                    elif eta_seconds < 3600:
-                        eta_str = f"{eta_seconds/60:.1f}m"
-                    else:
-                        eta_str = f"{eta_seconds/3600:.1f}h"
-                    
-                    progress_pct = current_processed_entries / num_entries * 100
-                    spinner.text = f'Extracting enhanced embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
-                else:
-                    spinner.text = f'Extracting embeddings: batch {actual_batch_idx+1}/{len(dataloader)}'
-            
-            # Clear memory before processing each batch for CUDA
+                processed_batches = max(actual_batch_idx - start_batch_idx + 1, 1)
+                rate = (processed_batches * batch_size) / elapsed if elapsed > 0 else 0
+                remaining_entries = max(num_entries - current_processed_entries, 0)
+                eta_seconds = remaining_entries / rate if rate > 0 else 0
+                eta_str = f"{eta_seconds:.0f}s" if eta_seconds < 60 else (f"{eta_seconds/60:.1f}m" if eta_seconds < 3600 else f"{eta_seconds/3600:.1f}h")
+                progress_pct = (current_processed_entries / num_entries) * 100 if num_entries > 0 else 0
+                spinner.text = f'Extracting enhanced embeddings: {progress_pct:.1f}% (ETA: {eta_str})'
+
+            # Clear memory periodically for CUDA
             if device.type == "cuda" and actual_batch_idx % 5 == 0:
                 clear_memory(device)
-            
+
             try:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
-                
-                # Get outputs with attention weights
+
                 outputs = model(
-                    input_ids=input_ids, 
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_attentions=True
                 )
             except torch.cuda.OutOfMemoryError:
-                # If we run out of memory, clear everything and process samples one by one
                 spinner.text = f'Memory error at batch {actual_batch_idx+1}, switching to single-sample processing'
                 clear_memory(device)
-                
-                # Process each sample in the batch individually
+                # Fallback to per-sample processing
                 batch_outputs = []
                 for i in range(len(batch['input_ids'])):
                     single_input = batch['input_ids'][i:i+1].to(device)
                     single_mask = batch['attention_mask'][i:i+1].to(device)
-                    
                     single_output = model(
                         input_ids=single_input,
                         attention_mask=single_mask,
                         output_attentions=True
                     )
                     batch_outputs.append(single_output)
-                    
-                    # Clear after each sample
                     single_input = single_input.cpu()
                     single_mask = single_mask.cpu()
                     clear_memory(device)
-                
-                # Combine outputs
                 outputs = type(batch_outputs[0])(
                     last_hidden_state=torch.cat([out.last_hidden_state for out in batch_outputs], dim=0),
-                    attentions=tuple(torch.cat([out.attentions[i] for out in batch_outputs], dim=0) 
-                                   for i in range(len(batch_outputs[0].attentions)))
+                    attentions=tuple(torch.cat([out.attentions[i] for out in batch_outputs], dim=0)
+                                     for i in range(len(batch_outputs[0].attentions)))
                 )
-            
-            # 1. CLS token embeddings (global context)
-            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            all_cls_embeddings.append(cls_embeddings)
-            
-            # 2. Mean pooling (average representation)
+
+            # Prepare tensors
             token_embeddings = outputs.last_hidden_state
+            batch_size_actual = token_embeddings.size(0)
+
+            # 1. CLS token embeddings
+            cls_embeddings = token_embeddings[:, 0, :]
+
+            # 2. Mean pooling
             input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
             sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
             sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            mean_embeddings = (sum_embeddings / sum_mask).cpu().numpy()
-            all_mean_embeddings.append(mean_embeddings)
-            
-            # 3. Max pooling (capture key features)
-            # Set padding tokens to large negative value before max pooling
+            mean_embeddings = (sum_embeddings / sum_mask)
+
+            # 3. Max pooling
             token_embeddings_masked = token_embeddings.clone()
             token_embeddings_masked[input_mask_expanded == 0] = -1e9
-            max_embeddings = torch.max(token_embeddings_masked, 1)[0].cpu().numpy()
-            all_max_embeddings.append(max_embeddings)
-            
-            # 4. Attention-based features (which tokens are important)
-            # Average attention from last layer, focusing on CLS token's attention
+            max_embeddings = torch.max(token_embeddings_masked, 1)[0]
+
+            # 4. Attention features
             last_attention = outputs.attentions[-1]  # [batch, heads, seq, seq]
-            # Average over heads and take CLS token's attention to other tokens
-            cls_attention = last_attention.mean(dim=1)[:, 0, :].cpu().numpy()
-            
-            # Get top-k attention scores as features
+            cls_attention = last_attention.mean(dim=1)[:, 0, :]
             top_k = 10
             batch_attention_features = []
-            for i in range(cls_attention.shape[0]):
-                # Get actual sequence length for this sample
+            for i in range(batch_size_actual):
                 seq_len = attention_mask[i].sum().item()
-                # Only consider attention to actual tokens (not padding)
-                valid_attention = cls_attention[i, :seq_len]
-                
-                if len(valid_attention) > 1:  # Ensure we have more than just CLS token
-                    # Sort and get top-k values (excluding CLS token itself)
-                    top_values = np.sort(valid_attention[1:])[-top_k:]
-                    # Pad if necessary
-                    if len(top_values) < top_k:
-                        top_values = np.pad(top_values, (0, top_k - len(top_values)), 'constant')
+                valid_attention = cls_attention[i, :int(seq_len)]
+                if valid_attention.numel() > 1:
+                    top_values, _ = torch.topk(valid_attention[1:], k=min(top_k, max(int(seq_len) - 1, 0)))
+                    if top_values.numel() < top_k:
+                        pad = torch.zeros(top_k - top_values.numel(), device=top_values.device)
+                        top_values = torch.cat([top_values, pad], dim=0)
                 else:
-                    top_values = np.zeros(top_k)
-                
-                batch_attention_features.append(top_values)
-            
-            all_attention_features.append(np.array(batch_attention_features))
-            
+                    top_values = torch.zeros(top_k, device=cls_attention.device)
+                batch_attention_features.append(top_values.unsqueeze(0))
+            attn_features = torch.cat(batch_attention_features, dim=0)
+
+            # Combine to single batch embedding and cast to float16 to reduce footprint
+            combined_batch = torch.cat([
+                cls_embeddings,
+                mean_embeddings,
+                max_embeddings,
+                attn_features
+            ], dim=1).to(torch.float16).cpu().numpy()
+
+            # Determine destination indices in the memmap
+            idx_tensor = batch['idx']
+            if isinstance(idx_tensor, torch.Tensor):
+                indices = idx_tensor.cpu().numpy()
+            else:
+                indices = np.asarray(idx_tensor)
+            memmap_embeddings[indices, :] = combined_batch
+
             # Update global checkpoint state for emergency saving
-            if log_type and data_hash:
-                _current_checkpoint_state = {
-                    'log_type': log_type,
-                    'data_hash': data_hash,
-                    'all_cls_embeddings': all_cls_embeddings,
-                    'all_mean_embeddings': all_mean_embeddings,
-                    'all_max_embeddings': all_max_embeddings,
-                    'all_attention_features': all_attention_features,
-                    'batch_idx': actual_batch_idx,
-                    'processed_entries': current_processed_entries,
-                    'total_entries': num_entries
-                }
-            
-            # Save incremental checkpoint every 5% (more frequent for compute nodes)
-            progress_pct = (current_processed_entries / num_entries) * 100
-            checkpoint_interval = max(len(dataloader) // 20, 25)  # Every 5%, at least every 25 batches
-            processed_batches = actual_batch_idx - start_batch_idx + 1
-            
-            if (log_type and data_hash and 
-                processed_batches > 0 and 
-                actual_batch_idx % checkpoint_interval == 0 and 
-                progress_pct >= 2.5):  # Start checkpointing at 2.5%
-                
-                # Round to nearest 5% for cleaner checkpoint names
+            _current_checkpoint_state = {
+                'log_type': log_type,
+                'data_hash': data_hash,
+                'batch_idx': actual_batch_idx,
+                'processed_entries': min(current_processed_entries + batch_size_actual, num_entries),
+                'total_entries': num_entries,
+                'memmap_path': str(memmap_path),
+                'memmap_obj': memmap_embeddings,
+            }
+
+            # Save lightweight progress every ~5%
+            progress_pct = (current_processed_entries / num_entries) * 100 if num_entries > 0 else 0
+            checkpoint_interval = max(len(dataloader) // 20, 25)
+            if (actual_batch_idx % checkpoint_interval == 0) and (progress_pct >= 2.5):
                 rounded_pct = int(progress_pct // 5) * 5
-                
-                try:
-                    save_incremental_checkpoint(
-                        log_type, data_hash, rounded_pct,
-                        all_cls_embeddings, all_mean_embeddings,
-                        all_max_embeddings, all_attention_features,
-                        actual_batch_idx, current_processed_entries
-                    )
-                except Exception as e:
-                    print(f"⚠️  Failed to save incremental checkpoint: {e}")
-            
-            # Clear memory periodically based on performance config
+                save_memmap_progress(log_type, data_hash, rounded_pct, actual_batch_idx, current_processed_entries)
+
+            # Periodic cleanup
             if actual_batch_idx % clear_freq == 0:
                 clear_memory(device)
-            
-            # Move tensors to CPU immediately after processing to free GPU memory
-            if device.type == "cuda":
-                input_ids = input_ids.cpu()
-                attention_mask = attention_mask.cpu()
-    
+
+            # Free tensors
+            del outputs, token_embeddings, cls_embeddings, mean_embeddings, max_embeddings, attn_features
+            input_ids = input_ids.cpu()
+            attention_mask = attention_mask.cpu()
+            clear_memory(device)
+
     total_time = time.time() - start_time
-    rate = num_entries / total_time
+    rate = num_entries / total_time if total_time > 0 else 0
     spinner.succeed(f"Enhanced BERT embedding extraction complete ({total_time:.1f}s, {rate:.1f} entries/sec)")
-    
-    # Concatenate all features
-    cls_features = np.vstack(all_cls_embeddings).astype(np.float32)
-    mean_features = np.vstack(all_mean_embeddings).astype(np.float32)
-    max_features = np.vstack(all_max_embeddings).astype(np.float32)
-    attention_features = np.vstack(all_attention_features).astype(np.float32)
-    
-    # Combine all features into a single embedding
-    # This creates a richer representation while maintaining a single vector per log
-    combined_embeddings = np.hstack([
-        cls_features,      # 768D - global context
-        mean_features,     # 768D - average meaning
-        max_features,      # 768D - key features
-        attention_features # 10D - attention patterns
-    ])  # Total: 2314D
-    
-    spinner.text = f"Combined embedding shape: {combined_embeddings.shape} (2314D per log)"
-    
-    # Clear global checkpoint state
+
+    # Flush memmap to disk and cleanup
+    memmap_embeddings.flush()
     _current_checkpoint_state = None
-    
-    # Clear model from memory
-    del model, tokenizer
+    del model, tokenizer, memmap_embeddings
     clear_memory(device)
-    
-    # Clean up incremental checkpoints after successful completion
-    if log_type and data_hash:
-        cleanup_incremental_checkpoints(log_type, data_hash)
-    
-    return combined_embeddings
+
+    # Clean up legacy incremental checkpoints after successful completion
+    cleanup_incremental_checkpoints(log_type, data_hash)
+
+    return str(memmap_path)
 
 
 def process_embeddings(df, device, use_global_attack_list=False, performance_config=None, log_type=None):
-    """Process logs and create BERT embeddings with binary label vectors - resumeable."""
+    """Process logs and create BERT embeddings with binary label vectors - resumeable.
+
+    Embeddings are stored on disk as a numpy.memmap to avoid large RAM usage.
+    """
     data_hash = generate_data_hash(df)
-    
+
     # Check for checkpoint
     if log_type:
         checkpoint_data = load_checkpoint(log_type, "embeddings", data_hash)
         if checkpoint_data:
             print("✅ Resuming from embeddings checkpoint")
-            # Reconstruct dataframe from checkpoint
-            df['log_embedding'] = checkpoint_data['log_embeddings']
-            df['binary_labels'] = checkpoint_data['binary_labels']
+            # Restore memmap path and previously computed labels
+            if 'memmap_path' in checkpoint_data and checkpoint_data['memmap_path']:
+                df.attrs['embedding_memmap_path'] = checkpoint_data['memmap_path']
+            if 'binary_labels' in checkpoint_data:
+                df['binary_labels'] = checkpoint_data['binary_labels']
             if 'attack_types' in checkpoint_data:
                 df.attrs['attack_types'] = checkpoint_data['attack_types']
             if 'log_type_to_attacks' in checkpoint_data:
                 df.attrs['log_type_to_attacks'] = checkpoint_data['log_type_to_attacks']
-            return df
-    
-    # Extract BERT embeddings with performance optimization
-    log_embeddings = extract_bert_embeddings(df, device, performance_config, log_type, data_hash)
-    df['log_embedding'] = list(log_embeddings)
+            # Even if labels are present, verify memmap exists; otherwise re-extract
+            memmap_ok = 'embedding_memmap_path' in df.attrs and Path(df.attrs['embedding_memmap_path']).exists()
+            if memmap_ok:
+                return df
+
+    # Extract BERT embeddings with performance optimization (streams to memmap)
+    memmap_path = extract_bert_embeddings(df, device, performance_config, log_type, data_hash)
+    df.attrs['embedding_memmap_path'] = memmap_path
     
     # Process labels
     spinner = Halo(text="Processing binary label vectors", spinner='dots')
@@ -925,7 +966,7 @@ def process_embeddings(df, device, use_global_attack_list=False, performance_con
         # Save checkpoint
         if log_type:
             checkpoint_data = {
-                'log_embeddings': list(log_embeddings),
+                'memmap_path': df.attrs.get('embedding_memmap_path'),
                 'binary_labels': binary_labels,
                 'attack_types': attack_types
             }
@@ -952,7 +993,7 @@ def process_embeddings(df, device, use_global_attack_list=False, performance_con
         # Save checkpoint
         if log_type:
             checkpoint_data = {
-                'log_embeddings': list(log_embeddings),
+                'memmap_path': df.attrs.get('embedding_memmap_path'),
                 'binary_labels': binary_labels,
                 'log_type_to_attacks': log_type_to_attacks
             }
@@ -1005,7 +1046,14 @@ def visualize_embeddings(df, output_file=None):
         selected_indices = list(np.random.choice(selected_indices, MAX_TOTAL_POINTS, replace=False))
 
     # Gather embeddings and labels for the sampled indices
-    embeddings = np.vstack([df.at[i, 'log_embedding'] for i in selected_indices]).astype(np.float32)
+    if 'embedding_memmap_path' in df.attrs and df.attrs['embedding_memmap_path'] and Path(df.attrs['embedding_memmap_path']).exists():
+        memmap_path = df.attrs['embedding_memmap_path']
+        # float32 memmap by default; cast to float32 (no-op) for TSNE stability
+        full_mm = np.memmap(memmap_path, dtype=np.float32, mode='r', shape=(len(df), VECTOR_SIZE))
+        embeddings = np.array(full_mm[selected_indices, :], dtype=np.float32)
+        del full_mm
+    else:
+        embeddings = np.vstack([df.at[i, 'log_embedding'] for i in selected_indices]).astype(np.float32)
     sampled_labels = [viz_labels[i] for i in selected_indices]
     sampled_log_types = [df.at[i, 'log_type'] for i in selected_indices]
 
@@ -1106,12 +1154,23 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
     spinner.start()
     
     # Extract and save log embeddings as log_<type>.pkl
-    log_embeddings = np.vstack(df['log_embedding'].tolist()).astype(np.float32)
     log_filename = f"log_{log_type_name}.pkl"
-    
-    spinner.text = f"Saving log embeddings to {log_filename}"
-    with open(output_dir / log_filename, 'wb') as f:
-        pickle.dump(log_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)
+    memmap_path = df.attrs.get('embedding_memmap_path')
+    if memmap_path and Path(memmap_path).exists():
+        # Serialize directly from memmap to pickle without loading into RAM
+        spinner.text = f"Saving log embeddings to {log_filename}"
+        mm = np.memmap(memmap_path, dtype=np.float32, mode='r', shape=(len(df), VECTOR_SIZE))
+        with open(output_dir / log_filename, 'wb') as f:
+            pickle.dump(mm, f, protocol=pickle.HIGHEST_PROTOCOL)
+        del mm
+    else:
+        # Fallback for smaller datasets in-memory
+        if 'log_embedding' not in df.columns or len(df['log_embedding']) == 0:
+            raise RuntimeError("No embeddings found to save.")
+        log_embeddings = np.vstack(df['log_embedding'].tolist()).astype(np.float32)
+        spinner.text = f"Saving log embeddings to {log_filename}"
+        with open(output_dir / log_filename, 'wb') as f:
+            pickle.dump(log_embeddings, f, protocol=pickle.HIGHEST_PROTOCOL)
     
     # Extract and save binary label vectors as label_<type>.pkl
     if 'binary_labels' in df.columns and len(df['binary_labels']) > 0:
@@ -1194,7 +1253,9 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
             
             # Print summary
             print(f"\nSaved files for {log_type_name}:")
-            print(f"  - {log_filename}: Log embeddings {log_embeddings.shape} (2314D enhanced BERT vectors)")
+            # Determine shape info without loading the pickled embeddings
+            emb_shape = (len(df), VECTOR_SIZE) if (memmap_path and Path(memmap_path).exists()) else log_embeddings.shape
+            print(f"  - {log_filename}: Log embeddings {emb_shape} (2314D enhanced BERT vectors)")
             print(f"  - {label_filename}: Binary label vectors {binary_vectors.shape}")
             print(f"  - {attack_info_filename}: Attack types and column mapping details")
             print(f"  - Classes: {classes}")
