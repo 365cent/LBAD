@@ -389,11 +389,18 @@ def train_command(log_type: Optional[str] = None):
     print(f"Loaded {len(df)} samples with {len(attack_types)} attack types")
     
     # Initialize model and tokenizer
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    # Use local cache directory if defined to avoid $HOME/.cache quota issues
+    cache_dir = str(Path("hf_cache").resolve())
+    try:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", cache_dir=cache_dir)
     model = BertForSequenceClassification.from_pretrained(
         "bert-base-uncased",
         num_labels=len(attack_types),
         problem_type="multi_label_classification",
+        cache_dir=cache_dir,
     ).to(device)
     
     # Split data

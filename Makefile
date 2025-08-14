@@ -6,8 +6,14 @@ PYTHON := python
 PIP := pip
 SRC := ./src
 
-# Available log types (check embeddings/ directory for actual availability)
+# Available log types (override at runtime: make thesis LOG_TYPES="wp-error")
 LOG_TYPES := wp-access wp-error dns network web error monitoring auth audit
+
+# Embedding methods to use (override: make thesis EMBEDDINGS="logbert fasttext")
+EMBEDDINGS ?= logbert fasttext word2vec
+
+# Local HF/transformers/torch cache to avoid $HOME/.cache quota issues
+HF_ENV := HF_HOME="$(PWD)/hf_cache" TRANSFORMERS_CACHE="$(PWD)/hf_cache" HUGGINGFACE_HUB_CACHE="$(PWD)/hf_cache" XDG_CACHE_HOME="$(PWD)/.cache" TORCH_HOME="$(PWD)/.cache/torch"
 
 # =============================================================================
 # Main Pipeline Commands
@@ -16,6 +22,11 @@ LOG_TYPES := wp-access wp-error dns network web error monitoring auth audit
 help:
 	@echo "LBAD - Log-Based Anomaly Detection Pipeline"
 	@echo "==========================================="
+	@echo ""
+	@echo "🧪 Thesis orchestration:"
+	@echo "  thesis             Preprocess → generate all embeddings → run models → summarize"
+	@echo "  thesis-<type>      Run thesis pipeline for a specific log type"
+	@echo "  vars (override): LOG_TYPES=..., EMBEDDINGS=logbert|fasttext|word2vec"
 	@echo ""
 	@echo "🚀 MAIN PIPELINES:"
 	@echo "  pipeline-all        Complete pipeline: preprocess → embeddings → train → evaluate"
@@ -42,6 +53,7 @@ help:
 	@echo "🔧 STANDALONE TOOLS:"
 	@echo "  ml-baseline         Run traditional ML baselines (RF, XGBoost, etc.)"
 	@echo "  gan                 Run f-AnoGAN training and evaluation"
+	@echo "  summarize           Aggregate results into results/thesis_summary.json|.md"
 	@echo "  view-data           View processed data and embeddings"
 	@echo "  test                Run tests"
 	@echo ""
@@ -90,31 +102,42 @@ preprocess-%:
 # Embeddings generation
 embeddings:
 	@echo "🔄 Generating all embeddings..."
-	$(MAKE) logbert
-	$(MAKE) fasttext
+	$(MAKE) logbert-thesis
+	$(MAKE) fasttext-thesis
+	$(MAKE) word2vec-thesis
 
 embeddings-%:
 	@echo "🔄 Generating embeddings for log type: $*"
-	$(MAKE) logbert-$*
-	$(MAKE) fasttext-$*
+	$(MAKE) logbert-thesis-$*
+	$(MAKE) fasttext-thesis-$*
+	$(MAKE) word2vec-thesis-$*
 
-# LogBERT embeddings
-logbert:
-	@echo "🧠 Generating LogBERT embeddings for all log types..."
-	$(PYTHON) $(SRC)/logbert_embeddings.py
+# LogBERT embeddings (write to embeddings/logbert/<type>)
+logbert-thesis: ensure-cache
+	@echo "🧠 Generating LogBERT embeddings for all log types (method=logbert)..."
+	$(HF_ENV) $(PYTHON) $(SRC)/logbert_embeddings.py --output-subdir logbert
 
-logbert-%:
-	@echo "🧠 Generating LogBERT embeddings for log type: $*"
-	$(PYTHON) $(SRC)/logbert_embeddings.py --log-type $*
+logbert-thesis-%: ensure-cache
+	@echo "🧠 Generating LogBERT embeddings for log type: $* (method=logbert)"
+	$(HF_ENV) $(PYTHON) $(SRC)/logbert_embeddings.py --log-type $* --output-subdir logbert
 
-# FastText embeddings
-fasttext:
-	@echo "📝 Generating FastText embeddings for all log types..."
-	$(PYTHON) $(SRC)/fasttext_embedding.py
+# FastText embeddings (write to embeddings/fasttext/<type>)
+fasttext-thesis:
+	@echo "📝 Generating FastText embeddings for all log types (method=fasttext)..."
+	$(PYTHON) $(SRC)/fasttext_embedding.py --output-subdir fasttext
 
-fasttext-%:
-	@echo "📝 Generating FastText embeddings for log type: $*"
-	$(PYTHON) $(SRC)/fasttext_embedding.py --log-type $*
+fasttext-thesis-%:
+	@echo "📝 Generating FastText embeddings for log type: $* (method=fasttext)"
+	$(PYTHON) $(SRC)/fasttext_embedding.py --log-type $* --output-subdir fasttext
+
+# Word2Vec embeddings (write to embeddings/word2vec/<type>)
+word2vec-thesis:
+	@echo "🔤 Generating Word2Vec embeddings for all log types (method=word2vec)..."
+	$(PYTHON) $(SRC)/word2vec_embedding_thesis.py --output-subdir word2vec
+
+word2vec-thesis-%:
+	@echo "🔤 Generating Word2Vec embeddings for log type: $* (method=word2vec)"
+	$(PYTHON) $(SRC)/word2vec_embedding_thesis.py --log-type $* --output-subdir word2vec
 
 # =============================================================================
 # Model Training
@@ -271,6 +294,59 @@ clean-all: clean
 	@echo "🧹 Removing all generated data..."
 	rm -rf processed embeddings models results checkpoints augmented
 	mkdir -p processed embeddings models results checkpoints augmented
+
+# =============================================================================
+# Thesis Orchestration (replaces src/runner.py)
+# =============================================================================
+
+ensure-cache:
+	@mkdir -p hf_cache .cache/torch
+
+# Prepare legacy layout for a given log type and embedding method, then run models
+define RUN_FOR_METHOD
+	@echo "➡️  Preparing legacy layout for $(1) [method=$(2)]"
+	@mkdir -p embeddings/$(1)
+	@if [ -f embeddings/$(2)/$(1)/log_$(1).pkl ]; then cp -f embeddings/$(2)/$(1)/log_$(1).pkl embeddings/$(1)/log_$(1).pkl; fi
+	@if [ -f embeddings/$(2)/$(1)/label_$(1).pkl ]; then cp -f embeddings/$(2)/$(1)/label_$(1).pkl embeddings/$(1)/label_$(1).pkl; fi
+	@if [ -f embeddings/$(1)/log_$(1).pkl ]; then cp -f embeddings/$(1)/log_$(1).pkl embeddings/$(1)/embeddings.pkl; fi
+	@if [ -f embeddings/$(1)/label_$(1).pkl ]; then \
+		$(PYTHON) - <<'PY' \
+		import pickle, os; lt='$(1)'; src=f"embeddings/{lt}/label_{lt}.pkl"; dst=f"embeddings/{lt}/labels.pkl"; \
+		with open(src,'rb') as f: d=pickle.load(f); \
+		arr = d['vectors'] if isinstance(d, dict) and 'vectors' in d else d; \
+		with open(dst,'wb') as g: pickle.dump(arr, g) \
+		PY \
+	; fi
+	@echo "🤖 Running transformer for $(1) [method=$(2)]"
+	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
+	@echo "📊 Running ML baselines for $(1) [method=$(2)]"
+	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --model all || true
+	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(1) || true
+	@echo "⚑ Running binary baseline (SMOTE) for $(1) [method=$(2)]"
+	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(1) --pos-ratio 0.5 || true
+endef
+
+thesis: ensure-cache preprocess embeddings
+	@echo "🚀 Running thesis pipeline across methods: $(EMBEDDINGS)"
+	@for LT in $(LOG_TYPES); do \
+		for E in $(EMBEDDINGS); do \
+			$(call RUN_FOR_METHOD,$$LT,$$E); \
+		done; \
+	 done
+	@$(MAKE) summarize
+	@echo "✅ Thesis pipeline completed"
+
+thesis-%: ensure-cache preprocess-% embeddings-%
+	@echo "🚀 Running thesis pipeline for log type: $* across methods: $(EMBEDDINGS)"
+	@for E in $(EMBEDDINGS); do \
+		$(call RUN_FOR_METHOD,$*,$$E); \
+	 done
+	@$(MAKE) summarize
+	@echo "✅ Thesis pipeline completed for $*"
+
+summarize:
+	@echo "🧾 Summarizing results into results/thesis_summary.json|.md"
+	$(PYTHON) $(SRC)/summarize_results.py || true
 
 # =============================================================================
 # Quick Start Examples

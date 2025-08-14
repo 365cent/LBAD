@@ -65,6 +65,17 @@ MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
 NUM_WORKERS = 2
 
+# Local Hugging Face cache to avoid $HOME/.cache quota issues on HPC
+HF_CACHE_DIR = Path("hf_cache")
+try:
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Best-effort: if creation fails, fall back silently to default
+    pass
+os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR.resolve()))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR.resolve()))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR.resolve()))
+
 # Performance thresholds for auto-optimization
 SMALL_DATASET_THRESHOLD = 10000    # < 10K entries
 MEDIUM_DATASET_THRESHOLD = 100000  # < 100K entries
@@ -729,8 +740,10 @@ def extract_bert_embeddings(df, device, performance_config=None, log_type=None, 
     # Clear memory before loading model
     clear_memory(device)
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertModel.from_pretrained('bert-base-uncased', attn_implementation="eager").to(device)
+    # Use local cache directory explicitly to avoid $HOME/.cache on shared clusters
+    cache_dir = str(HF_CACHE_DIR.resolve()) if 'HF_CACHE_DIR' in globals() else None
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', cache_dir=cache_dir)
+    model = BertModel.from_pretrained('bert-base-uncased', cache_dir=cache_dir, attn_implementation="eager").to(device)
     model.eval()
 
     clear_memory(device)
