@@ -241,8 +241,4 @@ def main():
 	print("Word2Vec embedding processing complete!")
 
 if __name__ == "__main__":
-<<<<<<< Current (Your changes)
     main()
-=======
-	main()
->>>>>>> Incoming (Background Agent changes)

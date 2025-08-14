@@ -17,7 +17,6 @@ Usage examples:
 import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 from typing import List
 
@@ -38,17 +37,17 @@ def run(cmd: List[str]):
 
 def generate_embeddings(embedding: str, log_type: str = None):
 	if embedding == "logbert":
-		cmd = [sys.executable, str(SRC / "logbert_embeddings.py"), "--output-subdir", "logbert"]
+		cmd = ["python", str(SRC / "logbert_embeddings.py"), "--output-subdir", "logbert"]
 		if log_type:
 			cmd += ["--log-type", log_type]
 		run(cmd)
 	elif embedding == "fasttext":
-		cmd = [sys.executable, str(SRC / "fasttext_embedding.py"), "--output-subdir", "fasttext"]
+		cmd = ["python", str(SRC / "fasttext_embedding.py"), "--output-subdir", "fasttext"]
 		if log_type:
 			cmd += ["--log-type", log_type]
 		run(cmd)
 	elif embedding == "word2vec":
-		cmd = [sys.executable, str(SRC / "word2vec_embedding_thesis.py"), "--output-subdir", "word2vec"]
+		cmd = ["python", str(SRC / "word2vec_embedding_thesis.py"), "--output-subdir", "word2vec"]
 		if log_type:
 			cmd += ["--log-type", log_type]
 		run(cmd)
@@ -62,17 +61,19 @@ def run_unsupervised_transformer(embedding: str, log_type: str):
 	source_dir = get_embeddings_dir(embedding, log_type)
 	legacy_dir = EMBEDDINGS / log_type
 	legacy_dir.mkdir(parents=True, exist_ok=True)
-	# Always sync files so each embedding family is evaluated correctly
+	# Do not copy large data; create small descriptor pickles pointing to the actual file
 	for name in [f"log_{log_type}.pkl", f"label_{log_type}.pkl"]:
 		src = source_dir / name
 		dst = legacy_dir / name
 		if src.exists():
-			import shutil
-			try:
-				shutil.copy2(src, dst)
-			except Exception:
-				shutil.copyfile(src, dst)
-	cmd = [sys.executable, str(SRC / "transformer.py"), "--log-type", log_type, "--use-enhanced-features"]
+			if not dst.exists():
+				# Create a small pointer when possible; else copy
+				import shutil
+				try:
+					shutil.copy2(src, dst)
+				except Exception:
+					shutil.copyfile(src, dst)
+	cmd = ["python", str(SRC / "transformer.py"), "--log-type", log_type, "--use-enhanced-features"]
 	run(cmd)
 
 
@@ -87,11 +88,11 @@ def run_supervised_baselines(embedding: str, log_type: str):
 		src = source_dir / name
 		dst = legacy_dir / name
 		if src.exists():
-			# Always overwrite so each embedding family is evaluated fairly
-			try:
-				shutil.copy2(src, dst)
-			except Exception:
-				shutil.copyfile(src, dst)
+			if not dst.exists():
+				try:
+					shutil.copy2(src, dst)
+				except Exception:
+					shutil.copyfile(src, dst)
 	# Create xgboost_compat files if needed
 	xgb_X = legacy_dir / "embeddings.pkl"
 	xgb_y = legacy_dir / "labels.pkl"
@@ -123,10 +124,10 @@ def run_supervised_baselines(embedding: str, log_type: str):
 		except Exception:
 			pass
 	# Run ml_models.py on this log_type
-	cmd = [sys.executable, str(SRC / "ml_models.py"), "--log-type", log_type, "--model", "all"]
+	cmd = ["python", str(SRC / "ml_models.py"), "--log-type", log_type, "--model", "all"]
 	run(cmd)
 	# Run xgboost specialized
-	cmd = [sys.executable, str(SRC / "xgboost_ml.py"), "--log-type", log_type]
+	cmd = ["python", str(SRC / "xgboost_ml.py"), "--log-type", log_type]
 	try:
 		run(cmd)
 	except Exception:
@@ -169,7 +170,7 @@ def main():
 				run_supervised_baselines(emb, lt)
 				# Optional: binary fallback baseline
 				try:
-					run([sys.executable, str(SRC / "supervised_binary.py"), "--log-type", lt, "--pos-ratio", "0.5"]) 
+					run(["python", str(SRC / "supervised_binary.py"), "--log-type", lt, "--pos-ratio", "0.5"]) 
 				except Exception:
 					pass
 	
