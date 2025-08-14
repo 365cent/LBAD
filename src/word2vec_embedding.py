@@ -22,6 +22,7 @@ from sklearn.manifold import TSNE
 import seaborn as sns
 import json
 import multiprocessing
+import argparse
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -173,62 +174,75 @@ def visualize_embeddings(embeddings, labels, output_file=None):
     plt.close()  # Properly close figure to free memory
 
 def main():
-    # Load and preprocess data from TFRecord files
-    df = load_tfrecord_files()
-    df = preprocess_logs(df)
-    
-    # Split data (80% train, 20% test)
-    train_df = df.sample(frac=0.8, random_state=RANDOM_SEED)
-    test_df = df.drop(train_df.index)
-    
-    # Train Word2Vec model
-    model_path = MODEL_DIR / "word2vec_model.bin"
-    
-    if model_path.exists():
-        print(f"Loading existing model from {model_path}")
-        model = Word2Vec.load(str(model_path))
-    else:
-        model = train_word2vec_model(train_df['tokens'].tolist())
-        model.save(str(model_path))
-        print(f"Saved model to {model_path}")
-    
-    # Generate embeddings
-    train_embeddings = generate_embeddings(model, train_df['tokens'].tolist())
-    test_embeddings = generate_embeddings(model, test_df['tokens'].tolist())
-    
-    # Get labels
-    train_labels = train_df['label'].tolist()
-    test_labels = test_df['label'].tolist()
-    
-    # Save embeddings
-    with open(OUTPUT_DIR / "word2vec_train_embeddings.pkl", 'wb') as f:
-        pickle.dump(train_embeddings, f)
-    
-    with open(OUTPUT_DIR / "word2vec_test_embeddings.pkl", 'wb') as f:
-        pickle.dump(test_embeddings, f)
-        
-    # Save labels
-    with open(OUTPUT_DIR / "word2vec_train_labels.pkl", 'wb') as f:
-        pickle.dump(train_labels, f)
-    
-    with open(OUTPUT_DIR / "word2vec_test_labels.pkl", 'wb') as f:
-        pickle.dump(test_labels, f)
-    
-    print(f"Saved embeddings and labels to {OUTPUT_DIR}")
-    print(f"  - Embeddings: word2vec_train_embeddings.pkl, word2vec_test_embeddings.pkl")
-    print(f"  - Labels: word2vec_train_labels.pkl, word2vec_test_labels.pkl")
-    
-    # Visualize (sample up to 5000 points to avoid overcrowding)
-    sample_size = min(5000, len(train_embeddings))
-    sample_idx = np.random.choice(len(train_embeddings), sample_size, replace=False)
-    
-    visualize_embeddings(
-        train_embeddings[sample_idx], 
-        train_df['label'].iloc[sample_idx].tolist(),
-        output_file=OUTPUT_DIR / "word2vec_visualization.png"
-    )
-    
-    print("Word2Vec embedding processing complete!")
+	parser = argparse.ArgumentParser(description="Generate Word2Vec embeddings from TFRecords")
+	parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'word2vec')")
+	args = parser.parse_args()
+	
+	global OUTPUT_DIR
+	if args.output_subdir:
+		OUTPUT_DIR = Path("embeddings") / args.output_subdir
+		OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+	
+	# Load and preprocess data from TFRecord files
+	df = load_tfrecord_files()
+	df = preprocess_logs(df)
+	
+	# Split data (80% train, 20% test)
+	train_df = df.sample(frac=0.8, random_state=RANDOM_SEED)
+	test_df = df.drop(train_df.index)
+	
+	# Train Word2Vec model
+	model_path = MODEL_DIR / "word2vec_model.bin"
+	
+	if model_path.exists():
+		print(f"Loading existing model from {model_path}")
+		model = Word2Vec.load(str(model_path))
+	else:
+		model = train_word2vec_model(train_df['tokens'].tolist())
+		model.save(str(model_path))
+		print(f"Saved model to {model_path}")
+	
+	# Generate embeddings
+	train_embeddings = generate_embeddings(model, train_df['tokens'].tolist())
+	test_embeddings = generate_embeddings(model, test_df['tokens'].tolist())
+	
+	# Get labels
+	train_labels = train_df['label'].tolist()
+	test_labels = test_df['label'].tolist()
+	
+	# Save embeddings
+	with open(OUTPUT_DIR / "word2vec_train_embeddings.pkl", 'wb') as f:
+		pickle.dump(train_embeddings, f)
+	
+	with open(OUTPUT_DIR / "word2vec_test_embeddings.pkl", 'wb') as f:
+		pickle.dump(test_embeddings, f)
+		
+	# Save labels
+	with open(OUTPUT_DIR / "word2vec_train_labels.pkl", 'wb') as f:
+		pickle.dump(train_labels, f)
+	
+	with open(OUTPUT_DIR / "word2vec_test_labels.pkl", 'wb') as f:
+		pickle.dump(test_labels, f)
+	
+	print(f"Saved embeddings and labels to {OUTPUT_DIR}")
+	print(f"  - Embeddings: word2vec_train_embeddings.pkl, word2vec_test_embeddings.pkl")
+	print(f"  - Labels: word2vec_train_labels.pkl, word2vec_test_labels.pkl")
+	
+	# Visualize (sample up to 5000 points to avoid overcrowding)
+	sample_size = min(5000, len(train_embeddings))
+	sample_idx = np.random.choice(len(train_embeddings), sample_size, replace=False)
+	
+	visualize_embeddings(
+		train_embeddings[sample_idx], 
+		train_df['label'].iloc[sample_idx].tolist(),
+		output_file=OUTPUT_DIR / "word2vec_visualization.png"
+	)
+	
+	print("Word2Vec embedding processing complete!")
 
 if __name__ == "__main__":
+<<<<<<< Current (Your changes)
     main()
+=======
+	main()
+>>>>>>> Incoming (Background Agent changes)
