@@ -1496,6 +1496,50 @@ def train_model(
     # Add a normal/benign class to the attack types
     all_classes = classes + ['normal']
     
+    # Store original embeddings and labels for consistency
+    original_embeddings = embeddings.copy()
+    original_true_labels = true_labels.copy() if true_labels is not None else None
+    original_n_samples = len(embeddings)
+    
+    # Pre-process data augmentation for normal class if needed
+    augmented_embeddings = None
+    augmented_labels = None
+    normal_binary_labels = None
+    
+    if true_labels is not None:
+        # Check if we need to augment normal samples
+        normal_binary_labels = (np.sum(true_labels, axis=1) == 0).astype(np.float32)
+        if np.sum(normal_binary_labels) < 10:  # Very few normal samples
+            print(f"⚠️  Extreme imbalance detected: only {np.sum(normal_binary_labels)} normal samples!")
+            print(f"🔧 Applying data augmentation for normal class...")
+            
+            # Create synthetic normal samples by slightly modifying existing normal samples
+            normal_indices = np.where(normal_binary_labels == 1)[0]
+            if len(normal_indices) > 0:
+                # Multiply normal samples to have at least 100 samples
+                target_normal_samples = min(100, len(embeddings) // 10)
+                multiplier = max(1, target_normal_samples // len(normal_indices))
+                
+                # Add noise to create variations of normal samples
+                normal_embeddings = embeddings[normal_indices]
+                augmented_embeddings = []
+                augmented_labels = []
+                
+                for _ in range(multiplier):
+                    # Add small amount of Gaussian noise
+                    noise = np.random.normal(0, 0.01, normal_embeddings.shape)
+                    noisy_embeddings = normal_embeddings + noise
+                    augmented_embeddings.append(noisy_embeddings)
+                    augmented_labels.extend([1.0] * len(normal_embeddings))
+                
+                if augmented_embeddings:
+                    # Create augmented data
+                    augmented_embeddings = np.vstack(augmented_embeddings)
+                    augmented_labels = np.array(augmented_labels)
+                    additional_attack_labels = np.zeros((len(augmented_embeddings), len(classes)))
+                    
+                    print(f"✅ Created {len(augmented_embeddings)} synthetic normal samples")
+    
     for class_idx, class_type in enumerate(all_classes):
         print(f"\n{'='*60}")
         print(f"🎯 Training model for class: {class_type}")
@@ -1504,67 +1548,48 @@ def train_model(
         # Create binary labels for this class (1 for this class, 0 for others)
         if true_labels is not None:
             if class_type == 'normal':
-                # Normal class: 1 if no attack present (all zeros), 0 otherwise
-                binary_labels = (np.sum(true_labels, axis=1) == 0).astype(np.float32)
-                print(f"📊 Normal class: {np.sum(binary_labels)} normal samples out of {len(binary_labels)} total")
-                
-                # Handle extreme imbalance for normal class
-                if np.sum(binary_labels) < 10:  # Very few normal samples
-                    print(f"⚠️  Extreme imbalance detected: only {np.sum(binary_labels)} normal samples!")
-                    print(f"🔧 Applying data augmentation for normal class...")
+                # Use pre-computed normal binary labels
+                if augmented_embeddings is not None:
+                    # Combine original and augmented data
+                    combined_embeddings = np.vstack([original_embeddings, augmented_embeddings])
+                    combined_binary_labels = np.concatenate([normal_binary_labels, augmented_labels])
+                    combined_true_labels = np.vstack([original_true_labels, additional_attack_labels])
                     
-                    # Create synthetic normal samples by slightly modifying existing normal samples
-                    normal_indices = np.where(binary_labels == 1)[0]
-                    if len(normal_indices) > 0:
-                        # Multiply normal samples to have at least 100 samples
-                        target_normal_samples = min(100, len(embeddings) // 10)
-                        multiplier = max(1, target_normal_samples // len(normal_indices))
-                        
-                        # Add noise to create variations of normal samples
-                        normal_embeddings = embeddings[normal_indices]
-                        augmented_embeddings = []
-                        augmented_labels = []
-                        
-                        for _ in range(multiplier):
-                            # Add small amount of Gaussian noise
-                            noise = np.random.normal(0, 0.01, normal_embeddings.shape)
-                            noisy_embeddings = normal_embeddings + noise
-                            augmented_embeddings.append(noisy_embeddings)
-                            augmented_labels.extend([1.0] * len(normal_embeddings))
-                        
-                        if augmented_embeddings:
-                            # Update embeddings and labels with augmented data
-                            embeddings = np.vstack([embeddings] + augmented_embeddings)
-                            additional_attack_labels = np.zeros((len(np.vstack(augmented_embeddings)), len(classes)))
-                            true_labels = np.vstack([true_labels, additional_attack_labels])
-                            
-                            # Update binary labels
-                            binary_labels = np.concatenate([binary_labels, augmented_labels])
-                            
-                            print(f"✅ Added {len(np.vstack(augmented_embeddings))} synthetic normal samples")
-                            print(f"📊 New dataset size: {len(embeddings)} samples")
+                    print(f"📊 Normal class with augmentation: {np.sum(combined_binary_labels)} normal samples out of {len(combined_binary_labels)} total")
+                else:
+                    # Use original data only
+                    combined_embeddings = original_embeddings
+                    combined_binary_labels = normal_binary_labels
+                    combined_true_labels = original_true_labels
+                    
+                    print(f"📊 Normal class: {np.sum(combined_binary_labels)} normal samples out of {len(combined_binary_labels)} total")
             else:
-                # Attack class: use the corresponding column
+                # Attack class: use the corresponding column from original data
                 attack_idx = classes.index(class_type)
-                binary_labels = true_labels[:, attack_idx].astype(np.float32)
-                print(f"📊 Attack class {class_type}: {np.sum(binary_labels)} attack samples out of {len(binary_labels)} total")
+                combined_embeddings = original_embeddings
+                combined_binary_labels = original_true_labels[:, attack_idx].astype(np.float32)
+                combined_true_labels = original_true_labels
+                
+                print(f"📊 Attack class {class_type}: {np.sum(combined_binary_labels)} attack samples out of {len(combined_binary_labels)} total")
             
-            print(f"📊 Binary distribution for {class_type}: {np.sum(binary_labels==0)} negative, {np.sum(binary_labels==1)} positive")
+            print(f"📊 Binary distribution for {class_type}: {np.sum(combined_binary_labels==0)} negative, {np.sum(combined_binary_labels==1)} positive")
             
             # Check for extreme imbalance and warn
-            positive_ratio = np.sum(binary_labels) / len(binary_labels)
+            positive_ratio = np.sum(combined_binary_labels) / len(combined_binary_labels)
             if positive_ratio > 0.95:
                 print(f"⚠️  High positive ratio ({positive_ratio:.1%}) - this class appears in most samples")
             elif positive_ratio < 0.05:
                 print(f"⚠️  Low positive ratio ({positive_ratio:.1%}) - this class is very rare")
         else:
             # Create pseudo-labels for this class type using clustering
-            binary_labels = generate_pseudo_labels_for_attack_type(
-                embeddings, class_type, class_idx, n_samples=len(embeddings)
+            combined_embeddings = original_embeddings
+            combined_binary_labels = generate_pseudo_labels_for_attack_type(
+                combined_embeddings, class_type, class_idx, n_samples=len(combined_embeddings)
             )
-            print(f"📊 Using pseudo-labels for {class_type}: {len(binary_labels)} samples")
+            combined_true_labels = None
+            print(f"📊 Using pseudo-labels for {class_type}: {len(combined_binary_labels)} samples")
         
-        print(f"🔍 Debug: embeddings shape {embeddings.shape}, binary_labels shape {binary_labels.shape}")
+        print(f"🔍 Debug: embeddings shape {combined_embeddings.shape}, binary_labels shape {combined_binary_labels.shape}")
         
         # Create enhanced single-class model for this attack type with conservative settings
         enhanced_config = EnhancedTransformerConfig(
@@ -1611,13 +1636,13 @@ def train_model(
         
         # Train this model
         trained_model = train_single_attack_model(
-            model, embeddings, binary_labels, class_type, config, tracker, log_type, enhanced_config
+            model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
         )
         
-        # Generate predictions for this class
+        # Generate predictions for this class using original embeddings only
         trained_model.eval()
         with torch.no_grad():
-            embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
+            embeddings_tensor = torch.from_numpy(original_embeddings).float().to(device)
             outputs = trained_model(embeddings_tensor)
             class_scores = outputs["multi_label_scores"]  # [batch, 1]
             class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()  # [batch]
@@ -1632,14 +1657,14 @@ def train_model(
         print(f"📊 Predictions: {np.sum(class_preds)}/{len(class_preds)} samples classified as {class_type}")
         
         # Show more detailed prediction analysis
-        if true_labels is not None:
+        if original_true_labels is not None:
             if class_type == 'normal':
-                actual_normal = np.sum(np.sum(true_labels, axis=1) == 0)
+                actual_normal = np.sum(np.sum(original_true_labels, axis=1) == 0)
                 predicted_normal = np.sum(class_preds)
                 print(f"📈 Normal class analysis: {actual_normal} actual vs {predicted_normal} predicted")
             else:
                 attack_idx = classes.index(class_type)
-                actual_attack = np.sum(true_labels[:, attack_idx])
+                actual_attack = np.sum(original_true_labels[:, attack_idx])
                 predicted_attack = np.sum(class_preds)
                 print(f"📈 {class_type} analysis: {actual_attack} actual vs {predicted_attack} predicted")
     
@@ -1739,9 +1764,49 @@ def load_and_preprocess_data(
     
     print(f"🔄 Loading data for {log_type}...")
     
-    # Load embeddings
-    embeddings_dir = Path("embeddings") / log_type
+    # Try different embedding subfolder structures
+    embedding_paths = [
+        Path("embeddings") / log_type,
+        Path("embeddings") / "fasttext" / log_type,
+        Path("embeddings") / "bert" / log_type,
+        Path("embeddings") / "logbert" / log_type,
+    ]
+    
+    embeddings = None
+    embeddings_dir = None
+    
+    for path in embedding_paths:
+        log_file = path / f"log_{log_type}.pkl"
+        if log_file.exists():
+            embeddings_dir = path
+            print(f"📁 Found embeddings in: {path}")
+            break
+    
+    if embeddings_dir is None:
+        # Try to find any embedding file for this log type
+        for path in embedding_paths:
+            if path.exists():
+                for file in path.glob(f"*{log_type}*.pkl"):
+                    if "log" in file.name:
+                        embeddings_dir = path
+                        log_file = file
+                        print(f"📁 Found embeddings in: {path} - {file.name}")
+                        break
+                if embeddings_dir:
+                    break
+    
+    if embeddings_dir is None:
+        raise FileNotFoundError(f"Embeddings not found for {log_type} in any of the expected locations")
+    
     log_file = embeddings_dir / f"log_{log_type}.pkl"
+    if not log_file.exists():
+        # Try alternative naming patterns
+        for pattern in [f"*{log_type}*.pkl", f"log_*.pkl", f"embeddings_*.pkl"]:
+            files = list(embeddings_dir.glob(pattern))
+            if files:
+                log_file = files[0]
+                print(f"📁 Using embedding file: {log_file}")
+                break
     
     if not log_file.exists():
         raise FileNotFoundError(f"Embeddings not found: {log_file}")
@@ -1754,19 +1819,63 @@ def load_and_preprocess_data(
         else:
             embeddings = loaded
     
-    # Load labels
+    # Load labels - try different naming patterns
     label_file = embeddings_dir / f"label_{log_type}.pkl"
+    if not label_file.exists():
+        # Try alternative naming patterns
+        for pattern in [f"label_*.pkl", f"labels_*.pkl", f"*label*.pkl"]:
+            files = list(embeddings_dir.glob(pattern))
+            if files:
+                label_file = files[0]
+                print(f"📁 Using label file: {label_file}")
+                break
+    
     if not label_file.exists():
         raise FileNotFoundError(f"Labels not found: {label_file}")
     
     with open(label_file, 'rb') as f:
         label_data = pickle.load(f)
     
-    true_labels = label_data["vectors"]
-    classes = label_data["classes"]
+    # Handle different label data structures
+    if isinstance(label_data, dict):
+        if "vectors" in label_data:
+            true_labels = label_data["vectors"]
+        elif "labels" in label_data:
+            true_labels = label_data["labels"]
+        else:
+            # Assume the dict itself contains the labels
+            true_labels = np.array(list(label_data.values()))
+        
+        if "classes" in label_data:
+            classes = label_data["classes"]
+        elif "class_names" in label_data:
+            classes = label_data["class_names"]
+        else:
+            # Generate default class names
+            classes = [f"class_{i}" for i in range(true_labels.shape[1] if true_labels.ndim > 1 else 1)]
+    else:
+        # Assume label_data is directly the labels array
+        true_labels = label_data
+        classes = [f"class_{i}" for i in range(true_labels.shape[1] if true_labels.ndim > 1 else 1)]
     
     # Store true labels in tracker for later use
     tracker.true_labels = true_labels
+    
+    # Determine embedding type based on dimensions
+    embedding_dim = embeddings.shape[1]
+    if embedding_dim == 300:
+        embedding_type = "FastText (300D)"
+    elif embedding_dim == 768:
+        embedding_type = "BERT CLS (768D)"
+    elif embedding_dim == 2314:
+        embedding_type = "Enhanced LogBERT (2314D)"
+    else:
+        embedding_type = f"Unknown ({embedding_dim}D)"
+    
+    print(f"🔍 Detected embedding type: {embedding_type}")
+    print(f"📊 Embedding dimensions: {embeddings.shape}")
+    print(f"📊 Label dimensions: {true_labels.shape if true_labels is not None else 'None'}")
+    print(f"📊 Number of classes: {len(classes)}")
     
     # Sample data if requested
     if sample_size and sample_size < len(embeddings):
@@ -1783,8 +1892,8 @@ def load_and_preprocess_data(
             "requested_size": sample_size,
             "actual_size": sample_size,
             "memory_gb": embeddings.nbytes / (1024**3),
-            "embedding_dim": embeddings.shape[1],
-            "embedding_type": "FastText (300D)" if embeddings.shape[1] == 300 else "Unknown"
+            "embedding_dim": embedding_dim,
+            "embedding_type": embedding_type
         })
     else:
         print(f"📊 Using full dataset: {len(embeddings):,} samples ({embeddings.nbytes / (1024**3):.1f} GB)")
@@ -1792,8 +1901,8 @@ def load_and_preprocess_data(
         tracker.log_step("Full Dataset Processing", {
             "total_samples": len(embeddings),
             "memory_gb": embeddings.nbytes / (1024**3),
-            "embedding_dim": embeddings.shape[1],
-            "embedding_type": "FastText (300D)" if embeddings.shape[1] == 300 else "Unknown",
+            "embedding_dim": embedding_dim,
+            "embedding_type": embedding_type,
             "device_type": config.device
         })
     
@@ -1803,19 +1912,19 @@ def load_and_preprocess_data(
     
     tracker.log_step("Data Preprocessing", {
         "embeddings_shape": list(embeddings.shape),
-        "embedding_type": "FastText (300D)" if embeddings.shape[1] == 300 else "Unknown",
+        "embedding_type": embedding_type,
         "n_classes": len(classes),
         "n_clusters": len(classes),
         "has_true_labels": true_labels is not None
     })
     
     print(f"✅ Data loading completed in {time.time():.1f}s")
-    print(f"📊 Loaded {len(embeddings):,} samples with {embeddings.shape[1]}D embeddings")
+    print(f"📊 Loaded {len(embeddings):,} samples with {embedding_dim}D embeddings ({embedding_type})")
     
     if sample_size:
         print(f"🎯 Using sample size: {len(embeddings)} (requested: {sample_size})")
     
-    print(f"✔ Data loaded: {len(embeddings)} samples, {embeddings.shape[1]} features")
+    print(f"✔ Data loaded: {len(embeddings)} samples, {embedding_dim} features ({embedding_type})")
     
     return embeddings_scaled, classes, true_labels, scaler
 
