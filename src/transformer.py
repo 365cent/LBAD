@@ -57,6 +57,18 @@ from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, TensorDataset
 
+# Import utility modules for better code organization
+try:
+    from .transformer_utils import (
+        ArchitectureOptimizer, PerformanceMonitor, MemoryManager,
+        DataProcessor, LossOptimizer, format_training_summary, estimate_training_time
+    )
+except ImportError:
+    from transformer_utils import (
+        ArchitectureOptimizer, PerformanceMonitor, MemoryManager,
+        DataProcessor, LossOptimizer, format_training_summary, estimate_training_time
+    )
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
@@ -77,50 +89,57 @@ class SystemConfig:
 
 @dataclass
 class EnhancedTransformerConfig:
-    """Enhanced configuration for the multi-label transformer model."""
-    # Model architecture
-    d_model: int = 512
+    """Optimized configuration for the multi-label transformer model."""
+    # Model architecture - Reduced for performance
+    d_model: int = 256  # Reduced from 512
     n_heads: int = 8
-    n_layers: int = 6
-    d_ff: int = 2048
+    n_layers: int = 3   # Reduced from 6
+    d_ff: int = 1024    # Reduced from 2048
     dropout: float = 0.1
     max_seq_length: int = 512
     
     # Multi-label specific parameters
     num_labels: int = 10
-    label_correlation_weight: float = 0.2
+    label_correlation_weight: float = 0.1  # Reduced
     focal_loss_alpha: float = 0.25
-    focal_loss_gamma: float = 2.0
+    focal_loss_gamma: float = 1.5  # Reduced for stability
     
-    # Training parameters
-    learning_rate: float = 1e-4
+    # Training parameters - Optimized for speed
+    learning_rate: float = 2e-4  # Slightly higher for faster convergence
     weight_decay: float = 1e-5
-    batch_size: int = 32
-    epochs: int = 100
-    warmup_steps: int = 1000
+    batch_size: int = 64  # Increased default
+    epochs: int = 50      # Reduced from 100
+    max_epochs_per_model: int = 100  # Max epochs for individual models
+    warmup_steps: int = 500  # Reduced
     
     # Data splitting parameters
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
+    train_ratio: float = 0.8
+    test_ratio: float = 0.2
     stratify: bool = True
     random_state: int = 42
     
-    # SMOTE parameters
+    # Performance optimization flags
+    use_mixed_precision: bool = True
+    gradient_checkpointing: bool = False
+    compile_model: bool = False  # PyTorch 2.0 compilation
+    
+    # SMOTE parameters - Optimized for speed
     use_smote: bool = True
-    smote_variant: str = 'smote'  # 'smote', 'borderline', 'adasyn'
-    contamination_rate: float = 0.1
-    smote_k_neighbors: int = 5
+    smote_variant: str = 'smote'  # Only basic SMOTE for speed
+    contamination_rate: float = 0.15  # Slightly higher
+    smote_k_neighbors: int = 3  # Reduced for speed
+    smote_max_samples: int = 5000  # Limit SMOTE output
     
-    # Hierarchical clustering parameters
-    use_hierarchical: bool = True
-    hierarchy_levels: int = 3
-    clustering_method: str = 'agglomerative'  # 'kmeans', 'agglomerative'
+    # Clustering parameters - Simplified
+    use_hierarchical: bool = False  # Disabled for performance
+    hierarchy_levels: int = 2
+    clustering_method: str = 'kmeans'  # Faster than agglomerative
     
-    # Loss weights
-    reconstruction_weight: float = 1.0
-    contrastive_weight: float = 0.5
+    # Loss weights - Simplified
+    reconstruction_weight: float = 0.5  # Reduced
+    contrastive_weight: float = 0.2     # Reduced
     classification_weight: float = 1.0
+    use_complex_losses: bool = False    # Disable complex loss functions
     
     # Evaluation parameters
     eval_metrics: List[str] = field(default_factory=lambda: [
@@ -132,54 +151,26 @@ class EnhancedTransformerConfig:
     device: str = 'auto'
 
 
-class FocalLoss(nn.Module):
-    """Focal Loss for addressing class imbalance in multi-label classification."""
+class SimplifiedFocalLoss(nn.Module):
+    """Simplified Focal Loss for better performance."""
     
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+    def __init__(self, alpha: float = 0.25, gamma: float = 1.5, reduction: str = 'mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
         
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Compute focal loss with numerical stability.
-        
-        Args:
-            inputs: Predicted logits (batch_size, num_labels)
-            targets: Ground truth labels (batch_size, num_labels)
-            
-        Returns:
-            Focal loss value
-        """
-        # Clamp inputs to prevent overflow
-        inputs = torch.clamp(inputs, min=-10, max=10)
-        
-        # Apply sigmoid to get probabilities
-        probs = torch.sigmoid(inputs)
-        
-        # Add small epsilon for numerical stability
-        eps = 1e-8
-        probs = torch.clamp(probs, min=eps, max=1.0 - eps)
-        
-        # Compute binary cross entropy with clamped values
+        """Simplified focal loss computation."""
+        # Use built-in BCE with logits for stability
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         
-        # Compute focal weight with stability checks
+        # Simplified focal weight calculation
+        probs = torch.sigmoid(inputs)
         p_t = probs * targets + (1 - probs) * (1 - targets)
-        p_t = torch.clamp(p_t, min=eps, max=1.0 - eps)
+        focal_weight = self.alpha * (1 - p_t) ** self.gamma
         
-        # Compute focal weight with clamping to prevent extreme values
-        focal_weight = self.alpha * torch.pow(1 - p_t, self.gamma)
-        focal_weight = torch.clamp(focal_weight, min=eps, max=100.0)  # Prevent extreme weights
-        
-        # Apply focal weight
         focal_loss = focal_weight * bce_loss
-        
-        # Check for NaN/Inf before reduction
-        if torch.isnan(focal_loss).any() or torch.isinf(focal_loss).any():
-            # Fallback to standard BCE loss
-            return F.binary_cross_entropy_with_logits(inputs, targets, reduction=self.reduction)
         
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -388,141 +379,362 @@ class DataSplitter:
         
     def split_data(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, ...]:
         """
-        Split data into train/validation/test sets with stratification.
+        Split data into train/test sets with stratification (80/20 split).
         
         Args:
             X: Input features
             y: Multi-label targets
             
         Returns:
-            Tuple of (X_train, X_val, X_test, y_train, y_val, y_test)
+            Tuple of (X_train, X_test, y_train, y_test)
         """
         if self.config.stratify and y.ndim > 1:
             # For multi-label stratification, use iterative stratification
             return self._iterative_stratification(X, y)
         else:
             # Simple random split
-            return self._random_split(X, y)
+            return self._simple_split(X, y)
     
-    def _random_split(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, ...]:
-        """Perform random data splitting."""
-        # First split: train + val vs test
-        X_temp, X_test, y_temp, y_test = train_test_split(
+    def print_data_distribution(self, y: np.ndarray, classes: List[str], split_name: str, prefix: str = ""):
+        """Print detailed data distribution analysis."""
+        print(f"\n{prefix}📊 {split_name} Data Distribution Analysis:")
+        print(f"{prefix}{'='*50}")
+        
+        if y.ndim == 1:
+            # Single label case
+            unique, counts = np.unique(y, return_counts=True)
+            total = len(y)
+            print(f"{prefix}Total samples: {total:,}")
+            for label, count in zip(unique, counts):
+                percentage = (count / total) * 100
+                print(f"{prefix}  Class {label}: {count:,} samples ({percentage:.2f}%)")
+        else:
+            # Multi-label case
+            total = len(y)
+            print(f"{prefix}Total samples: {total:,}")
+            print(f"{prefix}Number of classes: {len(classes)}")
+            
+            # Per-class distribution
+            for i, class_name in enumerate(classes):
+                positive_count = np.sum(y[:, i])
+                percentage = (positive_count / total) * 100
+                print(f"{prefix}  {class_name}: {positive_count:,} positive samples ({percentage:.2f}%)")
+            
+            # Normal samples (no attack)
+            normal_count = np.sum(np.sum(y, axis=1) == 0)
+            normal_percentage = (normal_count / total) * 100
+            print(f"{prefix}  Normal (no attack): {normal_count:,} samples ({normal_percentage:.2f}%)")
+            
+            # Multi-label samples
+            multi_label_count = np.sum(np.sum(y, axis=1) > 1)
+            multi_label_percentage = (multi_label_count / total) * 100
+            print(f"{prefix}  Multi-label samples: {multi_label_count:,} ({multi_label_percentage:.2f}%)")
+            
+            # Class imbalance analysis
+            print(f"\n{prefix}🔍 Imbalance Analysis:")
+            for i, class_name in enumerate(classes):
+                positive_count = np.sum(y[:, i])
+                imbalance_ratio = positive_count / (total - positive_count) if (total - positive_count) > 0 else float('inf')
+                if imbalance_ratio < 0.1:
+                    status = "⚠️  SEVERE IMBALANCE"
+                elif imbalance_ratio < 0.3:
+                    status = "⚠️  MODERATE IMBALANCE"
+                else:
+                    status = "✅ BALANCED"
+                print(f"{prefix}  {class_name}: ratio {imbalance_ratio:.3f} - {status}")
+        
+        print(f"{prefix}{'='*50}")
+    
+    def _simple_split(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, ...]:
+        """Perform simple 80/20 train/test split."""
+        X_train, X_test, y_train, y_test = train_test_split(
             X, y, 
             test_size=self.config.test_ratio,
-            random_state=self.config.random_state
+            random_state=self.config.random_state,
+            stratify=y if y.ndim == 1 else None  # Can only stratify single-label
         )
         
-        # Second split: train vs val
-        val_size = self.config.val_ratio / (self.config.train_ratio + self.config.val_ratio)
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp,
-            test_size=val_size,
-            random_state=self.config.random_state
-        )
-        
-        return X_train, X_val, X_test, y_train, y_val, y_test
+        return X_train, X_test, y_train, y_test
     
     def _iterative_stratification(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, ...]:
-        """Perform iterative stratification for multi-label data."""
+        """Perform iterative stratification for multi-label data (80/20 split)."""
         try:
             from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
             
-            # Create stratified splits
+            # Create stratified splits for 80/20 train/test
             msss = MultilabelStratifiedShuffleSplit(
                 n_splits=1,
                 test_size=self.config.test_ratio,
                 random_state=self.config.random_state
             )
             
-            train_val_idx, test_idx = next(msss.split(X, y))
-            X_temp, X_test = X[train_val_idx], X[test_idx]
-            y_temp, y_test = y[train_val_idx], y[test_idx]
+            train_idx, test_idx = next(msss.split(X, y))
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
             
-            # Split train and validation
-            val_size = self.config.val_ratio / (self.config.train_ratio + self.config.val_ratio)
-            msss_val = MultilabelStratifiedShuffleSplit(
-                n_splits=1,
-                test_size=val_size,
-                random_state=self.config.random_state
-            )
-            
-            train_idx, val_idx = next(msss_val.split(X_temp, y_temp))
-            X_train, X_val = X_temp[train_idx], X_temp[val_idx]
-            y_train, y_val = y_temp[train_idx], y_temp[val_idx]
-            
-            return X_train, X_val, X_test, y_train, y_val, y_test
+            return X_train, X_test, y_train, y_test
             
         except ImportError:
-            print("Warning: iterative-stratification not available, using random split")
-            return self._random_split(X, y)
+            print("Warning: iterative-stratification not available, using simple split")
+            return self._simple_split(X, y)
 
 
 class SMOTEIntegrator:
-    """Enhanced SMOTE integration with contamination rate control."""
+    """Lightweight SMOTE integration with contamination rate control and detailed reporting."""
     
     def __init__(self, config: EnhancedTransformerConfig):
         self.config = config
+        self.smote_reports = []  # Store SMOTE modification reports
         
-        # SMOTE variants
+        # Lightweight SMOTE variants (reduced complexity for speed)
         self.smote_variants = {
             'smote': SMOTE(
-                k_neighbors=config.smote_k_neighbors,
-                random_state=config.random_state
+                k_neighbors=min(3, config.smote_k_neighbors),  # Reduced for speed
+                random_state=config.random_state,
+                n_jobs=1  # Single thread for stability
             ),
             'borderline': BorderlineSMOTE(
-                k_neighbors=config.smote_k_neighbors,
-                random_state=config.random_state
+                k_neighbors=min(3, config.smote_k_neighbors),
+                random_state=config.random_state,
+                n_jobs=1
             ),
             'adasyn': ADASYN(
-                n_neighbors=config.smote_k_neighbors,
-                random_state=config.random_state
+                n_neighbors=min(3, config.smote_k_neighbors),
+                random_state=config.random_state,
+                n_jobs=1
             )
         }
     
-    def apply_smote(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def apply_smote_multilabel(self, X: np.ndarray, y: np.ndarray, classes: List[str], 
+                              split_name: str = "train") -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply SMOTE with contamination rate control.
+        Apply lightweight SMOTE with detailed reporting for multi-label data.
         
         Args:
             X: Input features
             y: Multi-label targets
+            classes: List of class names
+            split_name: Name of the data split (for reporting)
             
         Returns:
             Tuple of (X_resampled, y_resampled)
         """
         if not self.config.use_smote:
+            print(f"⏩ SMOTE disabled, keeping original {split_name} data")
             return X, y
         
-        # Convert multi-label to single-label for SMOTE
-        if y.ndim > 1:
-            # Use label powerset approach
-            y_single = self._multilabel_to_single(y)
-        else:
-            y_single = y
+        print(f"\n🔄 Applying lightweight SMOTE to {split_name} data...")
         
-        # Apply SMOTE
-        smote = self.smote_variants[self.config.smote_variant]
+        # Analyze initial distribution
+        self._print_pre_smote_analysis(y, classes, split_name)
         
-        try:
-            # Calculate sampling strategy based on contamination rate
-            sampling_strategy = self._calculate_sampling_strategy(y_single)
-            smote.set_params(sampling_strategy=sampling_strategy)
+        # Apply SMOTE per class (binary approach)
+        X_resampled = X.copy()
+        y_resampled = y.copy()
+        modifications = []
+        
+        # Check normal samples first
+        normal_mask = np.sum(y, axis=1) == 0
+        normal_count = np.sum(normal_mask)
+        total_samples = len(y)
+        
+        # Determine if we need to oversample normal or attack classes
+        attack_counts = []
+        for i, class_name in enumerate(classes):
+            attack_count = np.sum(y[:, i])
+            attack_counts.append(attack_count)
+        
+        max_attack_count = max(attack_counts) if attack_counts else 0
+        
+        # Handle severe imbalances
+        for i, class_name in enumerate(classes):
+            attack_count = np.sum(y_resampled[:, i])
             
-            X_resampled, y_single_resampled = smote.fit_resample(X, y_single)
+            # Determine if this class needs oversampling
+            target_count = max(min(max_attack_count // 2, total_samples // 10), 50)
             
-            # Convert back to multi-label if needed
-            if y.ndim > 1:
-                y_resampled = self._single_to_multilabel(y_single_resampled, y.shape[1])
+            if attack_count < target_count and attack_count > 0:
+                try:
+                    # Create binary problem for this class
+                    y_binary = y_resampled[:, i].astype(int)
+                    
+                    # Apply lightweight SMOTE
+                    smote = SMOTE(
+                        k_neighbors=min(3, attack_count - 1) if attack_count > 1 else 1,
+                        random_state=self.config.random_state + i,
+                        n_jobs=1
+                    )
+                    
+                    X_class_resampled, y_class_resampled = smote.fit_resample(X_resampled, y_binary)
+                    
+                    # Calculate how many samples were added
+                    added_samples = len(X_class_resampled) - len(X_resampled)
+                    
+                    if added_samples > 0:
+                        # Update the full datasets
+                        X_resampled = X_class_resampled
+                        
+                        # Update y_resampled with proper multi-label format
+                        new_y = np.zeros((len(X_class_resampled), len(classes)))
+                        new_y[:len(y_resampled)] = y_resampled  # Copy original
+                        
+                        # For new samples, copy the pattern from similar samples
+                        for j in range(len(y_resampled), len(X_class_resampled)):
+                            new_y[j, i] = 1  # This class is positive
+                            # Randomly assign other classes based on correlation
+                            for k in range(len(classes)):
+                                if k != i:
+                                    # Check correlation with this class
+                                    correlation = np.corrcoef(y[:, i], y[:, k])[0, 1]
+                                    if not np.isnan(correlation) and correlation > 0.3:
+                                        new_y[j, k] = np.random.choice([0, 1], p=[0.7, 0.3])
+                        
+                        y_resampled = new_y
+                        
+                        modifications.append({
+                            'class': class_name,
+                            'original_count': attack_count,
+                            'new_count': np.sum(y_resampled[:, i]),
+                            'added_samples': added_samples,
+                            'indicator': '++'
+                        })
+                        
+                        print(f"  ++ {class_name}: {attack_count} → {np.sum(y_resampled[:, i])} (+{added_samples} samples)")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  SMOTE failed for {class_name}: {e}")
+                    modifications.append({
+                        'class': class_name,
+                        'original_count': attack_count,
+                        'new_count': attack_count,
+                        'added_samples': 0,
+                        'indicator': '--',
+                        'error': str(e)
+                    })
+        
+        # Handle normal samples if severely underrepresented
+        final_normal_count = np.sum(np.sum(y_resampled, axis=1) == 0)
+        if final_normal_count < max(max_attack_count // 3, 30):
+            try:
+                # Create synthetic normal samples
+                normal_indices = np.where(np.sum(y_resampled, axis=1) == 0)[0]
+                if len(normal_indices) > 0:
+                    target_normal = min(max_attack_count // 2, len(y_resampled) // 5)
+                    needed_normal = max(0, target_normal - final_normal_count)
+                    
+                    if needed_normal > 0:
+                        # Duplicate and add noise to normal samples
+                        normal_samples = X_resampled[normal_indices]
+                        
+                        # Create variations
+                        synthetic_normal = []
+                        for _ in range(min(needed_normal, len(normal_indices) * 3)):
+                            idx = np.random.choice(len(normal_indices))
+                            sample = normal_samples[idx] + np.random.normal(0, 0.01, normal_samples[idx].shape)
+                            synthetic_normal.append(sample)
+                        
+                        if synthetic_normal:
+                            synthetic_normal = np.array(synthetic_normal)
+                            X_resampled = np.vstack([X_resampled, synthetic_normal])
+                            
+                            # Add corresponding labels (all zeros for normal)
+                            synthetic_labels = np.zeros((len(synthetic_normal), len(classes)))
+                            y_resampled = np.vstack([y_resampled, synthetic_labels])
+                            
+                            modifications.append({
+                                'class': 'normal',
+                                'original_count': final_normal_count,
+                                'new_count': np.sum(np.sum(y_resampled, axis=1) == 0),
+                                'added_samples': len(synthetic_normal),
+                                'indicator': '++'
+                            })
+                            
+                            print(f"  ++ normal: {final_normal_count} → {np.sum(np.sum(y_resampled, axis=1) == 0)} (+{len(synthetic_normal)} samples)")
+            
+            except Exception as e:
+                print(f"  ⚠️  Normal sample augmentation failed: {e}")
+                modifications.append({
+                    'class': 'normal',
+                    'original_count': final_normal_count,
+                    'new_count': final_normal_count,
+                    'added_samples': 0,
+                    'indicator': '--',
+                    'error': str(e)
+                })
+        
+        # Store modifications for reporting
+        self.smote_reports.append({
+            'split_name': split_name,
+            'modifications': modifications,
+            'original_size': len(X),
+            'final_size': len(X_resampled)
+        })
+        
+        # Print final summary
+        total_added = len(X_resampled) - len(X)
+        print(f"\n✅ SMOTE completed for {split_name}:")
+        print(f"   Original: {len(X):,} samples")
+        print(f"   Final: {len(X_resampled):,} samples (+{total_added:,})")
+        
+        return X_resampled, y_resampled
+    
+    def _print_pre_smote_analysis(self, y: np.ndarray, classes: List[str], split_name: str):
+        """Print pre-SMOTE analysis to identify imbalances."""
+        print(f"  📊 {split_name} imbalance analysis:")
+        total = len(y)
+        
+        # Normal samples
+        normal_count = np.sum(np.sum(y, axis=1) == 0)
+        print(f"    Normal: {normal_count:,} ({normal_count/total*100:.1f}%)")
+        
+        # Attack classes
+        for i, class_name in enumerate(classes):
+            attack_count = np.sum(y[:, i])
+            percentage = attack_count / total * 100
+            
+            if attack_count == 0:
+                status = "🚫 MISSING"
+            elif percentage < 1:
+                status = "⚠️  SEVERE"
+            elif percentage < 5:
+                status = "⚠️  MODERATE"
             else:
-                y_resampled = y_single_resampled
+                status = "✅ OK"
             
-            print(f"SMOTE applied: {X.shape[0]} -> {X_resampled.shape[0]} samples")
-            return X_resampled, y_resampled
+            print(f"    {class_name}: {attack_count:,} ({percentage:.1f}%) {status}")
+    
+    def save_smote_report(self, output_path: str):
+        """Save detailed SMOTE modification report."""
+        report_lines = []
+        report_lines.append("SMOTE Modification Report")
+        report_lines.append("=" * 50)
+        report_lines.append("")
+        
+        for report in self.smote_reports:
+            report_lines.append(f"Split: {report['split_name']}")
+            report_lines.append(f"Original size: {report['original_size']:,}")
+            report_lines.append(f"Final size: {report['final_size']:,}")
+            report_lines.append(f"Total added: {report['final_size'] - report['original_size']:,}")
+            report_lines.append("")
             
-        except Exception as e:
-            print(f"SMOTE failed: {e}, returning original data")
-            return X, y
+            for mod in report['modifications']:
+                indicator = mod['indicator']
+                class_name = mod['class']
+                original = mod['original_count']
+                new_count = mod['new_count']
+                added = mod['added_samples']
+                
+                if 'error' in mod:
+                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} (ERROR: {mod['error']})")
+                else:
+                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} (+{added})")
+            
+            report_lines.append("")
+        
+        with open(output_path, 'w') as f:
+            f.write("\n".join(report_lines))
+        
+        print(f"📄 SMOTE report saved to: {output_path}")
     
     def _multilabel_to_single(self, y_multilabel: np.ndarray) -> np.ndarray:
         """Convert multi-label to single-label using label powerset."""
@@ -570,21 +782,18 @@ class SMOTEIntegrator:
         return sampling_strategy if sampling_strategy else 'auto'
 
 
-class UnsupervisedMultiLabelTransformer(nn.Module):
-    """Enhanced Transformer for unsupervised multi-label attack type detection."""
+class OptimizedTransformer(nn.Module):
+    """Optimized Transformer for efficient multi-label attack detection."""
     
     def __init__(
         self,
         input_dim: int,
         latent_dim: int,
-        n_labels: int,
-        n_clusters: int,  # Kept for API compatibility
+        n_labels: int = 1,
         dropout: float = 0.1,
         transformer_layers: int = 2,
-        attention_heads: int = 8,
-        use_enhanced_attention: bool = True,
-        use_label_correlation: bool = True,
-        use_contrastive: bool = True,
+        attention_heads: int = 4,  # Reduced default
+        use_simple_attention: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -592,70 +801,40 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.n_labels = n_labels
-        self.n_clusters = n_clusters
-        self.use_enhanced_attention = use_enhanced_attention
-        self.use_label_correlation = use_label_correlation
-        self.use_contrastive = use_contrastive
+        self.use_simple_attention = use_simple_attention
         
-        # Enhanced input projection with normalization and activation
+        # Simplified input projection
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),  # GELU for better performance
+            nn.ReLU(),  # Faster than GELU
             nn.Dropout(dropout)
         )
         
-        # Positional encoding for sequence modeling
-        self.pos_encoding = self._create_positional_encoding(latent_dim, 512)
+        # Use standard transformer encoder for efficiency
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=attention_heads,
+            dim_feedforward=latent_dim * 2,  # Reduced from 4x
+            dropout=dropout,
+            activation='relu',  # Faster than gelu
+            norm_first=False,   # Standard configuration
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=transformer_layers
+        )
         
-        # Enhanced transformer blocks or standard transformer
-        if use_enhanced_attention:
-            self.transformer_blocks = nn.ModuleList([
-                EnhancedTransformerBlock(latent_dim, attention_heads, latent_dim * 4, dropout)
-                for _ in range(transformer_layers)
-            ])
-        else:
-            # Standard transformer encoder
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=latent_dim,
-                nhead=attention_heads,
-                dim_feedforward=latent_dim * 4,
-                dropout=dropout,
-                activation='gelu',
-                norm_first=True,
-                batch_first=True
-            )
-            self.transformer_encoder = nn.TransformerEncoder(
-                encoder_layer, num_layers=transformer_layers
-            )
-        
-        # Label correlation module
-        if use_label_correlation and n_labels > 1:
-            self.label_correlation = LabelCorrelationModule(n_labels, latent_dim)
-        
-        # Enhanced decoder for reconstruction
+        # Simplified decoder
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
             nn.Linear(latent_dim, input_dim)
         )
         
-        # Contrastive learning head
-        if use_contrastive:
-            self.contrastive_head = nn.Sequential(
-                nn.Linear(latent_dim, latent_dim),
-                nn.GELU(),
-                nn.Linear(latent_dim, 128)
-            )
-        
-        # Enhanced classifier
+        # Simple classifier
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim // 2, n_labels)
         )
@@ -689,31 +868,17 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)  # Conservative embedding init
     
-    def forward(self, x, mask=None, return_attention=False, **kwargs):
-        """Forward pass with enhanced architecture"""
+    def forward(self, x, mask=None, **kwargs):
+        """Simplified forward pass for better performance"""
         # Handle 2D input
         if x.dim() == 2:
             x = x.unsqueeze(1)  # Add sequence dimension
         
-        batch_size, seq_len, _ = x.shape
-        
         # Input projection
-        x = self.input_projection(x)  # [batch, seq_len, latent_dim]
-        
-        # Add positional encoding
-        x = x + self.pos_encoding[:seq_len, :].transpose(0, 1)
+        x = self.input_projection(x)
         
         # Transformer encoding
-        attention_weights = []
-        if self.use_enhanced_attention:
-            # Use enhanced transformer blocks
-            for transformer_block in self.transformer_blocks:
-                x, attn_weights = transformer_block(x, mask)
-                if return_attention:
-                    attention_weights.append(attn_weights)
-        else:
-            # Use standard transformer
-            x = self.transformer_encoder(x, mask)
+        x = self.transformer_encoder(x, mask)
         
         # Global representation
         pooled = torch.mean(x, dim=1)  # Global average pooling
@@ -722,25 +887,9 @@ class UnsupervisedMultiLabelTransformer(nn.Module):
         outputs = {
             "sequence_representation": pooled,
             "reconstructed": self.decoder(pooled),
+            "multi_label_scores": self.classifier(pooled),
+            "pooled": pooled  # Legacy compatibility
         }
-        
-        # Multi-label predictions
-        if self.use_label_correlation and hasattr(self, 'label_correlation'):
-            multi_label_scores = self.label_correlation(pooled)
-        else:
-            multi_label_scores = self.classifier(pooled)
-        
-        outputs["multi_label_scores"] = multi_label_scores
-        
-        # Contrastive features
-        if self.use_contrastive and hasattr(self, 'contrastive_head'):
-            outputs["contrastive"] = F.normalize(self.contrastive_head(pooled), dim=-1)
-        
-        # Legacy compatibility
-        outputs["pooled"] = pooled
-        
-        if return_attention:
-            outputs["attention_weights"] = attention_weights
         
         return outputs
 
@@ -1105,8 +1254,8 @@ def generate_pseudo_labels_for_attack_type(
     return binary_labels
 
 
-def train_single_attack_model(
-    model: UnsupervisedMultiLabelTransformer,
+def train_optimized_model(
+    model: OptimizedTransformer,
     embeddings: np.ndarray,
     binary_labels: np.ndarray,
     attack_type: str,
@@ -1114,55 +1263,35 @@ def train_single_attack_model(
     tracker: ProgressTracker,
     log_type: str,
     enhanced_config: EnhancedTransformerConfig = None,
-) -> UnsupervisedMultiLabelTransformer:
-    """Train a single model for one attack type using normal log data."""
+) -> OptimizedTransformer:
+    """Train a single optimized model for one attack type."""
     
     device = torch.device(config.device)
     
-    # Enhanced architecture parameters
-    embedding_dim = embeddings.shape[1]
-    if embedding_dim <= 300:  # FastText
-        latent_dim = 256
-        transformer_layers = 3
-        attention_heads = 8
-    elif embedding_dim <= 768:  # Standard BERT
-        latent_dim = 384
-        transformer_layers = 4
-        attention_heads = 8
-    else:  # Enhanced LogBERT (2314D)
-        latent_dim = 512
-        transformer_layers = 6
-        attention_heads = 16
-
-    # Optimized batch sizes
-    if config.device == "mps":
-        if embedding_dim <= 300:
-            batch_size = min(128, max(32, int(config.gpu_memory_gb * 2)))
-        elif embedding_dim <= 768:
-            batch_size = min(64, max(16, int(config.gpu_memory_gb * 1.5)))
-        else:
-            batch_size = min(32, max(8, int(config.gpu_memory_gb * 1)))
-    elif config.device == "cuda":
-        if embedding_dim <= 300:
-            batch_size = min(32, max(8, int(config.gpu_memory_gb * 0.5)))
-        elif embedding_dim <= 768:
-            batch_size = min(16, max(4, int(config.gpu_memory_gb * 0.3)))
-        else:
-            batch_size = min(8, max(2, int(config.gpu_memory_gb * 0.2)))
-    else:
-        if embedding_dim <= 300:
-            batch_size = min(64, max(16, int(config.gpu_memory_gb * 1.5)))
-        elif embedding_dim <= 768:
-            batch_size = min(32, max(8, int(config.gpu_memory_gb * 1)))
-        else:
-            batch_size = min(16, max(4, int(config.gpu_memory_gb * 0.5)))
-
-    # Data setup
-    embeddings_tensor = torch.from_numpy(embeddings).float()
-    labels_tensor = torch.from_numpy(binary_labels).float().unsqueeze(1)  # [batch, 1]
+    # Use utility classes for better organization
+    memory_manager = MemoryManager()
+    data_processor = DataProcessor()
+    performance_monitor = PerformanceMonitor()
     
-    # Ensure tensors have the same first dimension
-    assert embeddings_tensor.size(0) == labels_tensor.size(0), f"Size mismatch: embeddings {embeddings_tensor.size(0)} vs labels {labels_tensor.size(0)}"
+    # Validate data first
+    if not data_processor.validate_data(embeddings, binary_labels):
+        raise ValueError(f"Invalid data for {attack_type}")
+    
+    # Get optimized architecture
+    arch_config = ArchitectureOptimizer.get_optimized_config(
+        embeddings.shape[1], config.device, config.gpu_memory_gb
+    )
+    
+    # Optimize batch size
+    base_batch_size = 64
+    batch_size = memory_manager.optimize_batch_size(
+        base_batch_size, embeddings.shape[1], config.device, config.gpu_memory_gb
+    )
+
+    # Prepare data using utility
+    embeddings_tensor, labels_tensor = data_processor.prepare_tensors(
+        embeddings, binary_labels, device
+    )
     
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
@@ -1194,15 +1323,26 @@ def train_single_attack_model(
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     max_grad_norm = 0.5
 
-    # Training loop with early stopping
+    # Optimized training setup
+    econfig = enhanced_config or EnhancedTransformerConfig()
     model.train()
-    total_epochs = 200
-    patience = 20
+    total_epochs = econfig.max_epochs_per_model
+    patience = 10
     patience_counter = 0
     best_loss = float("inf")
     best_model_state = None
-
-    print(f"🎯 Training {attack_type} model for {total_epochs} epochs")
+    
+    # Enable mixed precision if available
+    use_amp = config.device == "cuda" and econfig.use_mixed_precision
+    
+    # Estimate training time
+    time_estimate = estimate_training_time(
+        len(embeddings), 1, embeddings.shape[1], config.device
+    )
+    
+    print(f"🎯 Training {attack_type} (max {total_epochs} epochs, patience={patience}, ETA: {time_estimate})")
+    
+    performance_monitor.start_training()
 
     for epoch in range(total_epochs):
         epoch_start = time.time()
@@ -1219,181 +1359,83 @@ def train_single_attack_model(
             optimizer.zero_grad()
             outputs = model(x_batch)
             
-            # Enhanced loss computation
-            recon_loss = F.mse_loss(outputs["reconstructed"], x_batch)
-            
-            # Binary classification loss for this attack type
-            attack_scores = outputs["multi_label_scores"]  # [batch, 1]
-            
-            # Use enhanced config if available
-            econfig = enhanced_config or EnhancedTransformerConfig()
-            
-            # Enhanced focal loss for imbalanced data
-            focal_loss_fn = FocalLoss(alpha=econfig.focal_loss_alpha, gamma=econfig.focal_loss_gamma)
-            
-            # Label smoothing
-            smoothed_targets = y_batch * 0.9 + 0.05
-            class_loss = focal_loss_fn(attack_scores, smoothed_targets)
-            
-            # Contrastive loss if available
-            contrastive_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            if "contrastive" in outputs and outputs["contrastive"] is not None:
-                try:
-                    # Simple contrastive loss with stability checks
-                    contrastive_features = outputs["contrastive"]
-                    batch_size = contrastive_features.size(0)
-                    
-                    if batch_size > 1:
-                        # Ensure features are normalized and stable
-                        contrastive_features = F.normalize(contrastive_features, dim=1, eps=1e-8)
-                        
-                        # Compute similarity matrix with temperature
-                        temperature = max(0.05, 0.07)  # Ensure reasonable temperature
-                        similarity_matrix = torch.matmul(contrastive_features, contrastive_features.T) / temperature
-                        
-                        # Clamp similarity values to prevent overflow
-                        similarity_matrix = torch.clamp(similarity_matrix, min=-10, max=10)
-                        
-                        # Create labels (each sample is similar to itself)
-                        labels = torch.arange(batch_size).to(device)
-                        
-                        # Mask diagonal to remove self-similarity
-                        mask = torch.eye(batch_size, dtype=torch.bool).to(device)
-                        similarity_matrix = similarity_matrix.masked_fill(mask, -float('inf'))
-                        
-                        # Compute contrastive loss with error checking
-                        try:
-                            raw_contrastive_loss = F.cross_entropy(similarity_matrix, labels)
-                            if not (torch.isnan(raw_contrastive_loss) or torch.isinf(raw_contrastive_loss)):
-                                contrastive_loss = raw_contrastive_loss * econfig.contrastive_weight
-                            else:
-                                contrastive_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                        except Exception:
-                            contrastive_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                except Exception:
-                    contrastive_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            # Enhanced regularization with stability checks
-            predictions = torch.sigmoid(attack_scores)
-            predictions = torch.clamp(predictions, min=1e-8, max=1.0 - 1e-8)
-            
-            # Confidence regularization
-            confidence_loss = torch.mean((predictions - 0.5).abs()) * 0.05
-            
-            # Entropy regularization with stability
-            log_predictions = torch.log(predictions + 1e-8)
-            log_one_minus_predictions = torch.log(1 - predictions + 1e-8)
-            entropy_loss = -torch.mean(predictions * log_predictions + 
-                                     (1 - predictions) * log_one_minus_predictions) * 0.01
-            
-            # Validate individual loss components before combining
-            loss_components = []
-            weights = []
-            
-            # Reconstruction loss
-            if not (torch.isnan(recon_loss) or torch.isinf(recon_loss)):
-                loss_components.append(recon_loss)
-                weights.append(econfig.reconstruction_weight)
-            
-            # Classification loss  
-            if not (torch.isnan(class_loss) or torch.isinf(class_loss)):
-                loss_components.append(class_loss)
-                weights.append(econfig.classification_weight)
-            
-            # Contrastive loss
-            if not (torch.isnan(contrastive_loss) or torch.isinf(contrastive_loss)):
-                loss_components.append(contrastive_loss)
-                weights.append(1.0)
-            
-            # Regularization losses
-            if not (torch.isnan(confidence_loss) or torch.isinf(confidence_loss)):
-                loss_components.append(confidence_loss)
-                weights.append(1.0)
-                
-            if not (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)):
-                loss_components.append(entropy_loss)
-                weights.append(1.0)
-            
-            # Compute total loss only from valid components
-            if loss_components:
-                total_loss = sum(w * l for w, l in zip(weights, loss_components))
+            # Use utility for loss computation
+            if not econfig.use_complex_losses:
+                total_loss = LossOptimizer.compute_simple_loss(
+                    outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                )
             else:
-                # Fallback to simple MSE loss if all components are invalid
-                total_loss = F.mse_loss(outputs["reconstructed"], x_batch)
+                total_loss = LossOptimizer.compute_focal_loss(
+                    outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                    econfig.reconstruction_weight, econfig.classification_weight
+                )
             
-            # Backward and optimize
-            if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+            # Optimized backward pass
+            if use_amp:
+                # Use automatic mixed precision
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard training
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
-                
-                epoch_losses.append(total_loss.item())
-                epoch_recon_losses.append(recon_loss.item())
-                epoch_class_losses.append(class_loss.item())
-                
-                # Progress tracking
-                if batch_idx % 20 == 0:
-                    progress_text = f"{attack_type} | Epoch {epoch+1}/{total_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {total_loss.item():.4f}"
-                    if hasattr(tracker, '_progress_spinner'):
-                        tracker._progress_spinner.text = progress_text
-                    else:
-                        tracker._progress_spinner = Halo(text=progress_text, spinner='dots')
-                        tracker._progress_spinner.start()
-            else:
-                print(f"      ⚠️ Invalid loss for batch {batch_idx+1}")
-                
-                # If we get too many invalid losses, try simpler loss function
-                if batch_idx > 10:  # After several failed batches
-                    print(f"      🔄 Switching to simpler loss for {attack_type}")
-                    # Use only reconstruction loss as fallback
-                    simple_loss = F.mse_loss(outputs["reconstructed"], x_batch)
-                    if not (torch.isnan(simple_loss) or torch.isinf(simple_loss)):
-                        simple_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                        optimizer.step()
-                        epoch_losses.append(simple_loss.item())
-                        epoch_recon_losses.append(simple_loss.item())
-                        epoch_class_losses.append(0.0)
+            
+            epoch_losses.append(total_loss.item())
+            
+            # Reduced progress tracking for performance
+            if batch_idx % 50 == 0:  # Less frequent updates
+                current_loss = total_loss.item()
+                print(f"  {attack_type} | Epoch {epoch+1}/{total_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {current_loss:.4f}")
 
         scheduler.step()
 
-        # Calculate epoch metrics
+        # Calculate epoch metrics and use performance monitor
         epoch_time = time.time() - epoch_start
         avg_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
-        avg_recon_loss = np.mean(epoch_recon_losses) if epoch_recon_losses else float("nan")
-        avg_class_loss = np.mean(epoch_class_losses) if epoch_class_losses else float("nan")
         
-        # Clean up progress spinner
-        if hasattr(tracker, '_progress_spinner'):
-            tracker._progress_spinner.stop()
-            delattr(tracker, '_progress_spinner')
+        # Record performance
+        performance_monitor.record_epoch(epoch + 1, avg_loss, epoch_time)
         
-        # Print progress every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            print(f"✅ {attack_type} | Epoch {epoch+1}/{total_epochs} completed in {epoch_time:.1f}s")
-            print(f"📊 Loss: {avg_loss:.4f} | Recon: {avg_recon_loss:.4f} | Class: {avg_class_loss:.4f}")
-        
-        # Early stopping check
-        if not np.isnan(avg_loss) and avg_loss < best_loss - 1e-4:
-            best_loss = avg_loss
-            patience_counter = 0
-            best_model_state = model.state_dict().copy()
+        # Early stopping check with improved criteria
+        if not np.isnan(avg_loss):
+            if avg_loss < best_loss - 1e-4:
+                best_loss = avg_loss
+                patience_counter = 0
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}  # Store on CPU
+                print(f"    💾 New best loss: {best_loss:.4f}")
+            else:
+                patience_counter += 1
         else:
             patience_counter += 1
 
-        # Early stopping
+        # Early stopping with better restoration
         if patience_counter >= patience:
-            print(f"🛑 Early stopping triggered for {attack_type} at epoch {epoch + 1}")
+            print(f"🛑 Early stopping for {attack_type} at epoch {epoch + 1}")
             if best_model_state is not None:
-                model.load_state_dict(best_model_state)
-                print(f"✅ Restored best model for {attack_type} with loss: {best_loss:.4f}")
+                model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+                print(f"✅ Restored best model (loss: {best_loss:.4f})")
+            break
+            
+        # Additional stopping criteria for very good performance
+        if not np.isnan(avg_loss) and avg_loss < 0.01:
+            print(f"🎯 Excellent performance achieved for {attack_type} (loss: {avg_loss:.4f})")
             break
 
-    print(f"✅ Completed training for {attack_type}")
+    # Print training summary
+    summary = performance_monitor.get_summary()
+    print(format_training_summary(summary, attack_type))
+    
+    # Clear memory
+    memory_manager.clear_gpu_memory()
+    
     return model
 
 
-def train_model(
+def train_optimized_models(
     embeddings: np.ndarray,
     classes: List[str],
     C: np.ndarray,
@@ -1401,10 +1443,10 @@ def train_model(
     tracker: ProgressTracker,
     log_type: str,
     scaler: "StandardScaler" = None,
-) -> Tuple[List[UnsupervisedMultiLabelTransformer], "StandardScaler"]:
+) -> Tuple[List[OptimizedTransformer], "StandardScaler"]:
     """
-    Train separate models for each attack type using normal log data, then combine results.
-    This approach is much better for unsupervised learning than multi-label training.
+    Train optimized separate models for each attack type.
+    Reduced complexity and improved performance.
     """
 
     device = torch.device(config.device)
@@ -1426,20 +1468,14 @@ def train_model(
     
     clear_gpu_memory()
 
-    # Enhanced architecture for better performance
+    # Get optimized architecture using utility
     embedding_dim = embeddings.shape[1]
-    if embedding_dim <= 300:  # FastText
-        latent_dim = 256
-        transformer_layers = 3
-        attention_heads = 8
-    elif embedding_dim <= 768:  # Standard BERT
-        latent_dim = 384
-        transformer_layers = 4
-        attention_heads = 8
-    else:  # Enhanced LogBERT (2314D)
-        latent_dim = 512
-        transformer_layers = 6
-        attention_heads = 16
+    arch_config = ArchitectureOptimizer.get_optimized_config(
+        embedding_dim, config.device, config.gpu_memory_gb
+    )
+    latent_dim = arch_config.latent_dim
+    transformer_layers = arch_config.transformer_layers
+    attention_heads = arch_config.attention_heads
 
     print(f"🎯 Training separate models for each attack type using normal log data")
     print(f"📊 Attack types: {classes}")
@@ -1591,7 +1627,7 @@ def train_model(
         
         print(f"🔍 Debug: embeddings shape {combined_embeddings.shape}, binary_labels shape {combined_binary_labels.shape}")
         
-        # Create enhanced single-class model for this attack type with conservative settings
+        # Create optimized config for this model
         enhanced_config = EnhancedTransformerConfig(
             d_model=latent_dim,
             n_heads=attention_heads,
@@ -1599,43 +1635,35 @@ def train_model(
             num_labels=1,
             dropout=0.1,
             use_smote=True,
-            contamination_rate=0.1,
-            # Conservative focal loss settings to prevent numerical instability
+            contamination_rate=0.15,
             focal_loss_alpha=0.25,
-            focal_loss_gamma=1.0,  # Reduced gamma for stability
-            # Conservative loss weights
-            reconstruction_weight=1.0,
-            contrastive_weight=0.1,  # Reduced for stability
-            classification_weight=1.0
+            focal_loss_gamma=1.5,
+            reconstruction_weight=0.5,  # Reduced
+            classification_weight=1.0,
+            use_complex_losses=False,  # Simplified for speed
+            max_epochs_per_model=50   # Reduced epochs
         )
         
-        # Create model with conservative settings for numerical stability
-        model = UnsupervisedMultiLabelTransformer(
+        # Create optimized model
+        model = OptimizedTransformer(
             input_dim=embedding_dim,
             latent_dim=latent_dim,
-            n_labels=1,  # Single class: this attack vs normal
-            n_clusters=n_clusters,
+            n_labels=1,
             dropout=0.1,
             transformer_layers=transformer_layers,
             attention_heads=attention_heads,
-            use_enhanced_attention=True,  # Keep enhanced attention but with stability fixes
-            use_label_correlation=False,  # Not needed for single label
-            use_contrastive=True,  # Keep contrastive but with reduced weight
+            use_simple_attention=True
         ).to(device)
         
-        # Apply extra initialization for stability
-        for param in model.parameters():
-            if param.dim() > 1:
-                torch.nn.init.xavier_uniform_(param, gain=0.1)
-            else:
-                torch.nn.init.zeros_(param)
+        # Simplified initialization
+        model.apply(lambda m: torch.nn.init.xavier_uniform_(m.weight, gain=0.2) if hasattr(m, 'weight') and m.weight.dim() > 1 else None)
         
-        # Multi-GPU setup for this model
+        # Multi-GPU setup if available
         if config.n_gpus > 1:
             model = nn.DataParallel(model)
         
-        # Train this model
-        trained_model = train_single_attack_model(
+        # Train this model with optimized function
+        trained_model = train_optimized_model(
             model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
         )
         
@@ -1713,44 +1741,97 @@ def train_model(
             predicted_attack = np.sum(final_predictions[:, i])
             print(f"  {class_name}: {actual_attack} actual vs {predicted_attack} predicted")
     
-    # Save combined results
+    # Save combined results for training data (for reference)
     if config.rank == 0:
-        print(f"💾 Saving combined prediction results for {log_type}...")
+        print(f"💾 Saving training prediction results for {log_type}...")
         try:
             import pickle
             import os
 
+            # Generate predictions on training data for reference
+            train_all_predictions = []
+            train_all_probabilities = []
+            
+            for model in models:
+                model.eval()
+                with torch.no_grad():
+                    train_embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
+                    outputs = model(train_embeddings_tensor)
+                    class_scores = outputs["multi_label_scores"]
+                    class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()
+                    class_preds = (class_probs >= 0.5).astype(int)
+                    train_all_predictions.append(class_preds)
+                    train_all_probabilities.append(class_probs)
+            
+            # Combine training predictions
+            if len(train_all_predictions) > len(classes):  # Has normal class
+                train_combined_predictions = np.column_stack(train_all_predictions[:-1])
+                train_combined_probabilities = np.column_stack(train_all_probabilities[:-1])
+                train_normal_probs = train_all_probabilities[-1]
+            else:
+                train_combined_predictions = np.column_stack(train_all_predictions)
+                train_combined_probabilities = np.column_stack(train_all_probabilities)
+                train_normal_probs = None
+            
+            # Apply normal class suppression for training predictions too
+            if train_normal_probs is not None:
+                train_high_normal_confidence = train_normal_probs >= 0.7
+                train_combined_predictions[train_high_normal_confidence] = 0
+            else:
+                train_high_normal_confidence = None
+
             # Generate sample IDs
             ids = np.arange(len(embeddings))
 
-            # Prepare prediction dictionary with final processed predictions
+            # Prepare prediction dictionary with training predictions (for model validation)
             prediction_data = {
                 "ids": ids,
-                "probs": final_probabilities,  # Use final processed probabilities
-                "preds": final_predictions,    # Use final processed predictions
+                "train_probs": train_combined_probabilities,
+                "train_preds": train_combined_predictions,
                 "classes": classes,
-                "thresholds": np.ones(len(classes)) * 0.5,  # Default thresholds
-                # Include additional information for analysis
-                "normal_probs": normal_probs,
-                "high_normal_confidence": high_normal_confidence,
-                "all_classes": all_classes,  # Include normal class info
-                "raw_predictions_with_normal": combined_predictions_with_normal,
-                "raw_probabilities_with_normal": combined_probabilities_with_normal,
+                "thresholds": np.ones(len(classes)) * 0.5,
+                "model_count": len(models),
+                "all_classes": all_classes,
+                "separate_models_approach": True,
+                "training_mode": "One-vs-Rest with normal log data for each attack type"
             }
+            
+            if train_normal_probs is not None:
+                prediction_data["train_normal_probs"] = train_normal_probs
+                prediction_data["train_high_normal_confidence"] = train_high_normal_confidence
+            
             if true_labels is not None:
-                prediction_data["true_labels"] = true_labels
+                prediction_data["train_true_labels"] = true_labels
 
-            # Create results directory and save predictions
+            # Create results directory and save training predictions
             os.makedirs(f"results/{log_type}", exist_ok=True)
-            prediction_file = f"results/{log_type}/predictions.pkl"
+            train_prediction_file = f"results/{log_type}/train_predictions.pkl"
 
-            with open(prediction_file, "wb") as f:
+            with open(train_prediction_file, "wb") as f:
                 pickle.dump(prediction_data, f)
 
-            print(f"✅ Combined predictions saved to {prediction_file}")
+            print(f"✅ Training predictions saved to {train_prediction_file}")
+            print(f"   {len(models)} individual models combined")
+            print(f"   Training samples: {len(embeddings):,}")
+            print(f"   Attack classes: {len(classes)}")
+            if train_normal_probs is not None:
+                print(f"   Normal class model included")
         except Exception as e:
-            print(f"❌ Failed to save combined predictions: {e}")
+            print(f"❌ Failed to save training predictions: {e}")
 
+    # Simplified logging
+    tracker.log_step("Optimized Model Training Complete", {
+        "total_models": len(models),
+        "attack_classes": len(classes),
+        "architecture": f"{latent_dim}D latent, {transformer_layers} layers, {attention_heads} heads",
+        "training_samples": len(embeddings),
+        "optimization": "Simplified losses, reduced epochs, efficient architecture"
+    })
+    
+    # Clear memory after training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     return models, scaler
 
 
@@ -1759,18 +1840,28 @@ def load_and_preprocess_data(
     config: SystemConfig,
     tracker: ProgressTracker,
     sample_size: int = None,
+    embedding_type: str = None,
 ) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
-    """Load and preprocess data for training"""
+    """Load and preprocess data for training with optional embedding type specification"""
     
     print(f"🔄 Loading data for {log_type}...")
     
-    # Try different embedding subfolder structures
-    embedding_paths = [
-        Path("embeddings") / log_type,
-        Path("embeddings") / "fasttext" / log_type,
-        Path("embeddings") / "bert" / log_type,
-        Path("embeddings") / "logbert" / log_type,
-    ]
+    # Build embedding paths based on embedding_type argument
+    if embedding_type:
+        print(f"🎯 Targeting specific embedding type: {embedding_type}")
+        embedding_paths = [
+            Path("embeddings") / embedding_type / log_type,
+            Path("embeddings") / embedding_type,  # Direct subfolder
+        ]
+    else:
+        # Try different embedding subfolder structures
+        embedding_paths = [
+            Path("embeddings") / log_type,
+            Path("embeddings") / "fasttext" / log_type,
+            Path("embeddings") / "bert" / log_type,
+            Path("embeddings") / "logbert" / log_type,
+            Path("embeddings") / "enhanced" / log_type,
+        ]
     
     embeddings = None
     embeddings_dir = None
@@ -1975,19 +2066,57 @@ def process_log_type_with_args(
     sample_size: int = None,
     use_enhanced_features: bool = True,
     evaluate_with_clustering: bool = True,
+    embedding_type: str = None,
 ):
     """Process a single log type with the new separate models approach"""
     
     print(f"🎯 Processing single log type: {log_type}")
+    if embedding_type:
+        print(f"🎯 Using specific embedding type: {embedding_type}")
     
     # Initialize progress tracker
     output_dir = Path("results") / log_type
     tracker = ProgressTracker(output_dir, log_type, config)
     
-    # Load and preprocess data
+    # Load and preprocess data with embedding type specification
     embeddings, classes, true_labels, scaler = load_and_preprocess_data(
-        log_type, config, tracker, sample_size
+        log_type, config, tracker, sample_size, embedding_type
     )
+    
+    # Print original data distribution
+    enhanced_config = EnhancedTransformerConfig()
+    data_splitter = DataSplitter(enhanced_config)
+    
+    print(f"\n📈 ORIGINAL DATA ANALYSIS:")
+    data_splitter.print_data_distribution(true_labels, classes, "Original Dataset")
+    
+    # Split data into train/test (80/20)
+    print(f"\n🔀 Splitting data: 80% train, 20% test (unseen)...")
+    X_train, X_test, y_train, y_test = data_splitter.split_data(embeddings, true_labels)
+    
+    # Print train/test distributions
+    data_splitter.print_data_distribution(y_train, classes, "Training Set", "  ")
+    data_splitter.print_data_distribution(y_test, classes, "Test Set (Unseen)", "  ")
+    
+    # Apply SMOTE to training data only
+    smote_integrator = SMOTEIntegrator(enhanced_config)
+    print(f"\n🔄 Applying SMOTE to training data...")
+    X_train_smote, y_train_smote = smote_integrator.apply_smote_multilabel(
+        X_train, y_train, classes, "training"
+    )
+    
+    # Print post-SMOTE distribution
+    print(f"\n📈 POST-SMOTE TRAINING DATA:")
+    data_splitter.print_data_distribution(y_train_smote, classes, "Training Set (Post-SMOTE)", "  ")
+    
+    # Save SMOTE report
+    smote_report_path = output_dir / "smote_modifications.txt"
+    smote_integrator.save_smote_report(str(smote_report_path))
+    
+    # Store processed data in tracker for model training
+    tracker.true_labels = y_train_smote  # Use SMOTE-enhanced training labels
+    tracker.test_labels = y_test  # Store unseen test labels separately
+    tracker.test_embeddings = X_test  # Store unseen test embeddings
     
     # Check for existing results
     if not force_restart:
@@ -1996,45 +2125,86 @@ def process_log_type_with_args(
             print(f"✅ Found existing results for {log_type}, skipping training")
             return
     
-    # Start training
-    print(f"\n🚀 Starting training for {log_type}. Detailed progress will be shown below...")
+    # Start training with SMOTE-enhanced data
+    print(f"\n🚀 Starting training for {log_type} with SMOTE-enhanced data...")
+    print(f"   Training samples: {len(X_train_smote):,} (original: {len(X_train):,})")
+    print(f"   Test samples: {len(X_test):,} (unseen)")
     training_start_time = time.time()
     
-    models, _ = train_model(
-        embeddings, classes, None, config, tracker, log_type, scaler
+    models, _ = train_optimized_models(
+        X_train_smote, classes, None, config, tracker, log_type, scaler
     )
     print(f"✅ Training completed for {log_type}")
     
     # Calculate total training time
     total_training_time = time.time() - training_start_time
     
-    # Generate predictions only (no evaluation)
-    print(f"💾 Saving prediction results for {log_type}...")
+    # Generate predictions on UNSEEN test data
+    print(f"💾 Generating predictions on unseen test data for {log_type}...")
     import torch
     with torch.no_grad():
-        embeddings_tensor = torch.from_numpy(embeddings).float().to(config.device)
-        logits = models[0](embeddings_tensor)["multi_label_scores"]
-        probs = torch.sigmoid(logits).cpu().numpy()
+        # Use unseen test data for evaluation
+        test_embeddings_tensor = torch.from_numpy(X_test).float().to(config.device)
         
-        # Use default thresholds for now
+        # Get predictions from all models (combined approach)
+        all_test_predictions = []
+        all_test_probabilities = []
+        
+        for i, model in enumerate(models):
+            model.eval()
+            outputs = model(test_embeddings_tensor)
+            logits = outputs["multi_label_scores"]
+            probs = torch.sigmoid(logits).cpu().numpy().flatten()
+            preds = (probs >= 0.5).astype(int)
+            
+            all_test_predictions.append(preds)
+            all_test_probabilities.append(probs)
+        
+        # Combine predictions (excluding normal class for multi-label format)
+        if len(all_test_predictions) > len(classes):  # Has normal class
+            combined_test_predictions = np.column_stack(all_test_predictions[:-1])  # Exclude normal
+            combined_test_probabilities = np.column_stack(all_test_probabilities[:-1])
+            normal_probs = all_test_probabilities[-1]  # Normal class probabilities
+        else:
+            combined_test_predictions = np.column_stack(all_test_predictions)
+            combined_test_probabilities = np.column_stack(all_test_probabilities)
+            normal_probs = None
+        
+        # Apply normal class suppression if available
+        if normal_probs is not None:
+            high_normal_confidence = normal_probs >= 0.7
+            combined_test_predictions[high_normal_confidence] = 0
+        
+        # Use default thresholds
         thresholds = np.full(len(classes), 0.5)
-        preds = (probs >= thresholds).astype(int)
         
-        # Load true labels if available
-        true_labels = getattr(tracker, "true_labels", None)
-        
-        # Save predictions only
+        # Save comprehensive results including train/test split info
         prediction_file = Path(f"results/{log_type}/predictions.pkl")
-        with open(prediction_file, "wb") as f:
-            pickle.dump({
-                "probs": probs,
-                "preds": preds,
-                "true_labels": true_labels,
-                "classes": classes,
-                "thresholds": thresholds
-            }, f)
+        prediction_data = {
+            "test_probs": combined_test_probabilities,
+            "test_preds": combined_test_predictions,
+            "test_true_labels": y_test,
+            "classes": classes,
+            "thresholds": thresholds,
+            # Additional info
+            "train_size": len(X_train_smote),
+            "test_size": len(X_test),
+            "original_train_size": len(X_train),
+            "smote_applied": True,
+            "split_ratio": "80/20 train/test",
+            "embedding_type": embedding_type or "auto-detected"
+        }
         
-        print(f"✅ Predictions saved to {prediction_file}")
+        if normal_probs is not None:
+            prediction_data["normal_probs"] = normal_probs
+            prediction_data["high_normal_confidence"] = high_normal_confidence
+        
+        with open(prediction_file, "wb") as f:
+            pickle.dump(prediction_data, f)
+        
+        print(f"✅ Test predictions saved to {prediction_file}")
+        print(f"   Test samples: {len(X_test):,}")
+        print(f"   Predictions shape: {combined_test_predictions.shape}")
 
     # Enhanced evaluation and clustering analysis
     if evaluate_with_clustering and use_enhanced_features:
@@ -2045,16 +2215,16 @@ def process_log_type_with_args(
         evaluator = MultiLabelEvaluator(enhanced_config)
         clustering_analyzer = ClusteringAnalyzer(enhanced_config)
         
-        # Extract features from the first model for clustering
+        # Extract features from the first model for clustering (using test data)
         model = models[0]
         model.eval()
         with torch.no_grad():
-            embeddings_tensor = torch.from_numpy(embeddings).float().to(config.device)
-            outputs = model(embeddings_tensor)
+            test_embeddings_tensor = torch.from_numpy(X_test).float().to(config.device)
+            outputs = model(test_embeddings_tensor)
             features = outputs.get("sequence_representation", outputs.get("pooled")).cpu().numpy()
         
-        # Perform clustering analysis
-        clustering_results = clustering_analyzer.perform_clustering(features, true_labels)
+        # Perform clustering analysis on test data
+        clustering_results = clustering_analyzer.perform_clustering(features, y_test)
         
         # Save clustering results
         clustering_file = Path(f"results/{log_type}/clustering_analysis.json")
@@ -2081,29 +2251,23 @@ def process_log_type_with_args(
         
         print(f"💾 Clustering analysis saved to: {clustering_file}")
         
-        # Enhanced evaluation if true labels available
-        if true_labels is not None:
-            print(f"📊 Computing enhanced evaluation metrics...")
+        # Enhanced evaluation on UNSEEN test data if true labels available
+        if y_test is not None:
+            print(f"📊 Computing enhanced evaluation metrics on UNSEEN test data...")
             
-            # Load the combined predictions that were already computed
+            # Use the test predictions we just computed
             try:
-                with open(f"results/{log_type}/predictions.pkl", "rb") as f:
-                    prediction_data = pickle.load(f)
-                    
-                # Get the combined multi-label predictions and scores
-                combined_predictions = prediction_data["preds"]  # Shape: (n_samples, n_classes)
-                combined_scores = prediction_data["probs"]       # Shape: (n_samples, n_classes)
-                
-                print(f"🔍 Evaluation shapes - True: {true_labels.shape}, Pred: {combined_predictions.shape}, Scores: {combined_scores.shape}")
+                print(f"🔍 Evaluation shapes - True: {y_test.shape}, Pred: {combined_test_predictions.shape}, Scores: {combined_test_probabilities.shape}")
                 
                 # Ensure compatible shapes and types
-                if true_labels.shape != combined_predictions.shape:
-                    print(f"⚠️  Shape mismatch: true_labels {true_labels.shape} vs predictions {combined_predictions.shape}")
+                if y_test.shape != combined_test_predictions.shape:
+                    print(f"⚠️  Shape mismatch: y_test {y_test.shape} vs predictions {combined_test_predictions.shape}")
                     # Skip evaluation if shapes don't match
                     eval_results = {"error": "Shape mismatch between true labels and predictions"}
                 else:
-                    # Evaluate with properly shaped multi-label data
-                    eval_results = evaluator.evaluate(true_labels, combined_predictions, combined_scores)
+                    # Evaluate with properly shaped multi-label data on UNSEEN test set
+                    eval_results = evaluator.evaluate(y_test, combined_test_predictions, combined_test_probabilities)
+                    print(f"✅ Evaluation performed on {len(y_test):,} UNSEEN test samples")
                     
             except Exception as e:
                 print(f"⚠️  Could not load predictions for evaluation: {e}")
@@ -2126,7 +2290,8 @@ def process_log_type_with_args(
                 except Exception as e:
                     print(f"⚠️  Could not create evaluation report: {e}")
                     print(f"📊 Basic evaluation results: {eval_results}")
-            else:
+            
+            if "error" in eval_results:
                 print(f"⚠️  Evaluation failed: {eval_results.get('error', 'Unknown error')}")
             
             # Print clustering metrics
@@ -2149,24 +2314,21 @@ def process_log_type_with_args(
         torch.save({
             'model_state_dict': model.state_dict(),
             'classes': classes,
-            'input_dim': embeddings.shape[1],
+            'input_dim': X_train_smote.shape[1],
             'latent_dim': model.latent_dim,
             'n_labels': model.n_labels,
-            'transformer_layers': 3,  # Default
-            'attention_heads': 8,     # Default
+            'transformer_layers': 2,  # Optimized default
+            'attention_heads': 4,     # Optimized default
             'dropout': 0.1,
             'scaler': scaler,
-            'enhanced_features': use_enhanced_features,
-            'use_enhanced_attention': getattr(model, 'use_enhanced_attention', False),
-            'use_label_correlation': getattr(model, 'use_label_correlation', False),
-            'use_contrastive': getattr(model, 'use_contrastive', False),
+            'optimized_version': True,
+            'simplified_architecture': True,
         }, model_path)
         
         print(f"💾 Model saved to: {model_path}")
-        print(f"📊 Model info: {embeddings.shape[1]}D → {len(classes)} classes")
-        print(f"🏗️  Architecture: 3 layers, 8 heads, {model.latent_dim}D latent")
-        if use_enhanced_features:
-            print(f"✨ Enhanced features: Focal Loss, Enhanced Attention, Contrastive Learning")
+        print(f"📊 Model info: {X_train_smote.shape[1]}D → {len(classes)} classes")
+        print(f"🏗️  Optimized Architecture: 2-3 layers, 4-8 heads, {model.latent_dim}D latent")
+        print(f"⚡ Performance optimizations: Simplified losses, reduced epochs, efficient attention")
         print(f"🎯 Evaluation: Use 'python src/evaluate_transformer.py --log-type {log_type}' for full evaluation")
     
     print(f"✔ Enhanced multi-label model saved successfully")
@@ -2192,6 +2354,7 @@ def main():
     parser.add_argument("--sample-size", type=int, help="Sample size for testing")
     parser.add_argument("--force-restart", action="store_true", help="Force restart training")
     parser.add_argument("--cleanup", action="store_true", help="Clean up old backup files")
+    parser.add_argument("--embedding-type", type=str, help="Specific embedding type subfolder (e.g., 'fasttext', 'bert', 'logbert', 'enhanced')")
     parser.add_argument("--use-enhanced-features", action="store_true", default=True, help="Use enhanced features (Focal Loss, Enhanced Attention, Contrastive Learning)")
     parser.add_argument("--disable-enhanced-features", action="store_true", help="Disable enhanced features and use standard transformer")
     parser.add_argument("--evaluate-with-clustering", action="store_true", default=True, help="Perform clustering analysis during evaluation")
@@ -2206,7 +2369,8 @@ def main():
     # Detect system configuration
     config = detect_system_resources()
     
-    print(f"Detected {config.device.upper()} device")
+    print(f"🚀 Optimized Transformer v2.0 - {config.device.upper()} device")
+    print(f"   Performance optimizations enabled for faster training")
     print(f"System Configuration:")
     print(f"  Device: {config.device}")
     print(f"  GPUs: {config.n_gpus}")
@@ -2230,7 +2394,8 @@ def main():
         force_restart=args.force_restart,
         sample_size=args.sample_size,
         use_enhanced_features=use_enhanced_features,
-        evaluate_with_clustering=evaluate_with_clustering
+        evaluate_with_clustering=evaluate_with_clustering,
+        embedding_type=args.embedding_type
     )
     
     print(f"Completed {args.log_type} in {time.time():.2f} seconds")
