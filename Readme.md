@@ -244,6 +244,73 @@ Generates reports and visualizations under `results/`.
 - Training uses legacy layout under `embeddings/<type>/`; Makefile thesis targets prepare this automatically
 - Shape mismatches on eval: evaluator will attempt safe fixes; regenerate predictions if needed
 
+## Technical Specifications & Findings
+
+### Repository Structure
+- **Main Components**: logs/, labels/, processed/, embeddings/, models/, results/, checkpoints/, src/
+- **Key Scripts**: 
+  - preprocessing.py - TFRecord generation
+  - logbert_embeddings.py - Enhanced 2314D embeddings
+  - fasttext_embedding.py - 300D embeddings  
+  - word2vec_embedding_thesis.py - 200D embeddings
+  - transformer.py - One-vs-Rest multi-label training with SMOTE
+  - evaluate_models.py - Comprehensive evaluation
+  - ml_models.py - Traditional ML baselines
+
+### Embedding Specifications
+- **LogBERT**: 2314D (CLS(768) + Mean(768) + Max(768) + Attention top-10)
+- **FastText**: 300D subword-aware embeddings
+- **Word2Vec**: 200D semantic vector representations
+- **Hardware Support**: Apple Silicon (M2/MPS), CUDA, CPU
+- **Training**: One-vs-Rest with SMOTE on training split only
+- **Evaluation**: Micro/macro F1, precision, recall with threshold optimization
+
+### Dataset Information
+- **auth**: ~450 entries (small)
+- **share**: ~1,507 entries (small) 
+- **wp-error**: ~1,567 entries (small)
+- **audit**: ~4,399 entries (small)
+- **monitor**: ~8,278 entries (small)
+- **vpn**: ~13,072 entries (medium)
+- **wp-access**: ~221,902 entries (large)
+- **dns**: ~521,563 entries (very large)
+
+### Pipeline Features
+- Resumeable processing with 5% checkpoints
+- Memory-mapped operations to avoid OOM
+- Auto device detection and batch size tuning
+- Comprehensive artifact management
+- Full reproducibility with Makefile orchestration
+
+### Transformer Enhancements
+
+#### Advanced Loss Functions
+- **Focal Loss**: α=0.25, γ=2.0 for class imbalance handling
+- **Label Smoothing**: Prevents overconfident predictions
+- **Contrastive Loss**: Self-supervised representation learning
+
+#### Enhanced Architecture
+- **Enhanced Multi-Head Attention**: Label-aware attention with residual connections
+- **Pre-normalization**: Layer normalization before attention
+- **GELU Activations**: Replaced ReLU for better gradient flow
+- **Positional Encoding**: Proper sequence modeling
+
+#### Multi-Label Improvements
+- **Label Correlation Module**: Models dependencies between attack labels
+- **Enhanced Classification Head**: Deeper networks with GELU
+- **Contrastive Learning Head**: Self-supervised feature learning
+
+#### Evaluation Enhancements
+- **Multi-Label Evaluator**: Hamming Loss, Jaccard Score, F1 scores
+- **Clustering Analyzer**: KMeans, Agglomerative, DBSCAN
+- **Per-label Performance**: Precision, recall, accuracy breakdown
+- **Subset Accuracy**: Complete label set prediction accuracy
+
+#### Configuration Options
+- Enhanced features can be toggled on/off
+- Backward compatibility maintained
+- Comprehensive hyperparameter control
+
 ## License
 
 MIT. See `LICENSE`.
