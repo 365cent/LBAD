@@ -1,15 +1,15 @@
-# Log-Based Attack Detection (LBAD) Framework
+# LBAD - Log-Based Anomaly Detection Pipeline
 
-A robust framework for detecting and classifying attacks in system logs using advanced embedding techniques, machine learning models, and VAE-GAN augmentation. Optimized for performance on Apple Silicon.
+An end-to-end pipeline for log-based anomaly detection with resumeable embedding generation, multi-label transformer training, and comprehensive evaluation. Optimized for Apple Silicon (M2/MPS) and supports CUDA/CPU.
 
-## Overview
+## Highlights
 
-LBAD tackles challenges in log-based attack detection by:
-- Representing unstructured log data with FastText, Word2Vec, and TF-IDF embeddings.
-- Leveraging traditional machine learning models (Random Forest, XGBoost, SVM, KNN, Logistic Regression) for accurate classification.
-- Implementing VAE-GAN (Variational Autoencoder - Generative Adversarial Network) hybrid for high-quality synthetic data generation.
-- Addressing class imbalance through advanced data augmentation techniques.
-- Optimizing performance on Apple Silicon (M1/M2/M3) processors.
+- Preprocessing to TFRecords per log type
+- Embeddings: LogBERT (2314D enhanced), FastText (300D), Word2Vec (200D)
+- Resumeable, memory-mapped LogBERT extraction with 5% progress checkpoints
+- One-vs-Rest multi-label transformer training with SMOTE on train-only
+- Baseline multi-label ML (RF, LR, KNN, XGBoost) for comparison
+- Clear artifacts: `embeddings/`, `models/`, `results/`, `checkpoints/`
 
 ## Pipeline Architecture
 
@@ -24,228 +24,236 @@ flowchart TD
     subgraph Embedding_Generation
         D --> E1["Load TFRecord data"]
         E1 --> F1["Tokenize log entries"]
-        F1 --> G1["Generate static embeddings (FastText, Word2Vec, TF-IDF)"]
-        F1 --> G2["Generate LogBERT embeddings"]
+        F1 --> G1["Generate FastText embeddings (300D)"]
+        F1 --> G2["Generate Word2Vec embeddings (200D)"]
+        F1 --> G3["Generate LogBERT embeddings (2314D enhanced)"]
         G1 --> H1["Save embeddings & binary label matrices"]
         G2 --> H1
+        G3 --> H1
+        H1 --> H2["Resumeable checkpoints (LogBERT)"]
+        H2 --> H3["Memory-mapped streaming output"]
+    end
+
+    subgraph Transformer_Training
+        H1 --> V1["Split data 80/20 (stratified)"]
+        V1 --> V2["Apply SMOTE on training split only"]
+        V2 --> V3["Train separate transformer per attack type"]
+        V3 --> V4["Train normal class model"]
+        V4 --> X1["Combine one-vs-rest predictions"]
+        X1 --> X2["Apply normal class suppression"]
+        X2 --> Y1["Generate multi-label predictions"]
     end
 
     subgraph Baseline_ML_Evaluation
         H1 --> I1["Load embeddings & labels"]
-        I1 --> J1["Train MultiOutputClassifiers (RF, XGBoost, SVM, k-NN, LR)"]
-        J1 --> K1["Predict attack labels"]
+        I1 --> J1["Train MultiOutputClassifiers (RF, XGBoost, LR, KNN)"]
+        J1 --> K1["Multi-label attack predictions"]
         K1 --> L1["Evaluate & record metrics"]
     end
 
-    subgraph Optional_VAE_GAN_Augmentation
+    subgraph Optional_GAN_Augmentation
         H1 --> M1["Identify minority classes"]
-        M1 --> N1["Train VAE-GAN on selected embeddings"]
+        M1 --> N1["Train f-AnoGAN on selected embeddings"]
         N1 --> O1["Generate synthetic embeddings"]
         O1 --> P1["Create augmented dataset"]
+        P1 --> R1["Evaluate augmentation effectiveness"]
     end
 
-    subgraph Evaluation_of_Augmented_Data
-        P1 --> R1["Load original & augmented embeddings"]
-        R1 --> S1["Train ML classifiers on both datasets"]
-        S1 --> T1["Compare performance"]
-        T1 --> U1["Visualize improvements"]
-    end
-
-    subgraph Transformer_Training
-        H1 --> V1["Cluster embeddings & generate pseudo-labels"]
-        V1 --> W1["Train binary transformers per attack type"]
-        W1 --> X1["Combine predictions for multi-label output"]
-        X1 --> Y1["Evaluate multi-label transformer"]
+    subgraph Evaluation_and_Analysis
+        Y1 --> S1["Comprehensive multi-label metrics"]
+        L1 --> S1
+        R1 --> S1
+        S1 --> T1["Per-class threshold optimization"]
+        T1 --> U1["Clustering analysis & visualization"]
+        U1 --> U2["Classification reports & confusion matrices"]
+        U2 --> U3["Results aggregation & summary"]
     end
 
     %% Styling
     style A fill:#90EE90,stroke:#333,stroke-width:2px
     style D fill:#90EE90,stroke:#333,stroke-width:2px
     style H1 fill:#ADD8E6,stroke:#333,stroke-width:2px
+    style H2 fill:#87CEEB,stroke:#333,stroke-width:2px
+    style H3 fill:#87CEEB,stroke:#333,stroke-width:2px
+    style Y1 fill:#DDA0DD,stroke:#333,stroke-width:2px
     style L1 fill:#FFD700,stroke:#333,stroke-width:2px
     style P1 fill:#FFC0CB,stroke:#333,stroke-width:2px
-    style U1 fill:#FFBF00,stroke:#333,stroke-width:2px
-    style Y1 fill:#DDA0DD,stroke:#333,stroke-width:2px
+    style U3 fill:#FFBF00,stroke:#333,stroke-width:2px
 ```
 
-## Features
+## Quick Start
 
-- **Log Preprocessing**: Tokenization, normalization, and filtering of raw logs.
-- **Embedding Generation**: Multiple embedding methods:
-  - **FastText**: Capturing subword information for better representation of unusual log entries.
-  - **Word2Vec**: Creating semantic vector representations.
-  - **TF-IDF**: Weighting terms by importance with dimensionality reduction.
-- **Machine Learning Models**: Five optimized classifiers:
-  - **Random Forest**: Robust ensemble method for imbalanced datasets.
-  - **XGBoost**: Gradient-boosted trees with high performance.
-  - **SVM**: Support Vector Machine with non-linear kernels.
-  - **KNN**: K-Nearest Neighbors with distance weighting.
-  - **Logistic Regression**: Fast linear model with regularization.
-- **VAE-GAN Augmentation**: Hybrid approach for generating high-quality synthetic data:
-  - **Beta-VAE**: Tunable KL divergence weighting for better representation learning
-  - **KL Annealing**: Gradual increase in KL weight for stable training
-  - **Multi-batch diversity generation**: Creates embeddings with varying diversity levels
-  - **Focused minority class augmentation**: Targeted synthetic data generation
-- **Comprehensive Evaluation**: Precision, recall, F1-score, confusion matrices, and per-class metrics.
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.6 or higher
-- Required libraries listed in `requirements.txt`
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/365cent/LBAD.git
-   cd LBAD
-   ```
-
-2. Install dependencies:
-   ```bash
-   make install
-   ```
-
-## Usage
-
-### Complete Pipeline
-
-Run the entire workflow:
 ```bash
-make all
+make install                 # install requirements
+make preprocess-wp-error     # build TFRecords from logs/ + labels/
+make logbert-thesis-wp-error # generate LogBERT embeddings to embeddings/logbert/wp-error
+make train-wp-error          # train transformer (uses legacy layout prepared by Makefile)
+make evaluate-wp-error       # evaluate transformer on embeddings/wp-error
 ```
 
-### Individual Components
-
-- **Preprocessing**:
-  ```bash
-  make preprocess
-  ```
-
-- **Embedding Generation**:
-  ```bash
-  make embeddings    # Generate all embedding types
-  make fasttext      # Generate FastText embeddings
-  make word2vec      # Generate Word2Vec embeddings
-  make tfidf         # Generate TF-IDF embeddings
-  ```
-
-- **Machine Learning**:
-  ```bash
-  make ml            # Run all ML models on all embeddings
-  make ml-fasttext   # ML with FastText embeddings
-  make ml-word2vec   # ML with Word2Vec embeddings
-  make ml-tfidf      # ML with TF-IDF embeddings
-  
-  # Individual model types
-  make ml-rf         # Random Forest classifier
-  make ml-xgb        # XGBoost classifier
-  make ml-svm        # SVM classifier
-  make ml-knn        # KNN classifier
-  make ml-lr         # Logistic Regression classifier
-  ```
-
-- **VAE-GAN Augmentation and Evaluation**:
-  ```bash
-  make gan           # Run VAE-GAN augmentation
-  make eval          # Evaluate augmentation results
-  make gan-pipeline  # Run both augmentation and evaluation
-  make gan-small     # Run with fewer epochs and samples (quick test)
-  ```
-
-- **Direct TFRecord Processing**:
-  ```bash
-  make ml-direct     # Process TFRecord data directly (no embeddings)
-  ```
-
-- **Sample Run**:
-  ```bash
-  make sample-run    # Run with limited samples (for testing)
-  ```
-
-### Cleanup
-
-Remove generated files:
-```bash
-make clean       # Remove cache files
-make clean-aug   # Remove augmented data only
-make clean-all   # Remove all generated data
-```
+Tip: Run `make help` for a full command reference.
 
 ## Project Structure
 
 ```
 .
-├── logs/                     # Raw log dataset
-├── labels/                   # Ground truth annotations
-├── embeddings/               # Generated embeddings
-├── augmented/                # Synthetic data from VAE-GAN
-├── results/                  # Evaluation metrics and visualizations
-├── models/                   # Saved model weights
-├── src/                      # Source code
-│   ├── preprocessing.py      # Log preprocessing
-│   ├── fasttext_embedding.py # FastText embedding generation
-│   ├── word2vec_embedding.py # Word2Vec embedding generation
-│   ├── tfidf_embedding.py    # TF-IDF embedding generation
-│   ├── gan_augmentation.py   # VAE-GAN implementation
-│   ├── gan_evaluation.py     # Evaluation with XGBoost
-│   ├── ml_models.py          # Traditional ML models
-│   └── main.py               # Workflow orchestration
-├── Makefile                  # Build automation
-└── requirements.txt          # Dependencies
+├── logs/                     # raw logs by org/system
+├── labels/                   # ground-truth annotations (JSON lines)
+├── processed/                # TFRecords per log type (gzip)
+├── embeddings/               # embeddings/<method>/<type>/{log,label}_<type>.pkl
+├── models/                   # saved transformer checkpoints (*.pth)
+├── results/                  # predictions, metrics, visualizations
+├── checkpoints/              # logbert resumeable checkpoints
+├── hf_cache/ .cache/torch/   # local HF/torch caches (auto by Makefile)
+└── src/                      # source code
 ```
 
-## VAE-GAN Augmentation Approach
+## Pipelines (Makefile)
 
-Our VAE-GAN hybrid approach combines the benefits of Variational Autoencoders and Generative Adversarial Networks to generate high-quality synthetic embeddings:
+The Makefile orchestrates the full workflow. Key targets:
 
-### Model Architecture
-- **Enhanced Encoder**: Multi-layer network (512→768→512 units) for robust feature extraction
-- **Latent Space**: 128-dimensional latent space for expressive representation
-- **Decoder**: Mirror of encoder with tanh activation for embedding generation
-- **Discriminator**: Deep network that differentiates real from synthetic embeddings
+```bash
+make pipeline-all              # preprocess → embeddings → train → evaluate (all types)
+make pipeline-<type>           # full pipeline for one type (e.g., wp-error)
+make embeddings                # generate embeddings for all types (logbert, fasttext, word2vec)
+make embeddings-<type>         # embeddings for a single type
+make logbert-thesis[-<type>]   # LogBERT embeddings → embeddings/logbert/<type>
+make fasttext-thesis[-<type>]  # FastText embeddings → embeddings/fasttext/<type>
+make word2vec-thesis[-<type>]  # Word2Vec embeddings → embeddings/word2vec/<type>
+make train[-<type>]            # transformer training
+make train-<type>-sample       # training with sample size (faster)
+make evaluate[-<type>]         # evaluation
+make compare[-<type>]          # compare transformer vs f-AnoGAN
+make ml-baseline[-<type>]      # traditional ML baselines
+make gan / gan-train / gan-eval
+make summarize                 # aggregate results
+make status                    # show available data/artifacts
+```
 
-### Training Dynamics
-- **Beta-VAE**: Reduced beta parameter (0.5) to balance reconstruction vs. regularization
-- **KL Annealing**: Gradual increase of KL weight during training for stability
-- **Learning Rate Scheduling**: Exponential decay to prevent training divergence
-- **Gradient Clipping**: Limits gradient norms to prevent exploding gradients
+Notes
+- Thesis runners will also prepare a legacy layout under `embeddings/<type>/` so `src/transformer.py` can auto-discover files.
+- Override variables: `make thesis LOG_TYPES="wp-error" EMBEDDINGS="logbert fasttext"`.
 
-### Diversity Enhancement
-- **Multi-batch Generation**: Creates synthetic samples with varying diversity levels
-- **Periodic Diversity Injection**: Mixes diverse samples into training batches
-- **Targeted Augmentation**: Focuses on minority attack classes to address imbalance
+## Data Preparation (TFRecords)
 
-## Evaluation Metrics
+Script: `src/preprocessing.py`
+- Scans `logs/` and matches to `labels/`
+- Serializes per-line TFRecord examples with fields: `l` (log), `y` (labels JSON), `log_type`
+- Output: `processed/<log-type>/*.tfrecord` (gzip)
 
-- **Precision**: Reduces false positives in attack detection.
-- **Recall**: Ensures comprehensive attack detection.
-- **F1-Score**: Balances precision and recall.
-- **Per-class metrics**: Detailed performance for each attack type.
-- **Confusion matrices**: Visual representations of classification performance.
+Run manually:
+```bash
+python src/preprocessing.py               # all
+python src/preprocessing.py --log-type wp-error
+```
+
+## Embeddings
+
+### LogBERT (Enhanced 2314D)
+
+Script: `src/logbert_embeddings.py`
+- Components: CLS(768) + Mean(768) + Max(768) + Attention top-10 (2314D)
+- Device: auto (MPS→CUDA→CPU), optimized for M2/MPS
+- Resumeable: writes lightweight progress every ~5% and supports restart
+- Streams to disk via numpy.memmap to avoid OOM
+
+CLI:
+```bash
+python src/logbert_embeddings.py \
+  [--log-type wp-error] \
+  [--sample-size N] \
+  [--force-restart] \
+  [--clean-checkpoints|--clean-incremental] \
+  [--output-subdir logbert]
+```
+
+Outputs (per log type under `embeddings/logbert/<type>/`):
+- `log_<type>.pkl`: pickled memmap-backed matrix (2314D)
+- `label_<type>.pkl`: dict with `vectors` (multi-label int8) and `classes`
+- `attack_types_<type>.txt`: mapping and examples
+- `visualization.png`: t-SNE (balanced sampling, all classes shown)
+
+Defaults align with full-dataset processing; use `--sample-size` to subsample.
+
+### FastText (300D)
+
+Script: `src/fasttext_embedding.py`
+```bash
+python src/fasttext_embedding.py [--log-type <type>] [--output-subdir fasttext]
+```
+Outputs mirror LogBERT format under `embeddings/fasttext/<type>/`.
+
+### Word2Vec (200D)
+
+Script: `src/word2vec_embedding_thesis.py`
+```bash
+python src/word2vec_embedding_thesis.py [--log-type <type>] [--output-subdir word2vec]
+```
+Outputs mirror LogBERT format under `embeddings/word2vec/<type>/`.
+
+## Transformer Training (One-vs-Rest, SMOTE)
+
+Script: `src/transformer.py`
+- Auto-detects device (cuda/mps/cpu)
+- Splits data 80/20 (iterative stratification if available)
+- Applies SMOTE on training split only; saves detailed report
+- Trains a compact transformer per class plus a normal class model; combines predictions
+- Saves predictions for train and unseen test; supports normal-class suppression
+
+CLI:
+```bash
+python src/transformer.py --log-type wp-error \
+  [--sample-size N] [--force-restart] [--cleanup] \
+  [--embedding-type fasttext|bert|logbert|enhanced] \
+  [--use-enhanced-features|--disable-enhanced-features] \
+  [--evaluate-with-clustering|--disable-clustering]
+```
+
+Artifacts:
+- `results/<type>/smote_modifications.txt`
+- `results/<type>/predictions.pkl` (test probs/preds, classes, thresholds)
+- `results/<type>/train_predictions.pkl` (training reference)
+- `models/transformer_<type>_*.pth` (model + metadata)
+
+## Evaluation
+
+Transformer evaluation: `src/evaluate_models.py`
+```bash
+python src/evaluate_models.py --log-type wp-error [--optimize-thresholds]
+```
+Behavior
+- Uses cached predictions from `results/<type>/predictions.pkl` when present
+- Otherwise loads model + embeddings and evaluates; can auto-optimize per-class thresholds
+- Saves detailed metrics and report to `results/<type>/`
+
+Baselines: `src/ml_models.py`
+```bash
+python src/ml_models.py --log-type wp-error --model all
+```
+Generates reports and visualizations under `results/`.
+
+## Performance & Caching
+
+- Hugging Face/torch cache redirected to `hf_cache/` and `.cache/torch/` (see Makefile `HF_ENV`)
+- MPS (Apple Silicon) and CUDA supported; batch sizes auto-tuned
+- LogBERT extractor uses memmaps and 5% checkpoints for safe restarts
+
+## Troubleshooting
+
+- Embeddings not found: ensure `embeddings/<method>/<type>/log_<type>.pkl` and `label_<type>.pkl` exist
+- Training uses legacy layout under `embeddings/<type>/`; Makefile thesis targets prepare this automatically
+- Shape mismatches on eval: evaluator will attempt safe fixes; regenerate predictions if needed
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+MIT. See `LICENSE`.
 
 ## Citation
 
-If you use this framework in your research, please cite:
 ```
-@misc{log_attack_detection,
-  author = {365cent},
-  title = {Log-Based Attack Detection Framework},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/365cent/LBAD}
+@misc{lbad,
+  title  = {Log-Based Anomaly Detection Pipeline},
+  year   = {2025},
+  author = {LBAD Contributors}
 }
 ```
-
-## Acknowledgments
-
-- **FastText, Word2Vec, and TF-IDF**: For embedding implementations.
-- **TensorFlow, Keras**: For deep learning frameworks.
-- **Scikit-learn, XGBoost**: For ML implementations.
-- **Open-Source Community**: For tools and libraries.
