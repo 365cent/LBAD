@@ -63,7 +63,7 @@ CHECKPOINT_DIR = Path("checkpoints") / "logbert"
 VECTOR_SIZE = 2314  # Enhanced BERT: CLS(768) + Mean(768) + Max(768) + Attention(10)
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
-NUM_WORKERS = 2
+NUM_WORKERS = 8  # Increased for 16c/128GB system
 
 # Local Hugging Face cache to avoid $HOME/.cache quota issues on HPC
 HF_CACHE_DIR = Path("hf_cache")
@@ -84,10 +84,10 @@ LARGE_DATASET_THRESHOLD = 500000   # < 500K entries
 
 # Performance configurations based on dataset size
 PERF_CONFIG = {
-    'small': {'batch_size': 16, 'workers': 4, 'clear_freq': 100},
-    'medium': {'batch_size': 12, 'workers': 3, 'clear_freq': 50},
-    'large': {'batch_size': 8, 'workers': 2, 'clear_freq': 25},
-    'very_large': {'batch_size': 4, 'workers': 1, 'clear_freq': 10}
+    'small': {'batch_size': 16, 'workers': 8, 'clear_freq': 100},
+    'medium': {'batch_size': 12, 'workers': 6, 'clear_freq': 50},
+    'large': {'batch_size': 8, 'workers': 4, 'clear_freq': 25},
+    'very_large': {'batch_size': 4, 'workers': 2, 'clear_freq': 10}
 }
 
 # Enable TensorFlow optimizations but limit threads
