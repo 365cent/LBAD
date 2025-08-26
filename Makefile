@@ -7,7 +7,7 @@ PIP := pip
 SRC := ./src
 
 # Available log types (override at runtime: make thesis LOG_TYPES="wp-error")
-LOG_TYPES := auth share wp-error audit monitor vpn wp-access dns
+LOG_TYPES := wp-access wp-error dns network web error monitoring auth audit
 
 # Embedding methods to use (override: make thesis EMBEDDINGS="logbert fasttext")
 EMBEDDINGS ?= logbert fasttext word2vec
