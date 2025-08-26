@@ -332,7 +332,7 @@ thesis: ensure-cache preprocess embeddings
 		for E in $(EMBEDDINGS); do \
 			$(call RUN_FOR_METHOD,$$LT,$$E); \
 		done; \
-	 done
+	done
 	@$(MAKE) summarize
 	@echo "✅ Thesis pipeline completed"
 
