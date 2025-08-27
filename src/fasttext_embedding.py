@@ -715,7 +715,7 @@ def main():
         run_combined = False
     else:
         types_to_process = available_types
-        run_combined = True
+        run_combined = False  # Disable combined processing by default
 
     # Process individual log types
     for log_type in types_to_process:

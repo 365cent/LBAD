@@ -1695,7 +1695,7 @@ def main():
     else:
         # Sort by size (smallest first) for efficient processing
         types_to_process = sorted(available_types, key=lambda x: log_type_info[x]['size'])
-        run_combined = True  # Enable combined processing again
+        run_combined = False  # Disable combined processing by default
         print(f"\nProcessing all log types individually (starting with smallest for efficiency)")
     
     # Estimate total processing time if processing all
