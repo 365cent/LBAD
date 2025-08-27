@@ -72,6 +72,16 @@ except ImportError:
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
+# Ensure Matplotlib has a writable config/cache directory (HPC-safe)
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    # Best effort only; if it fails, Matplotlib will fall back to temp
+    pass
+
 
 @dataclass
 class SystemConfig:
@@ -490,18 +500,15 @@ class SMOTEIntegrator:
         self.smote_variants = {
             'smote': SMOTE(
                 k_neighbors=min(3, config.smote_k_neighbors),  # Reduced for speed
-                random_state=config.random_state,
-                n_jobs=1  # Single thread for stability
+                random_state=config.random_state
             ),
             'borderline': BorderlineSMOTE(
                 k_neighbors=min(3, config.smote_k_neighbors),
-                random_state=config.random_state,
-                n_jobs=1
+                random_state=config.random_state
             ),
             'adasyn': ADASYN(
                 n_neighbors=min(3, config.smote_k_neighbors),
-                random_state=config.random_state,
-                n_jobs=1
+                random_state=config.random_state
             )
         }
     
@@ -561,8 +568,7 @@ class SMOTEIntegrator:
                     # Apply lightweight SMOTE
                     smote = SMOTE(
                         k_neighbors=min(3, attack_count - 1) if attack_count > 1 else 1,
-                        random_state=self.config.random_state + i,
-                        n_jobs=1
+                        random_state=self.config.random_state + i
                     )
                     
                     X_class_resampled, y_class_resampled = smote.fit_resample(X_resampled, y_binary)
