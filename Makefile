@@ -310,7 +310,10 @@ define RUN_FOR_METHOD
 	@if [ -f embeddings/$(2)/$(1)/label_$(1).pkl ]; then cp -f embeddings/$(2)/$(1)/label_$(1).pkl embeddings/$(1)/label_$(1).pkl; fi
 	@if [ -f embeddings/$(1)/log_$(1).pkl ]; then cp -f embeddings/$(1)/log_$(1).pkl embeddings/$(1)/embeddings.pkl; fi
 	@if [ -f embeddings/$(1)/label_$(1).pkl ]; then \
-		$(PYTHON) -c "import pickle, os; lt='$(1)'; src='embeddings/'+lt+'/label_'+lt+'.pkl'; dst='embeddings/'+lt+'/labels.pkl'; d=pickle.load(open(src,'rb')); arr=d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; pickle.dump(arr, open(dst,'wb'))" ; \
+    $(PYTHON) -c "import pickle, os; lt='$(1)'; \
+	src=f'embeddings/{lt}/label_{lt}.pkl'; dst=f'embeddings/{lt}/labels.pkl'; \
+	d=pickle.load(open(src,'rb')); arr = d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; \
+	pickle.dump(arr, open(dst,'wb'))" \
 	fi
 	@echo "🤖 Running transformer for $(1) [method=$(2)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
