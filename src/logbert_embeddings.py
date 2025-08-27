@@ -659,6 +659,198 @@ def check_existing_outputs(log_type: str) -> dict:
     return status
 
 
+def _discover_per_type_outputs_for_combination():
+    """Discover per-log-type outputs that can be combined efficiently.
+    Returns a list of dicts with keys: type, dir, log_pkl, label_pkl, memmap_dat (optional).
+    """
+    discovered = []
+    if not OUTPUT_DIR.exists():
+        return discovered
+    for path in OUTPUT_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        log_type = path.name
+        log_pkl = path / f"log_{log_type}.pkl"
+        label_pkl = path / f"label_{log_type}.pkl"
+        if log_pkl.exists() and label_pkl.exists():
+            dat_candidates = list(path.glob(f"log_{log_type}_*.dat"))
+            memmap_dat = dat_candidates[0] if dat_candidates else None
+            discovered.append({
+                'type': log_type,
+                'dir': path,
+                'log_pkl': log_pkl,
+                'label_pkl': label_pkl,
+                'memmap_dat': memmap_dat
+            })
+    return discovered
+
+
+def _compute_rows_from_memmap_file(dat_path: Path) -> int:
+    item_size = np.dtype(np.float32).itemsize
+    total_bytes = dat_path.stat().st_size
+    rows = total_bytes // (item_size * VECTOR_SIZE)
+    return int(rows)
+
+
+def _build_global_classes(per_type_infos: list) -> list:
+    """Build a global sorted union of classes from all per-type label files."""
+    global_set = set()
+    for info in per_type_infos:
+        try:
+            with open(info['label_pkl'], 'rb') as f:
+                label_obj = pickle.load(f)
+            classes = label_obj.get('classes', [])
+            for c in classes:
+                global_set.add(c)
+            # Free memory ASAP
+            del label_obj
+        except Exception as e:
+            print(f"⚠️  Failed to read classes for {info['type']}: {e}")
+    return sorted(list(global_set))
+
+
+def _combine_from_existing_embeddings() -> bool:
+    """Combine per-type outputs into a single combined output without reprocessing raw data.
+    Returns True if combined successfully; False to indicate fallback to raw processing.
+    """
+    per_type_infos = _discover_per_type_outputs_for_combination()
+    if not per_type_infos:
+        print("⚠️  No per-type outputs discovered for combination.")
+        return False
+
+    # Compute per-type row counts (prefer memmap size, else read label vectors shape)
+    per_type_rows = {}
+    need_label_reads_for_rows = []
+    for info in per_type_infos:
+        if info['memmap_dat'] is not None and info['memmap_dat'].exists():
+            per_type_rows[info['type']] = _compute_rows_from_memmap_file(info['memmap_dat'])
+        else:
+            need_label_reads_for_rows.append(info)
+
+    for info in need_label_reads_for_rows:
+        try:
+            with open(info['label_pkl'], 'rb') as f:
+                label_obj = pickle.load(f)
+            vectors = label_obj.get('vectors')
+            per_type_rows[info['type']] = int(vectors.shape[0]) if vectors is not None else 0
+            del label_obj, vectors
+        except Exception as e:
+            print(f"❌ Failed to read label rows for {info['type']}: {e}")
+            return False
+
+    total_rows = sum(per_type_rows.values())
+    if total_rows == 0:
+        print("⚠️  No rows found across per-type outputs.")
+        return False
+
+    # Build global class list
+    global_classes = _build_global_classes(per_type_infos)
+    num_global_classes = len(global_classes)
+
+    # Prepare combined output directory and memmaps
+    combined_dir = OUTPUT_DIR / "all_combined"
+    combined_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a reproducible data hash from types and counts
+    signature = ";".join([f"{info['type']}:{per_type_rows[info['type']]}" for info in sorted(per_type_infos, key=lambda x: x['type'])])
+    combined_hash = hashlib.md5(signature.encode()).hexdigest()[:16]
+
+    # Combined embedding memmap
+    emb_dat_path, _ = get_memmap_paths("all_combined", combined_hash)
+    emb_dat_path = Path(emb_dat_path)
+    emb_mm = np.memmap(emb_dat_path, dtype=np.float32, mode='w+', shape=(total_rows, VECTOR_SIZE))
+
+    # Combined labels memmap
+    lbl_dat_path = combined_dir / f"labels_all_combined_{combined_hash}.dat"
+    lbl_mm = np.memmap(lbl_dat_path, dtype=np.int8, mode='w+', shape=(total_rows, num_global_classes))
+
+    # Build index mapping per type for labels
+    global_index = {name: idx for idx, name in enumerate(global_classes)}
+
+    # Stream copy per-type embeddings and remap labels
+    start = 0
+    for info in sorted(per_type_infos, key=lambda x: x['type']):
+        lt = info['type']
+        n_rows = per_type_rows[lt]
+        end = start + n_rows
+        print(f"🔗 Combining {lt}: rows {n_rows} -> [{start}:{end})")
+
+        # Embeddings: prefer memmap .dat
+        try:
+            if info['memmap_dat'] is not None and info['memmap_dat'].exists():
+                src_mm = np.memmap(info['memmap_dat'], dtype=np.float32, mode='r', shape=(n_rows, VECTOR_SIZE))
+                emb_mm[start:end, :] = src_mm[:]
+                del src_mm
+            else:
+                # Fallback: load pickled embeddings array
+                with open(info['log_pkl'], 'rb') as f:
+                    src_emb = pickle.load(f)
+                emb_mm[start:end, :] = np.asarray(src_emb, dtype=np.float32)
+                del src_emb
+        except Exception as e:
+            print(f"❌ Failed to merge embeddings for {lt}: {e}")
+            del emb_mm, lbl_mm
+            return False
+
+        # Labels: load label pickle and remap to global space
+        try:
+            with open(info['label_pkl'], 'rb') as f:
+                label_obj = pickle.load(f)
+            local_vectors = label_obj.get('vectors')
+            local_classes = label_obj.get('classes', [])
+            if local_vectors is None or local_vectors.shape[0] != n_rows:
+                raise RuntimeError("Label vectors missing or row count mismatch")
+
+            # Build column mapping from local to global indices
+            col_map = [global_index[c] for c in local_classes if c in global_index]
+            # Zero initialize target slice then scatter columns
+            lbl_mm[start:end, :] = 0
+            for j_local, g_idx in enumerate(col_map):
+                # Assign column j_local into global column g_idx for the slice
+                lbl_mm[start:end, g_idx] = local_vectors[:, j_local]
+            del label_obj, local_vectors
+        except Exception as e:
+            print(f"❌ Failed to merge labels for {lt}: {e}")
+            del emb_mm, lbl_mm
+            return False
+
+        start = end
+
+    # Flush memmaps
+    emb_mm.flush()
+    lbl_mm.flush()
+
+    # Save combined artifacts
+    # 1) Embeddings pickle (store memmap without loading into RAM)
+    with open(combined_dir / "log_all_combined.pkl", 'wb') as f:
+        pickle.dump(emb_mm, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # 2) Labels pickle with classes
+    label_data = {
+        'vectors': lbl_mm,
+        'classes': global_classes,
+        'description': 'Binary multi-label vectors where [0 1 0] means only the second class is present'
+    }
+    with open(combined_dir / "label_all_combined.pkl", 'wb') as f:
+        pickle.dump(label_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # 3) Attack types text
+    attack_info_filename = combined_dir / "attack_types_all_combined.txt"
+    with open(attack_info_filename, 'w', encoding='utf-8') as f:
+        f.write("Attack Types and Column Mapping for all_combined\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Total attack types: {len(global_classes)}\n")
+        f.write(f"Vector dimension: {len(global_classes)}\n\n")
+        if global_classes:
+            f.write("Column Mapping (Index -> Attack Type):\n")
+            f.write("-" * 40 + "\n")
+            for i, attack_type in enumerate(global_classes):
+                f.write(f"Column {i:2d}: {attack_type}\n")
+
+    print(f"✅ Combined outputs saved under {combined_dir}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Dataset Class for BERT
 # ---------------------------------------------------------------------------
@@ -1503,7 +1695,7 @@ def main():
     else:
         # Sort by size (smallest first) for efficient processing
         types_to_process = sorted(available_types, key=lambda x: log_type_info[x]['size'])
-        run_combined = False  # Skip combined processing
+        run_combined = True  # Enable combined processing again
         print(f"\nProcessing all log types individually (starting with smallest for efficiency)")
     
     # Estimate total processing time if processing all
@@ -1625,54 +1817,60 @@ def main():
             print(f"   Files: log✓ labels✓ attack_types✓ visualization✓")
         else:
             try:
-                # Load all data
-                df_all = load_tfrecord_files()
-                if df_all.empty:
-                    print("No data found for combined log types")
+                # Efficient path: combine per-type embeddings if available
+                combined_ok = _combine_from_existing_embeddings()
+                if combined_ok:
+                    print("✅ Combined from existing per-type outputs without raw reprocessing")
                 else:
-                    # Sample data if requested
-                    if args.sample_size and len(df_all) > args.sample_size:
-                        print(f"Sampling {args.sample_size} entries from {len(df_all)} total entries")
-                        df_all = df_all.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
-                    
-                    # Get performance configuration
-                    dataset_size = len(df_all)
-                    if dataset_size < SMALL_DATASET_THRESHOLD:
-                        size_category = "small"
-                    elif dataset_size < MEDIUM_DATASET_THRESHOLD:
-                        size_category = "medium"
-                    elif dataset_size < LARGE_DATASET_THRESHOLD:
-                        size_category = "large"
+                    # Fallback to legacy: load all TFRecords and process (may be large)
+                    print("⚠️  Falling back to raw combined processing (may be slow)")
+                    df_all = load_tfrecord_files()
+                    if df_all.empty:
+                        print("No data found for combined log types")
                     else:
-                        size_category = "very_large"
-                    
-                    perf_config = get_performance_config(size_category, device.type)
-                    time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
-                    
-                    print(f"Combined dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
-                    print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
-                    
-                    display_data_distribution(df_all, "all combined")
-                    df_all = process_embeddings(df_all, device, use_global_attack_list=True, 
-                                             performance_config=perf_config, log_type="all_combined")
-                    
-                    # Save combined outputs
-                    save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
-                    
-                    # Create visualization
-                    visualize_embeddings(
-                        df_all,
-                        output_file=OUTPUT_DIR / "visualization_all_combined.png"
-                    )
-                    
-                    # Clean up old checkpoints
-                    cleanup_old_checkpoints("all_combined")
-                    
-                    # Clear memory
-                    del df_all
-                    clear_memory(device)
-                    
-                    print(f"✅ Completed processing combined model")
+                        # Sample data if requested
+                        if args.sample_size and len(df_all) > args.sample_size:
+                            print(f"Sampling {args.sample_size} entries from {len(df_all)} total entries")
+                            df_all = df_all.sample(n=args.sample_size, random_state=42).reset_index(drop=True)
+                        
+                        # Get performance configuration
+                        dataset_size = len(df_all)
+                        if dataset_size < SMALL_DATASET_THRESHOLD:
+                            size_category = "small"
+                        elif dataset_size < MEDIUM_DATASET_THRESHOLD:
+                            size_category = "medium"
+                        elif dataset_size < LARGE_DATASET_THRESHOLD:
+                            size_category = "large"
+                        else:
+                            size_category = "very_large"
+                        
+                        perf_config = get_performance_config(size_category, device.type)
+                        time_estimate = estimate_processing_time(dataset_size, perf_config['batch_size'], device.type)
+                        
+                        print(f"Combined dataset size: {dataset_size:,} entries ({size_category}) - ETA: {time_estimate}")
+                        print(f"Performance config: batch_size={perf_config['batch_size']}, workers={perf_config['workers']}")
+                        
+                        display_data_distribution(df_all, "all combined")
+                        df_all = process_embeddings(df_all, device, use_global_attack_list=True, 
+                                                 performance_config=perf_config, log_type="all_combined")
+                        
+                        # Save combined outputs
+                        save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
+                        
+                        # Create visualization
+                        visualize_embeddings(
+                            df_all,
+                            output_file=OUTPUT_DIR / "visualization_all_combined.png"
+                        )
+                        
+                        # Clean up old checkpoints
+                        cleanup_old_checkpoints("all_combined")
+                        
+                        # Clear memory
+                        del df_all
+                        clear_memory(device)
+                        
+                        print(f"✅ Completed processing combined model")
             
             except KeyboardInterrupt:
                 print(f"\n⚠️  Combined processing interrupted. Checkpoint saved.")
