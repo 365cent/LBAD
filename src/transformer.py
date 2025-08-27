@@ -139,6 +139,10 @@ class EnhancedTransformerConfig:
     contamination_rate: float = 0.15  # Slightly higher
     smote_k_neighbors: int = 3  # Reduced for speed
     smote_max_samples: int = 5000  # Limit SMOTE output
+    # NEW: Balancing strategy
+    balance_strategy: str = 'ratio'  # 'ratio' or 'equalize'
+    balance_target_ratio: float = 0.05  # target positive proportion per class when strategy='ratio'
+    allow_downsampling: bool = True  # downsample majority classes to target
     
     # Clustering parameters - Simplified
     use_hierarchical: bool = False  # Disabled for performance
@@ -516,15 +520,7 @@ class SMOTEIntegrator:
                               split_name: str = "train") -> Tuple[np.ndarray, np.ndarray]:
         """
         Apply lightweight SMOTE with detailed reporting for multi-label data.
-        
-        Args:
-            X: Input features
-            y: Multi-label targets
-            classes: List of class names
-            split_name: Name of the data split (for reporting)
-            
-        Returns:
-            Tuple of (X_resampled, y_resampled)
+        Now supports aggressive balancing via oversampling to target and optional downsampling.
         """
         if not self.config.use_smote:
             print(f"⏩ SMOTE disabled, keeping original {split_name} data")
@@ -535,138 +531,68 @@ class SMOTEIntegrator:
         # Analyze initial distribution
         self._print_pre_smote_analysis(y, classes, split_name)
         
-        # Apply SMOTE per class (binary approach)
+        # Work on copies
         X_resampled = X.copy()
         y_resampled = y.copy()
         modifications = []
         
-        # Check normal samples first
-        normal_mask = np.sum(y, axis=1) == 0
-        normal_count = np.sum(normal_mask)
-        total_samples = len(y)
+        rng = np.random.RandomState(self.config.random_state)
+        total_samples = len(y_resampled)
         
-        # Determine if we need to oversample normal or attack classes
-        attack_counts = []
+        # Pre-compute max attack count for equalize mode
+        attack_counts_initial = [int(np.sum(y_resampled[:, i])) for i in range(len(classes))]
+        max_attack_count = max(attack_counts_initial) if attack_counts_initial else 0
+        
+        # Per-class balancing
         for i, class_name in enumerate(classes):
-            attack_count = np.sum(y[:, i])
-            attack_counts.append(attack_count)
-        
-        max_attack_count = max(attack_counts) if attack_counts else 0
-        
-        # Handle severe imbalances
-        for i, class_name in enumerate(classes):
-            attack_count = np.sum(y_resampled[:, i])
+            # Determine target count per strategy
+            if self.config.balance_strategy == 'equalize':
+                target_count = max_attack_count
+            else:
+                target_count = int(total_samples * self.config.balance_target_ratio)
+                target_count = max(target_count, 1)
             
-            # Determine if this class needs oversampling
-            target_count = max(min(max_attack_count // 2, total_samples // 10), 50)
+            # Current count
+            attack_count = int(np.sum(y_resampled[:, i]))
             
-            if attack_count < target_count and attack_count > 0:
+            # Oversample minority classes up to target_count
+            if attack_count > 0 and attack_count < target_count:
                 try:
-                    # Create binary problem for this class
                     y_binary = y_resampled[:, i].astype(int)
-                    
-                    # Apply lightweight SMOTE
-                    smote = SMOTE(
-                        k_neighbors=min(3, attack_count - 1) if attack_count > 1 else 1,
-                        random_state=self.config.random_state + i
-                    )
-                    
-                    X_class_resampled, y_class_resampled = smote.fit_resample(X_resampled, y_binary)
-                    
-                    # Calculate how many samples were added
-                    added_samples = len(X_class_resampled) - len(X_resampled)
-                    
+                    k_neighbors = min(3, max(1, attack_count - 1))
+                    smote = SMOTE(k_neighbors=k_neighbors, random_state=self.config.random_state + i)
+                    X_cls, y_cls = smote.fit_resample(X_resampled, y_binary)
+                    added_samples = len(X_cls) - len(X_resampled)
                     if added_samples > 0:
-                        # Update the full datasets
-                        X_resampled = X_class_resampled
-                        
-                        # Update y_resampled with proper multi-label format
-                        new_y = np.zeros((len(X_class_resampled), len(classes)))
-                        new_y[:len(y_resampled)] = y_resampled  # Copy original
-                        
-                        # For new samples, copy the pattern from similar samples
-                        for j in range(len(y_resampled), len(X_class_resampled)):
-                            new_y[j, i] = 1  # This class is positive
-                            # Randomly assign other classes based on correlation
-                            for k in range(len(classes)):
-                                if k != i:
-                                    # Check correlation with this class
-                                    correlation = np.corrcoef(y[:, i], y[:, k])[0, 1]
-                                    if not np.isnan(correlation) and correlation > 0.3:
-                                        new_y[j, k] = np.random.choice([0, 1], p=[0.7, 0.3])
-                        
+                        # Grow X
+                        X_resampled = X_cls
+                        # Grow Y by extending with zeros and set class i to 1 for new rows
+                        new_y = np.zeros((len(X_cls), y_resampled.shape[1]))
+                        new_y[:len(y_resampled)] = y_resampled
+                        new_y[len(y_resampled):, i] = 1
                         y_resampled = new_y
-                        
-                        modifications.append({
-                            'class': class_name,
-                            'original_count': attack_count,
-                            'new_count': np.sum(y_resampled[:, i]),
-                            'added_samples': added_samples,
-                            'indicator': '++'
-                        })
-                        
-                        print(f"  ++ {class_name}: {attack_count} → {np.sum(y_resampled[:, i])} (+{added_samples} samples)")
-                    
+                        modifications.append({'class': class_name, 'original_count': attack_count, 'new_count': int(np.sum(y_resampled[:, i])), 'added_samples': added_samples, 'indicator': '++'})
+                        print(f"  ++ {class_name}: {attack_count} → {int(np.sum(y_resampled[:, i]))} (+{added_samples} samples)")
                 except Exception as e:
                     print(f"  ⚠️  SMOTE failed for {class_name}: {e}")
-                    modifications.append({
-                        'class': class_name,
-                        'original_count': attack_count,
-                        'new_count': attack_count,
-                        'added_samples': 0,
-                        'indicator': '--',
-                        'error': str(e)
-                    })
-        
-        # Handle normal samples if severely underrepresented
-        final_normal_count = np.sum(np.sum(y_resampled, axis=1) == 0)
-        if final_normal_count < max(max_attack_count // 3, 30):
-            try:
-                # Create synthetic normal samples
-                normal_indices = np.where(np.sum(y_resampled, axis=1) == 0)[0]
-                if len(normal_indices) > 0:
-                    target_normal = min(max_attack_count // 2, len(y_resampled) // 5)
-                    needed_normal = max(0, target_normal - final_normal_count)
-                    
-                    if needed_normal > 0:
-                        # Duplicate and add noise to normal samples
-                        normal_samples = X_resampled[normal_indices]
-                        
-                        # Create variations
-                        synthetic_normal = []
-                        for _ in range(min(needed_normal, len(normal_indices) * 3)):
-                            idx = np.random.choice(len(normal_indices))
-                            sample = normal_samples[idx] + np.random.normal(0, 0.01, normal_samples[idx].shape)
-                            synthetic_normal.append(sample)
-                        
-                        if synthetic_normal:
-                            synthetic_normal = np.array(synthetic_normal)
-                            X_resampled = np.vstack([X_resampled, synthetic_normal])
-                            
-                            # Add corresponding labels (all zeros for normal)
-                            synthetic_labels = np.zeros((len(synthetic_normal), len(classes)))
-                            y_resampled = np.vstack([y_resampled, synthetic_labels])
-                            
-                            modifications.append({
-                                'class': 'normal',
-                                'original_count': final_normal_count,
-                                'new_count': np.sum(np.sum(y_resampled, axis=1) == 0),
-                                'added_samples': len(synthetic_normal),
-                                'indicator': '++'
-                            })
-                            
-                            print(f"  ++ normal: {final_normal_count} → {np.sum(np.sum(y_resampled, axis=1) == 0)} (+{len(synthetic_normal)} samples)")
+                    modifications.append({'class': class_name, 'original_count': attack_count, 'new_count': attack_count, 'added_samples': 0, 'indicator': '--', 'error': str(e)})
             
-            except Exception as e:
-                print(f"  ⚠️  Normal sample augmentation failed: {e}")
-                modifications.append({
-                    'class': 'normal',
-                    'original_count': final_normal_count,
-                    'new_count': final_normal_count,
-                    'added_samples': 0,
-                    'indicator': '--',
-                    'error': str(e)
-                })
+            # Downsample majority classes to target_count if allowed
+            attack_count = int(np.sum(y_resampled[:, i]))
+            if self.config.allow_downsampling and attack_count > target_count:
+                pos_idx = np.where(y_resampled[:, i] == 1)[0]
+                keep_pos = min(target_count, len(pos_idx))
+                if keep_pos < len(pos_idx):
+                    keep_pos_idx = rng.choice(pos_idx, size=keep_pos, replace=False)
+                    neg_idx = np.where(y_resampled[:, i] == 0)[0]
+                    keep_idx = np.sort(np.concatenate([keep_pos_idx, neg_idx]))
+                    before_n = len(X_resampled)
+                    X_resampled = X_resampled[keep_idx]
+                    y_resampled = y_resampled[keep_idx]
+                    after_n = len(X_resampled)
+                    new_count = int(np.sum(y_resampled[:, i]))
+                    modifications.append({'class': class_name, 'original_count': attack_count, 'new_count': new_count, 'removed_samples': before_n - after_n, 'indicator': 'dd'})
+                    print(f"  dd {class_name}: {attack_count} → {new_count} (downsampled {before_n - after_n} rows)")
         
         # Store modifications for reporting
         self.smote_reports.append({
@@ -680,7 +606,7 @@ class SMOTEIntegrator:
         total_added = len(X_resampled) - len(X)
         print(f"\n✅ SMOTE completed for {split_name}:")
         print(f"   Original: {len(X):,} samples")
-        print(f"   Final: {len(X_resampled):,} samples (+{total_added:,})")
+        print(f"   Final: {len(X_resampled):,} samples ({'+' if total_added>=0 else ''}{total_added:,})")
         
         return X_resampled, y_resampled
     
