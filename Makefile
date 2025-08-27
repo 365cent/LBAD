@@ -7,7 +7,7 @@ PIP := pip
 SRC := ./src
 
 # Available log types (override at runtime: make thesis LOG_TYPES="wp-error")
-LOG_TYPES := wp-access wp-error dns network web error monitoring auth audit
+LOG_TYPES := wp-access wp-error dns monitor share vpn audit auth
 
 # Embedding methods to use (override: make thesis EMBEDDINGS="logbert fasttext")
 EMBEDDINGS ?= logbert fasttext word2vec
@@ -313,7 +313,7 @@ define RUN_FOR_METHOD
     $(PYTHON) -c "import pickle, os; lt='$(1)'; \
 	src=f'embeddings/{lt}/label_{lt}.pkl'; dst=f'embeddings/{lt}/labels.pkl'; \
 	d=pickle.load(open(src,'rb')); arr = d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; \
-	pickle.dump(arr, open(dst,'wb'))" \
+	pickle.dump(arr, open(dst,'wb'))" ; \
 	fi
 	@echo "🤖 Running transformer for $(1) [method=$(2)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
