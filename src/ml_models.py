@@ -19,7 +19,7 @@ import pandas as pd
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
 from sklearn.metrics import (
@@ -34,6 +34,15 @@ import multiprocessing
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
+
+# Ensure Matplotlib can write cache/config on HPC
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    pass
 
 # Try XGBoost with fallback
 try:
@@ -61,7 +70,7 @@ if CPU_COUNT:
 else:
     N_JOBS = -1
 
-def create_multilabel_models(n_labels, random_state=42):
+def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False):
     """Create multi-label ML models."""
     models = {}
     
@@ -80,30 +89,46 @@ def create_multilabel_models(n_labels, random_state=42):
         )
     )
     
-    # Logistic Regression - with MultiOutput wrapper
-    models['lr'] = MultiOutputClassifier(
-        LogisticRegression(
-            penalty='l2',
-            C=1.0,
-            solver='liblinear',  # Works well with small datasets
-            max_iter=1000,
-            random_state=random_state,
-            class_weight='balanced'
-        )
-    )
+    # Logistic baseline: use SGD (logistic) for large datasets, else saga LR
+    if not skip_lr:
+        if large_dataset:
+            models['lr'] = MultiOutputClassifier(
+                SGDClassifier(
+                    loss='log_loss',
+                    penalty='l2',
+                    alpha=1e-4,
+                    max_iter=20,
+                    tol=1e-3,
+                    random_state=random_state,
+                    n_jobs=N_JOBS
+                )
+            )
+        else:
+            models['lr'] = MultiOutputClassifier(
+                LogisticRegression(
+                    penalty='l2',
+                    C=1.0,
+                    solver='saga',  # scales better
+                    max_iter=500,
+                    tol=1e-3,
+                    random_state=random_state,
+                    class_weight='balanced'
+                )
+            )
     
-    # K-Nearest Neighbors - with MultiOutput wrapper
-    models['knn'] = MultiOutputClassifier(
-        KNeighborsClassifier(
-            n_neighbors=5,
-            weights='distance',
-            algorithm='auto',
-            n_jobs=N_JOBS
+    # K-Nearest Neighbors - heavy for very large data; allow skipping
+    if not skip_knn and not large_dataset:
+        models['knn'] = MultiOutputClassifier(
+            KNeighborsClassifier(
+                n_neighbors=5,
+                weights='distance',
+                algorithm='auto',
+                n_jobs=N_JOBS
+            )
         )
-    )
     
     # XGBoost if available
-    if HAS_XGBOOST:
+    if has_xgb and HAS_XGBOOST:
         models['xgb'] = MultiOutputClassifier(
             XGBClassifier(
                 n_estimators=100,
@@ -179,11 +204,14 @@ def load_multilabel_data(log_type):
     # Convert to numpy arrays and ensure proper format for multi-label
     if not isinstance(embeddings, np.ndarray):
         embeddings = np.array(embeddings)
+    # Ensure float32 to reduce memory pressure
+    if embeddings.dtype != np.float32:
+        embeddings = embeddings.astype(np.float32, copy=False)
     if not isinstance(binary_vectors, np.ndarray):
         binary_vectors = np.array(binary_vectors)
     
     # Ensure binary vectors are in correct format (0s and 1s)
-    binary_vectors = binary_vectors.astype(int)
+    binary_vectors = binary_vectors.astype(np.int8, copy=False)
     
     print(f"Loaded {len(embeddings)} samples with {len(class_names)} classes")
     print(f"Embedding dimension: {embeddings.shape[1]}")
@@ -416,6 +444,12 @@ def main():
                         default='all', help='Model to train (default: all)')
     parser.add_argument('--test-size', type=float, default=0.2, 
                         help='Test set proportion (default: 0.2)')
+    parser.add_argument('--max-train-samples', type=int, default=200000, help='Cap training samples for scalability')
+    parser.add_argument('--max-test-samples', type=int, default=50000, help='Cap test samples for scalability')
+    parser.add_argument('--disable-downsample', action='store_true', help='Use full dataset (may be slow)')
+    parser.add_argument('--skip-knn', action='store_true', help='Skip KNN model')
+    parser.add_argument('--skip-lr', action='store_true', help='Skip Logistic baseline')
+    parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
     args = parser.parse_args()
     
     # Find available log types
@@ -461,6 +495,20 @@ def main():
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=args.test_size, random_state=42, stratify=None
             )
+
+            # Downsample for scalability unless disabled
+            large_dataset = len(X_train) > 300000
+            if not args.disable_downsample:
+                if len(X_train) > args.max_train_samples:
+                    sel = np.random.choice(len(X_train), args.max_train_samples, replace=False)
+                    X_train = X_train[sel]
+                    y_train = y_train[sel]
+                    print(f"Downsampled train to {len(X_train)} samples for speed")
+                if len(X_test) > args.max_test_samples:
+                    sel = np.random.choice(len(X_test), args.max_test_samples, replace=False)
+                    X_test = X_test[sel]
+                    y_test = y_test[sel]
+                    print(f"Downsampled test to {len(X_test)} samples for speed")
             
             print(f"Train set: {len(X_train)} samples")
             print(f"Test set: {len(X_test)} samples")
@@ -474,7 +522,13 @@ def main():
             joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
             
             # Create models
-            models = create_multilabel_models(len(class_names))
+            models = create_multilabel_models(
+                len(class_names),
+                large_dataset=large_dataset,
+                skip_knn=(args.skip_knn or large_dataset),
+                skip_lr=args.skip_lr,
+                has_xgb=args.with_xgb
+            )
             
             # Select models to train
             if args.model == 'all':
