@@ -191,6 +191,16 @@ def main():
 	# Process per log type
 	for lt in log_types:
 		print(f"\n{'='*50}\nProcessing log type: {lt}\n{'='*50}")
+		# Pre-check: skip if expected outputs already exist and appear valid
+		out_dir = OUTPUT_DIR / lt
+		log_pkl = out_dir / f"log_{lt}.pkl"
+		label_pkl = out_dir / f"label_{lt}.pkl"
+		attack_txt = out_dir / f"attack_types_{lt}.txt"
+		if log_pkl.exists() and log_pkl.stat().st_size > 0 and \
+		   label_pkl.exists() and label_pkl.stat().st_size > 0 and \
+		   attack_txt.exists() and attack_txt.stat().st_size > 0:
+			print(f"Outputs already exist for '{lt}', skipping.")
+			continue
 		df = load_tfrecord_files(log_type_filter=lt)
 		# Tokenize
 		df['tokens'] = tokenize_logs(df['log'])
@@ -201,7 +211,6 @@ def main():
 		df['binary_labels'] = [create_binary_label_vector(s, attack_types) for s in df['label_json']]
 		df.attrs['attack_types'] = attack_types
 		# Save
-		out_dir = OUTPUT_DIR / lt
 		save_embeddings_and_labels(df, out_dir, lt)
 		print(f"Saved to {out_dir}")
 

@@ -721,6 +721,18 @@ def main():
     for log_type in types_to_process:
         print(f"\n{'='*50}\nProcessing log type: {log_type}\n{'='*50}")
         try:
+            # Pre-check: skip if expected outputs already exist
+            output_dir = OUTPUT_DIR / log_type
+            log_pkl = output_dir / f"log_{log_type}.pkl"
+            label_pkl = output_dir / f"label_{log_type}.pkl"
+            attack_txt = output_dir / f"attack_types_{log_type}.txt"
+            viz_png = output_dir / "visualization.png"
+            if log_pkl.exists() and log_pkl.stat().st_size > 0 and \
+               label_pkl.exists() and label_pkl.stat().st_size > 0 and \
+               attack_txt.exists() and attack_txt.stat().st_size > 0 and \
+               viz_png.exists() and viz_png.stat().st_size > 0:
+                print(f"Outputs already exist for '{log_type}', skipping.")
+                continue
             # Load data for this log type
             df = load_tfrecord_files(log_type_filter=log_type)
             if df.empty:
@@ -754,6 +766,15 @@ def main():
     if run_combined:
         print(f"\n{'='*50}\nProcessing all log types combined\n{'='*50}")
         try:
+            # Pre-check for combined outputs
+            combined_log_pkl = OUTPUT_DIR / "log_all_combined.pkl"
+            combined_label_pkl = OUTPUT_DIR / "label_all_combined.pkl"
+            combined_viz_png = OUTPUT_DIR / "visualization_all_combined.png"
+            if combined_log_pkl.exists() and combined_log_pkl.stat().st_size > 0 and \
+               combined_label_pkl.exists() and combined_label_pkl.stat().st_size > 0 and \
+               combined_viz_png.exists() and combined_viz_png.stat().st_size > 0:
+                print("Combined outputs already exist, skipping combined processing.")
+                raise SystemExit
             # Load all data
             df_all = load_tfrecord_files()
             if df_all.empty:

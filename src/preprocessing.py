@@ -28,11 +28,9 @@ class LogPreprocessor:
             'vpn': ['openvpn.log'],
             'wp-access': ['access.log'],
             'wp-error': ['error.log'],
-            'intranet-error': ['error.log'],
             'auth': ['auth.log'],
             'audit': ['audit.log'],
             'dns': ['dnsmasq.log'],
-            'share': ['audit.log'],
             'monitor': ['system.cpu.log']
         }
 
@@ -183,34 +181,26 @@ class LogPreprocessor:
         return tf.train.Example(features=tf.train.Features(feature=feature)).SerializeToString()
 
     def process_file(self, log_file):
-        """Process a log file with its matching label file."""
+        """Process a log file with its matching label file.
+        Returns (processed: bool, log_type: str | None)
+        """
         log_file = Path(log_file)
         
         if not self.is_text_file(log_file):
             logger.info(f"Skipping non-text file: {log_file}")
-            return
+            return False, None
             
-        logger.info(f"Processing {log_file}")
-
-        # Determine log type
+        # Determine log type early to compute output path
         log_type = self.determine_log_type(log_file)
-        logger.info(f"Determined log type: {log_type}")
+        logger.info(f"Processing {log_file} (type={log_type})")
 
-        label_file = self.find_matching_label_files(log_file)
-        label_map = self.read_label_map(label_file) if label_file else {}
-        log_lines = self.read_file_lines(log_file)
-        
-        if not log_lines:
-            logger.warning(f"No text content found in {log_file}")
-            return
-
-        # Create output directory for the specific log type
+        # Prepare output path and skip if already exists
         type_output_dir = self.output_dir / log_type
         type_output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Preserve directory structure by getting relative path from logs_dir
         rel_path = log_file.relative_to(self.logs_dir)
-        
+
         # Create output path that includes user directory and log name
         if rel_path.parent != Path('.'):
             # Extract the username (first directory in path)
@@ -218,7 +208,20 @@ class LogPreprocessor:
             output_path = type_output_dir / f"{user}_{log_file.stem}.tfrecord"
         else:
             output_path = type_output_dir / f"{log_file.stem}.tfrecord"
-            
+
+        if output_path.exists() and output_path.stat().st_size > 0:
+            logger.info(f"Output already exists, skipping: {output_path}")
+            return False, log_type
+
+        # Load inputs only if we are going to write
+        label_file = self.find_matching_label_files(log_file)
+        label_map = self.read_label_map(label_file) if label_file else {}
+        log_lines = self.read_file_lines(log_file)
+        
+        if not log_lines:
+            logger.warning(f"No text content found in {log_file}")
+            return False, log_type
+        
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with tf.io.TFRecordWriter(
@@ -231,6 +234,7 @@ class LogPreprocessor:
                 writer.write(example)
 
         logger.info(f"Wrote {len(log_lines)} records to {output_path} with log type {log_type}")
+        return True, log_type
 
     def batch_process(self):
         """Process all valid log files in the logs directory."""
@@ -243,12 +247,13 @@ class LogPreprocessor:
         
         for log_file in log_files:
             if self.is_text_file(log_file):
-                self.process_file(log_file)
-                processed_count += 1
-                
-                # Track counts by log type
-                log_type = self.determine_log_type(log_file)
-                log_type_counts[log_type] = log_type_counts.get(log_type, 0) + 1
+                processed, log_type = self.process_file(log_file)
+                if processed:
+                    processed_count += 1
+                    # Track counts by log type
+                    if log_type is None:
+                        log_type = self.determine_log_type(log_file)
+                    log_type_counts[log_type] = log_type_counts.get(log_type, 0) + 1
                 
         logger.info(f"Batch processing complete. Processed {processed_count} text files.")
         logger.info(f"Log type distribution: {log_type_counts}")

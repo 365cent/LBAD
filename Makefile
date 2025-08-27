@@ -328,7 +328,7 @@ thesis: ensure-cache preprocess embeddings
 	@echo "🚀 Running thesis pipeline across methods: $(EMBEDDINGS)"
 	@for LT in $(LOG_TYPES); do \
 		for E in $(EMBEDDINGS); do \
-			$(call RUN_FOR_METHOD,$$LT,$$E); \
+			$(MAKE) run-method LOG_TYPE=$$LT METHOD=$$E; \
 		done; \
 	done
 	@$(MAKE) summarize
@@ -337,7 +337,7 @@ thesis: ensure-cache preprocess embeddings
 thesis-%: ensure-cache preprocess-% embeddings-%
 	@echo "🚀 Running thesis pipeline for log type: $* across methods: $(EMBEDDINGS)"
 	@for E in $(EMBEDDINGS); do \
-		$(call RUN_FOR_METHOD,$*,$$E); \
+		$(MAKE) run-method LOG_TYPE=$* METHOD=$$E; \
 	 done
 	@$(MAKE) summarize
 	@echo "✅ Thesis pipeline completed for $*"
@@ -424,3 +424,24 @@ benchmark:
         $(addprefix compare-,$(LOG_TYPES)) \
         $(addprefix ml-baseline-,$(LOG_TYPES)) \
         $(addprefix production-,$(LOG_TYPES))
+
+# New concrete rule replacing callable function style to avoid shell multiline issues
+run-method:
+	@echo "➡️  Preparing legacy layout for $(LOG_TYPE) [method=$(METHOD)]"
+	@mkdir -p embeddings/$(LOG_TYPE)
+	@if [ -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl; fi
+	@if [ -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/label_$(LOG_TYPE).pkl; fi
+	@if [ -f embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/embeddings.pkl; fi
+	@if [ -f embeddings/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
+		$(PYTHON) -c "import pickle, os; lt='$(LOG_TYPE)'; \
+		src=f'embeddings/{lt}/label_{lt}.pkl'; dst=f'embeddings/{lt}/labels.pkl'; \
+		d=pickle.load(open(src,'rb')); arr = d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; \
+		pickle.dump(arr, open(dst,'wb'))" ; \
+	fi
+	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)]"
+	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --use-enhanced-features || true
+	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
+	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --model all || true
+	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(LOG_TYPE) || true
+	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
+	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --pos-ratio 0.5 || true
