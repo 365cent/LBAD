@@ -427,19 +427,13 @@ benchmark:
 
 # New concrete rule replacing callable function style to avoid shell multiline issues
 run-method:
-	@echo "➡️  Preparing legacy layout for $(LOG_TYPE) [method=$(METHOD)]"
-	@mkdir -p embeddings/$(LOG_TYPE)
-	@if [ -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl; fi
-	@if [ -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/label_$(LOG_TYPE).pkl; fi
-	@if [ -f embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ]; then cp -f embeddings/$(LOG_TYPE)/log_$(LOG_TYPE).pkl embeddings/$(LOG_TYPE)/embeddings.pkl; fi
-	@if [ -f embeddings/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
-		$(PYTHON) -c "import pickle, os; lt='$(LOG_TYPE)'; \
-		src=f'embeddings/{lt}/label_{lt}.pkl'; dst=f'embeddings/{lt}/labels.pkl'; \
-		d=pickle.load(open(src,'rb')); arr = d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; \
-		pickle.dump(arr, open(dst,'wb'))" ; \
+	@echo "➡️  Checking embeddings for $(LOG_TYPE) [method=$(METHOD)]"
+	@if [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ] || [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
+		echo "❌ Missing embeddings for $(LOG_TYPE) in embeddings/$(METHOD). Skipping model runs for this method."; \
+		exit 0; \
 	fi
-	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --use-enhanced-features || true
+	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)] with correct embedding source"
+	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
 	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --model all || true
 	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(LOG_TYPE) || true

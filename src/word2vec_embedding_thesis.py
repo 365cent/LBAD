@@ -22,6 +22,9 @@ from gensim.models import Word2Vec
 from gensim.utils import simple_preprocess
 from halo import Halo
 import pickle
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import seaborn as sns
 
 # Configuration
 OUTPUT_DIR = Path("embeddings") / "word2vec"
@@ -160,6 +163,62 @@ def save_embeddings_and_labels(df: pd.DataFrame, out_dir: Path, log_type: str):
 				f.write(f"{i},{c}\n")
 
 
+def visualize_embeddings(df: pd.DataFrame, out_path: Path):
+	"""Create a balanced t-SNE visualization similar to FastText/LogBERT."""
+	MAX_TOTAL_POINTS = 30000
+	MAX_POINTS_PER_CLASS = 1500
+
+	# Build labels for viz
+	viz_labels = []
+	for s in df['label_json']:
+		labels = get_labels_from_json(s)
+		viz_labels.append("normal" if not labels else ", ".join(sorted(labels)))
+
+	# Balanced sampling
+	label_to_idx = {}
+	for i, lbl in enumerate(viz_labels):
+		label_to_idx.setdefault(lbl, []).append(i)
+
+	selected = []
+	for lbl, idxs in label_to_idx.items():
+		if len(idxs) > MAX_POINTS_PER_CLASS:
+			selected.extend(np.random.choice(idxs, MAX_POINTS_PER_CLASS, replace=False))
+		else:
+			selected.extend(idxs)
+
+	if len(selected) > MAX_TOTAL_POINTS:
+		selected = list(np.random.choice(selected, MAX_TOTAL_POINTS, replace=False))
+
+	X = np.vstack(df['log_embedding'].iloc[selected]).astype(np.float32)
+	labels = [viz_labels[i] for i in selected]
+
+	perplexity = min(50, max(5, len(X)//1000))
+	tsne = TSNE(n_components=2, perplexity=perplexity, n_iter=500, learning_rate='auto', init='pca', method='barnes_hut', random_state=42)
+	Y = tsne.fit_transform(X)
+
+	# Plot
+	plt.figure(figsize=(16, 10))
+	df_plot = pd.DataFrame({'x': Y[:,0], 'y': Y[:,1], 'label': labels})
+	uniq = sorted(df_plot['label'].unique())
+	palette = sns.color_palette("husl", len(uniq))
+	color_map = {lbl: palette[i] for i, lbl in enumerate(uniq)}
+	if "normal" in color_map:
+		color_map["normal"] = "green"
+	for lbl in uniq:
+		mask = df_plot['label'] == lbl
+		plt.scatter(df_plot.loc[mask, 'x'], df_plot.loc[mask, 'y'], c=[color_map[lbl]], s=12, alpha=0.6, edgecolors='none', label=lbl)
+	plt.title(f't-SNE: Word2Vec Log Embeddings ({len(uniq)} classes)')
+	plt.xlabel('t-SNE-1'); plt.ylabel('t-SNE-2')
+	if len(uniq) <= 20:
+		plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+		plt.tight_layout(rect=[0,0,0.85,1])
+	else:
+		plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=6, ncol=2)
+		plt.tight_layout(rect=[0,0,0.8,1])
+	plt.savefig(out_path, dpi=150, bbox_inches='tight')
+	plt.close()
+
+
 def main():
 	parser = argparse.ArgumentParser(description="Generate Word2Vec embeddings per log type (thesis)")
 	parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
@@ -196,9 +255,11 @@ def main():
 		log_pkl = out_dir / f"log_{lt}.pkl"
 		label_pkl = out_dir / f"label_{lt}.pkl"
 		attack_txt = out_dir / f"attack_types_{lt}.txt"
+		viz_png = out_dir / "visualization.png"
 		if log_pkl.exists() and log_pkl.stat().st_size > 0 and \
 		   label_pkl.exists() and label_pkl.stat().st_size > 0 and \
-		   attack_txt.exists() and attack_txt.stat().st_size > 0:
+		   attack_txt.exists() and attack_txt.stat().st_size > 0 and \
+		   viz_png.exists() and viz_png.stat().st_size > 0:
 			print(f"Outputs already exist for '{lt}', skipping.")
 			continue
 		df = load_tfrecord_files(log_type_filter=lt)
@@ -212,6 +273,8 @@ def main():
 		df.attrs['attack_types'] = attack_types
 		# Save
 		save_embeddings_and_labels(df, out_dir, lt)
+		# Visualization
+		visualize_embeddings(df, out_dir / "visualization.png")
 		print(f"Saved to {out_dir}")
 
 if __name__ == "__main__":
