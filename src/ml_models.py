@@ -120,9 +120,10 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
     if not skip_knn and not large_dataset:
         models['knn'] = MultiOutputClassifier(
             KNeighborsClassifier(
-                n_neighbors=5,
+                n_neighbors=3,
                 weights='distance',
-                algorithm='auto',
+                algorithm='brute',
+                metric='cosine',
                 n_jobs=N_JOBS
             )
         )
@@ -450,6 +451,8 @@ def main():
     parser.add_argument('--skip-knn', action='store_true', help='Skip KNN model')
     parser.add_argument('--skip-lr', action='store_true', help='Skip Logistic baseline')
     parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
+    parser.add_argument('--knn-train-cap', type=int, default=80000, help='Max samples for KNN training')
+    parser.add_argument('--knn-test-cap', type=int, default=30000, help='Max samples for KNN prediction')
     args = parser.parse_args()
     
     # Find available log types
@@ -549,13 +552,39 @@ def main():
                 print(f"{'-'*40}")
                 
                 try:
-                    result = train_evaluate_multilabel_model(
-                        f"{model_name}_{log_type}",
-                        models[model_name],
-                        X_train_scaled, y_train,
-                        X_test_scaled, y_test,
-                        class_names, results_dir
-                    )
+                    # Apply additional capping specifically for KNN to avoid hangs
+                    if model_name == 'knn':
+                        if len(X_train_scaled) > args.knn_train_cap:
+                            sel = np.random.choice(len(X_train_scaled), args.knn_train_cap, replace=False)
+                            X_train_local = X_train_scaled[sel]
+                            y_train_local = y_train[sel]
+                            print(f"KNN train capped to {len(X_train_local)} samples")
+                        else:
+                            X_train_local = X_train_scaled
+                            y_train_local = y_train
+                        if len(X_test_scaled) > args.knn_test_cap:
+                            sel = np.random.choice(len(X_test_scaled), args.knn_test_cap, replace=False)
+                            X_test_local = X_test_scaled[sel]
+                            y_test_local = y_test[sel]
+                            print(f"KNN test capped to {len(X_test_local)} samples")
+                        else:
+                            X_test_local = X_test_scaled
+                            y_test_local = y_test
+                        result = train_evaluate_multilabel_model(
+                            f"{model_name}_{log_type}",
+                            models[model_name],
+                            X_train_local, y_train_local,
+                            X_test_local, y_test_local,
+                            class_names, results_dir
+                        )
+                    else:
+                        result = train_evaluate_multilabel_model(
+                            f"{model_name}_{log_type}",
+                            models[model_name],
+                            X_train_scaled, y_train,
+                            X_test_scaled, y_test,
+                            class_names, results_dir
+                        )
                     results.append(result)
                     
                 except Exception as e:
