@@ -1606,13 +1606,31 @@ def train_optimized_models(
         )
         
         # Generate predictions for this class using original embeddings only
-        trained_model.eval()
-        with torch.no_grad():
-            embeddings_tensor = torch.from_numpy(original_embeddings).float().to(device)
-            outputs = trained_model(embeddings_tensor)
-            class_scores = outputs["multi_label_scores"]  # [batch, 1]
-            class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()  # [batch]
-            class_preds = (class_probs >= 0.5).astype(int)
+        def _infer_with_fallback(model, np_embeddings, prefer_device: torch.device):
+            model.eval()
+            try:
+                with torch.no_grad():
+                    tensor = torch.from_numpy(np_embeddings).float().to(prefer_device)
+                    model = model.to(prefer_device)
+                    out = model(tensor)
+                return out
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "cublas" in str(e).lower() or "invalid configuration" in str(e).lower():
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    with torch.no_grad():
+                        cpu_tensor = torch.from_numpy(np_embeddings).float().cpu()
+                        out = model.to("cpu")(cpu_tensor)
+                    return out
+                raise
+
+        outputs = _infer_with_fallback(trained_model, original_embeddings, device)
+        class_scores = outputs["multi_label_scores"]  # [batch, 1]
+        class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()  # [batch]
+        class_preds = (class_probs >= 0.5).astype(int)
         
         # Store results
         models.append(trained_model)
@@ -2084,17 +2102,37 @@ def process_log_type_with_args(
         # Use unseen test data for evaluation
         test_embeddings_tensor = torch.from_numpy(X_test).float().to(config.device)
         
+        # Inference with CUDA→CPU fallback
+        def _infer_probs_with_fallback(model, np_embeddings, prefer_device: str):
+            try:
+                with torch.no_grad():
+                    tensor = torch.from_numpy(np_embeddings).float().to(prefer_device)
+                    out = model.to(prefer_device)(tensor)
+                    logits = out["multi_label_scores"]
+                    probs = torch.sigmoid(logits).cpu().numpy().flatten()
+                return probs
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "cublas" in str(e).lower() or "invalid configuration" in str(e).lower():
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    with torch.no_grad():
+                        tensor = torch.from_numpy(np_embeddings).float().cpu()
+                        out = model.to("cpu")(tensor)
+                        logits = out["multi_label_scores"]
+                        probs = torch.sigmoid(logits).cpu().numpy().flatten()
+                    return probs
+                raise
+
         # Get predictions from all models (combined approach)
         all_test_predictions = []
         all_test_probabilities = []
         
         for i, model in enumerate(models):
-            model.eval()
-            outputs = model(test_embeddings_tensor)
-            logits = outputs["multi_label_scores"]
-            probs = torch.sigmoid(logits).cpu().numpy().flatten()
+            probs = _infer_probs_with_fallback(model, X_test, config.device)
             preds = (probs >= 0.5).astype(int)
-            
             all_test_predictions.append(preds)
             all_test_probabilities.append(probs)
         
