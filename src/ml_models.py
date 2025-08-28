@@ -146,34 +146,41 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
     
     return models
 
-def find_available_log_types():
+def find_available_log_types(embedding_type: str = None):
     """Find available log types from embeddings directory."""
-    log_types = []
-    
-    if EMBEDDINGS_DIR.exists():
-        for log_dir in EMBEDDINGS_DIR.iterdir():
-            if log_dir.is_dir():
-                log_file = log_dir / f"log_{log_dir.name}.pkl"
-                label_file = log_dir / f"label_{log_dir.name}.pkl"
-                
-                if log_file.exists() and label_file.exists():
-                    log_types.append(log_dir.name)
-    
-    return sorted(log_types)
+    log_types = set()
+    base = EMBEDDINGS_DIR / embedding_type if embedding_type else EMBEDDINGS_DIR
+    if not base.exists():
+        return []
+    for log_dir in base.iterdir():
+        if log_dir.is_dir():
+            name = log_dir.name
+            if (log_dir / f"log_{name}.pkl").exists() and (log_dir / f"label_{name}.pkl").exists():
+                log_types.add(name)
+    return sorted(list(log_types))
 
-def load_multilabel_data(log_type):
+def load_multilabel_data(log_type, embedding_type: str = None):
     """Load embeddings and multi-label data."""
     print(f"Loading {log_type} data...")
     
-    # Load embeddings
-    embeddings_file = EMBEDDINGS_DIR / log_type / f'log_{log_type}.pkl'
-    with open(embeddings_file, 'rb') as f:
-        embeddings = pickle.load(f)
+    # Candidate search order
+    candidates = []
+    if embedding_type:
+        base = EMBEDDINGS_DIR / embedding_type / log_type
+        candidates.append((base / f'log_{log_type}.pkl', base / f'label_{log_type}.pkl'))
+    legacy = EMBEDDINGS_DIR / log_type
+    candidates.append((legacy / f'log_{log_type}.pkl', legacy / f'label_{log_type}.pkl'))
     
-    # Load labels
-    labels_file = EMBEDDINGS_DIR / log_type / f'label_{log_type}.pkl'
-    with open(labels_file, 'rb') as f:
-        label_data = pickle.load(f)
+    embeddings = label_data = None
+    for x_path, y_path in candidates:
+        if x_path.exists() and y_path.exists():
+            with open(x_path, 'rb') as f:
+                embeddings = pickle.load(f)
+            with open(y_path, 'rb') as f:
+                label_data = pickle.load(f)
+            break
+    if embeddings is None:
+        raise FileNotFoundError(f"Embeddings for {log_type} not found in: " + ", ".join([str(p[0].parent) for p in candidates]))
     
     # Try to load attack types description file
     attack_types_file = EMBEDDINGS_DIR / log_type / f'attack_types_{log_type}.txt'
@@ -441,6 +448,7 @@ def main():
     """Main function for multi-label ML baseline."""
     parser = argparse.ArgumentParser(description='Multi-Label ML Baseline for Log Analysis')
     parser.add_argument('--log-type', type=str, help='Specific log type to process')
+    parser.add_argument('--embedding-type', type=str, help='Embedding subfolder (fasttext|logbert|word2vec)')
     parser.add_argument('--model', choices=['rf', 'lr', 'knn', 'xgb', 'all'], 
                         default='all', help='Model to train (default: all)')
     parser.add_argument('--test-size', type=float, default=0.2, 
@@ -456,7 +464,7 @@ def main():
     args = parser.parse_args()
     
     # Find available log types
-    available_log_types = find_available_log_types()
+    available_log_types = find_available_log_types(args.embedding_type)
     
     if not available_log_types:
         print("No processed log types found. Please run embeddings generation first.")
@@ -487,7 +495,7 @@ def main():
         
         try:
             # Load data
-            X, y, class_names = load_multilabel_data(log_type)
+            X, y, class_names = load_multilabel_data(log_type, args.embedding_type)
             
             # Skip if no positive labels
             if y.sum() == 0:

@@ -54,8 +54,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, TensorDataset
+from datetime import datetime
+import json as _json_for_progress
 
 # Import utility modules for better code organization
 try:
@@ -80,6 +82,14 @@ try:
         os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
 except Exception:
     # Best effort only; if it fails, Matplotlib will fall back to temp
+    pass
+
+# Prefer fast matmul on modern NVIDIA GPUs (H100/Ampere+)
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+except Exception:
     pass
 
 
@@ -343,14 +353,31 @@ class LabelCorrelationModule(nn.Module):
         return predictions
 
 
+def _select_best_cuda_device() -> int:
+    try:
+        n = torch.cuda.device_count()
+        if n <= 1:
+            return 0
+        best_idx = 0
+        best_mem = 0
+        for i in range(n):
+            props = torch.cuda.get_device_properties(i)
+            if props.total_memory > best_mem:
+                best_mem = props.total_memory
+                best_idx = i
+        return best_idx
+    except Exception:
+        return 0
+
 def detect_system_resources() -> SystemConfig:
     """Auto-detect system resources and configuration"""
     
     # Device detection
     if torch.cuda.is_available():
-        device = "cuda"
+        idx = _select_best_cuda_device()
+        device = f"cuda:{idx}"
         n_gpus = torch.cuda.device_count()
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        gpu_memory_gb = torch.cuda.get_device_properties(idx).total_memory / (1024**3)
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = "mps"
         n_gpus = 1
@@ -361,7 +388,11 @@ def detect_system_resources() -> SystemConfig:
         gpu_memory_gb = 0.0
     
     # System info
-    total_memory_gb = 8.0  # Default, could be detected
+    try:
+        import psutil
+        total_memory_gb = psutil.virtual_memory().total / (1024**3)
+    except Exception:
+        total_memory_gb = 8.0
     n_cpus = os.cpu_count() or 8
     
     # Distributed training info
@@ -1246,7 +1277,7 @@ def train_optimized_model(
         model.parameters(), lr=1e-4, weight_decay=1e-5
     )
     
-    scaler = GradScaler() if config.device == "cuda" else None
+    scaler = GradScaler(enabled=str(config.device).startswith("cuda"))
 
     # Enhanced scheduler
     def lr_lambda(epoch):
@@ -1271,7 +1302,7 @@ def train_optimized_model(
     best_model_state = None
     
     # Enable mixed precision if available
-    use_amp = config.device == "cuda" and econfig.use_mixed_precision
+    use_amp = str(config.device).startswith("cuda") and econfig.use_mixed_precision
     
     # Estimate training time
     time_estimate = estimate_training_time(
@@ -1295,18 +1326,29 @@ def train_optimized_model(
             
             # Forward pass
             optimizer.zero_grad()
-            outputs = model(x_batch)
-            
-            # Use utility for loss computation
-            if not econfig.use_complex_losses:
-                total_loss = LossOptimizer.compute_simple_loss(
-                    outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
-                )
+            if use_amp:
+                with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    outputs = model(x_batch)
+                    if not econfig.use_complex_losses:
+                        total_loss = LossOptimizer.compute_simple_loss(
+                            outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                        )
+                    else:
+                        total_loss = LossOptimizer.compute_focal_loss(
+                            outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                            econfig.reconstruction_weight, econfig.classification_weight
+                        )
             else:
-                total_loss = LossOptimizer.compute_focal_loss(
-                    outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
-                    econfig.reconstruction_weight, econfig.classification_weight
-                )
+                outputs = model(x_batch)
+                if not econfig.use_complex_losses:
+                    total_loss = LossOptimizer.compute_simple_loss(
+                        outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                    )
+                else:
+                    total_loss = LossOptimizer.compute_focal_loss(
+                        outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                        econfig.reconstruction_weight, econfig.classification_weight
+                    )
             
             # Optimized backward pass
             if use_amp:
@@ -1448,7 +1490,7 @@ def train_optimized_models(
         config.is_distributed = False
 
     # Training information
-    use_mixed_precision = config.device == "cuda"
+    use_mixed_precision = str(config.device).startswith("cuda")
     patience = 30
     class_weights = None
 
