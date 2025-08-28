@@ -438,4 +438,4 @@ run-method:
 	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --model all || true
 	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(LOG_TYPE) || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --pos-ratio 0.5 || true
+	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true

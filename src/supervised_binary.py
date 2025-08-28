@@ -45,18 +45,46 @@ EMBEDDINGS_DIR = ROOT / "embeddings"
 RESULTS_ROOT = ROOT / "results"
 
 
-def load_embeddings_labels(log_type: str):
-    dir_path = EMBEDDINGS_DIR / log_type
-    with open(dir_path / f"log_{log_type}.pkl", "rb") as f:
-        X = pickle.load(f)
-    with open(dir_path / f"label_{log_type}.pkl", "rb") as f:
-        data = pickle.load(f)
-        if isinstance(data, dict) and "vectors" in data:
-            Y = data["vectors"]
-            classes = data.get("classes", [])
-        else:
-            Y = data
-            classes = []
+def load_embeddings_labels(log_type: str, embedding_type: str = None):
+    """Load embeddings and labels, supporting method-specific subfolders.
+
+    Search order:
+    1) embeddings/<embedding_type>/<log_type>/log_<log_type>.pkl, label_<log_type>.pkl (if embedding_type given)
+    2) embeddings/<log_type>/log_<log_type>.pkl, label_<log_type>.pkl (legacy per-type)
+    3) embeddings/<log_type>/embeddings.pkl, labels.pkl (older legacy)
+    """
+    candidates = []
+    if embedding_type:
+        base = EMBEDDINGS_DIR / embedding_type / log_type
+        candidates.append((base / f"log_{log_type}.pkl", base / f"label_{log_type}.pkl"))
+    # Legacy per-type
+    base_legacy = EMBEDDINGS_DIR / log_type
+    candidates.append((base_legacy / f"log_{log_type}.pkl", base_legacy / f"label_{log_type}.pkl"))
+    # Older legacy names
+    candidates.append((base_legacy / "embeddings.pkl", base_legacy / "labels.pkl"))
+
+    X = Y = classes = None
+    last_err = None
+    for x_path, y_path in candidates:
+        try:
+            if x_path.exists() and y_path.exists():
+                with open(x_path, "rb") as f:
+                    X = pickle.load(f)
+                with open(y_path, "rb") as f:
+                    data = pickle.load(f)
+                break
+        except Exception as e:
+            last_err = e
+            continue
+    if X is None:
+        raise FileNotFoundError(f"Embeddings not found for '{log_type}'. Tried: " + ", ".join([str(p[0].parent) for p in candidates]))
+
+    if isinstance(data, dict) and "vectors" in data:
+        Y = data["vectors"]
+        classes = data.get("classes", [])
+    else:
+        Y = data
+        classes = []
     if not isinstance(X, np.ndarray):
         X = np.array(X, dtype=np.float32)
     else:
@@ -149,11 +177,12 @@ def main():
     parser.add_argument("--pos-ratio", type=float, default=0.5, help="Desired positive ratio after SMOTE (0-1)")
     parser.add_argument("--test-size", type=float, default=0.2, help="Test size fraction")
     parser.add_argument("--models", nargs="*", default=["lr", "rf", "xgb"], help="Models to run")
+    parser.add_argument("--embedding-type", type=str, default=None, help="Embedding subfolder (fasttext|logbert|word2vec)")
     args = parser.parse_args()
 
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-    X, Y_multi, classes = load_embeddings_labels(args.log_type)
+    X, Y_multi, classes = load_embeddings_labels(args.log_type, args.embedding_type)
     y_bin = to_binary_labels(Y_multi)
 
     results, meta = train_and_eval(X, y_bin, pos_ratio=args.pos_ratio, test_size=args.test_size, models=args.models)
