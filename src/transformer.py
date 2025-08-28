@@ -650,16 +650,22 @@ class SMOTEIntegrator:
             report_lines.append("")
             
             for mod in report['modifications']:
-                indicator = mod['indicator']
-                class_name = mod['class']
-                original = mod['original_count']
-                new_count = mod['new_count']
-                added = mod['added_samples']
+                indicator = mod.get('indicator', '')
+                class_name = mod.get('class', 'unknown')
+                original = mod.get('original_count', 0)
+                new_count = mod.get('new_count', original)
                 
                 if 'error' in mod:
                     report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} (ERROR: {mod['error']})")
+                elif 'added_samples' in mod:
+                    added = mod.get('added_samples', 0)
+                    sign = '+' if added >= 0 else ''
+                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} ({sign}{added})")
+                elif 'removed_samples' in mod:
+                    removed = mod.get('removed_samples', 0)
+                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} (-{removed})")
                 else:
-                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count} (+{added})")
+                    report_lines.append(f"  {indicator} {class_name}: {original} → {new_count}")
             
             report_lines.append("")
         
