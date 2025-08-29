@@ -46,12 +46,21 @@ import seaborn as sns
 import json
 import multiprocessing as mp
 import argparse
-from transformers import BertModel, BertTokenizer
+try:
+    from transformers import BertModel, BertTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("Warning: transformers library not available, LogBERT embeddings disabled")
 from torch.utils.data import DataLoader, Dataset
 from halo import Halo
 from typing import List, Dict, Tuple, Optional
 import time
-import psutil
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 import hashlib
 import signal
 import sys
@@ -520,7 +529,13 @@ def get_performance_config(dataset_size_category, device_type="cpu"):
         config['clear_freq'] = max(config['clear_freq'] // 2, 1)  # Clear memory more frequently
     
     # Adjust for system memory
-    memory_gb = psutil.virtual_memory().total / (1024**3)
+    if HAS_PSUTIL:
+        try:
+            memory_gb = psutil.virtual_memory().total / (1024**3)
+        except Exception:
+            memory_gb = 16.0  # Default assumption
+    else:
+        memory_gb = 16.0  # Default assumption
     if memory_gb < 8:  # Less than 8GB RAM
         config['batch_size'] = max(config['batch_size'] // 2, 1)
         config['workers'] = max(config['workers'] // 2, 1)
@@ -1626,6 +1641,12 @@ def main():
     parser.add_argument("--clean-incremental", action="store_true", help="Clean up incremental checkpoints only")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'logbert')")
     args = parser.parse_args()
+    
+    # Check if transformers library is available
+    if not HAS_TRANSFORMERS:
+        print("❌ transformers library not available. Please install it:")
+        print("   pip install transformers torch")
+        return
     
     print("🔄 Auto-Resume System: Saves every 5%, auto-recovers from crashes, perfect for compute nodes")
     

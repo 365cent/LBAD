@@ -72,7 +72,12 @@ import multiprocessing
 import argparse
 from functools import partial
 from halo import Halo
-import gensim.downloader as api
+try:
+    import gensim.downloader as api
+    HAS_GENSIM = True
+except ImportError:
+    HAS_GENSIM = False
+    print("Warning: gensim library not available, FastText embeddings disabled")
 
 # Configuration
 OUTPUT_DIR = Path("embeddings")
@@ -681,6 +686,12 @@ def main():
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'fasttext')")
     args = parser.parse_args()
+
+    # Check if gensim library is available
+    if not HAS_GENSIM:
+        print("❌ gensim library not available. Please install it:")
+        print("   pip install gensim")
+        return
 
     # Optionally route outputs to embeddings/<subdir>
     global OUTPUT_DIR

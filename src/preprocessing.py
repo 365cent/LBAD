@@ -259,8 +259,33 @@ class LogPreprocessor:
         logger.info(f"Log type distribution: {log_type_counts}")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Preprocess log files into TFRecord format")
+    parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
+    args = parser.parse_args()
+    
     preprocessor = LogPreprocessor()
-    preprocessor.batch_process()
+    
+    if args.log_type:
+        # Process specific log type if requested
+        print(f"Processing specific log type: {args.log_type}")
+        # Find files for this log type and process them
+        log_files = list(preprocessor.logs_dir.rglob('*'))
+        log_files = [f for f in log_files if f.is_file() and not f.name.startswith('.')]
+        
+        processed_count = 0
+        for log_file in log_files:
+            if preprocessor.is_text_file(log_file):
+                determined_type = preprocessor.determine_log_type(log_file)
+                if determined_type == args.log_type:
+                    processed, _ = preprocessor.process_file(log_file)
+                    if processed:
+                        processed_count += 1
+        
+        print(f"Processed {processed_count} files for log type '{args.log_type}'")
+    else:
+        # Process all log types
+        preprocessor.batch_process()
 
 if __name__ == '__main__':
     main()

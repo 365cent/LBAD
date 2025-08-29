@@ -18,10 +18,25 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from gensim.models import Word2Vec
-from gensim.utils import simple_preprocess
+try:
+    from gensim.models import Word2Vec
+    from gensim.utils import simple_preprocess
+    HAS_GENSIM = True
+except ImportError:
+    HAS_GENSIM = False
+    print("Warning: gensim library not available, Word2Vec embeddings disabled")
 from halo import Halo
 import pickle
+
+# Ensure Matplotlib can write cache/config on HPC
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    pass
+
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import seaborn as sns
@@ -224,6 +239,12 @@ def main():
 	parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
 	parser.add_argument("--output-subdir", type=str, default=None, help="Override default subdir under embeddings/")
 	args = parser.parse_args()
+	
+	# Check if gensim library is available
+	if not HAS_GENSIM:
+		print("❌ gensim library not available. Please install it:")
+		print("   pip install gensim")
+		return
 	
 	global OUTPUT_DIR
 	if args.output_subdir:
