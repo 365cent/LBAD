@@ -85,6 +85,10 @@ except ImportError:
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
+# Set CUDA environment variables to prevent worker process issues
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # Synchronous CUDA operations
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # Consistent device ordering
+
 # Ensure Matplotlib has a writable config/cache directory (HPC-safe)
 try:
     if "MPLCONFIGDIR" not in os.environ:
@@ -1281,27 +1285,54 @@ def train_optimized_model(
         base_batch_size, embeddings.shape[1], config.device, config.gpu_memory_gb
     )
 
-    # Prepare data using utility
+    # Prepare data using utility - Keep tensors on CPU initially to avoid CUDA worker issues
     embeddings_tensor, labels_tensor = data_processor.prepare_tensors(
-        embeddings, binary_labels, device
+        embeddings, binary_labels, "cpu"  # Keep on CPU initially
     )
     
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
-    # Optimized DataLoader with better performance settings
-    num_workers = min(4, os.cpu_count() or 1) if len(dataset) > 10000 else 0
-    pin_memory = str(config.device).startswith("cuda") and len(dataset) < 1000000  # Pin memory for smaller datasets on GPU
+    # Optimized DataLoader with CUDA-safe configuration
+    # Disable multi-worker DataLoader for CUDA to avoid worker process issues
+    if str(config.device).startswith("cuda"):
+        num_workers = 0  # Single process to avoid CUDA worker issues
+        pin_memory = True  # Enable pin memory for GPU
+        print(f"🔧 CUDA mode: Using single worker DataLoader for stability")
+    else:
+        num_workers = min(4, os.cpu_count() or 1) if len(dataset) > 10000 else 0
+        pin_memory = False
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,  # Keep workers alive
-        prefetch_factor=2 if num_workers > 0 else 2,  # Prefetch batches
-        drop_last=True if len(dataset) > batch_size * 10 else False,  # Drop incomplete batches for large datasets
-    )
+    # Create DataLoader with fallback for CUDA issues
+    try:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=False,  # Disable persistent workers for CUDA stability
+            prefetch_factor=2 if num_workers > 0 else 2,
+            drop_last=True if len(dataset) > batch_size * 10 else False,
+        )
+    except Exception as e:
+        if "CUDA" in str(e) or "worker" in str(e).lower():
+            print(f"⚠️  DataLoader creation failed with CUDA/worker error: {e}")
+            print(f"🔄 Falling back to single-process CPU DataLoader...")
+            # Fallback to CPU-only DataLoader
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,  # Single process
+                pin_memory=False,  # No pin memory for CPU
+                persistent_workers=False,
+                drop_last=True if len(dataset) > batch_size * 10 else False,
+            )
+            # Force CPU mode
+            device = torch.device("cpu")
+            print(f"🔧 Forced CPU mode for stability")
+        else:
+            raise
     
     print(f"🔧 DataLoader optimized: batch_size={batch_size}, workers={num_workers}, pin_memory={pin_memory}")
 
@@ -1360,8 +1391,18 @@ def train_optimized_model(
         optimizer.zero_grad()  # Zero gradients at the start of epoch
         
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            x_batch = x_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
+            # Transfer to device with proper error handling
+            try:
+                x_batch = x_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+            except RuntimeError as e:
+                if "CUDA" in str(e):
+                    print(f"⚠️  CUDA transfer failed, falling back to CPU: {e}")
+                    device = torch.device("cpu")
+                    x_batch = x_batch.to(device)
+                    y_batch = y_batch.to(device)
+                else:
+                    raise
             
             # Forward pass with optimized precision handling
             if use_amp and AUTOCAST_AVAILABLE:
@@ -1508,8 +1549,20 @@ def train_optimized_models(
     def clear_gpu_memory():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            # Force garbage collection
+            import gc
+            gc.collect()
     
     clear_gpu_memory()
+    
+    # Set CUDA memory fraction to prevent worker process issues
+    if str(config.device).startswith("cuda"):
+        try:
+            # Reserve only 80% of GPU memory to avoid worker process conflicts
+            torch.cuda.set_per_process_memory_fraction(0.8)
+            print(f"🔧 CUDA memory fraction set to 80% for stability")
+        except Exception as e:
+            print(f"⚠️  Could not set CUDA memory fraction: {e}")
 
     # Get optimized architecture using utility
     embedding_dim = embeddings.shape[1]
@@ -1710,15 +1763,29 @@ def train_optimized_models(
         except Exception as e:
             print(f"⚠️  Model compilation failed: {e}")
         
-        # Multi-GPU setup if available
-        if config.n_gpus > 1:
-            model = nn.DataParallel(model)
-            print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
-        
-        # Train this model with optimized function
+            # Multi-GPU setup if available
+    if config.n_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
+    
+    # Train this model with optimized function
+    try:
         trained_model = train_optimized_model(
             model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
         )
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "worker" in str(e).lower():
+            print(f"⚠️  CUDA training failed: {e}")
+            print(f"🔄 Attempting CPU fallback...")
+            # Force CPU mode and retry
+            config.device = "cpu"
+            device = torch.device("cpu")
+            model = model.cpu()
+            trained_model = train_optimized_model(
+                model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
+            )
+        else:
+            raise
         
         # Generate predictions for this class using original embeddings only
         def _infer_with_fallback(model, np_embeddings, prefer_device: torch.device):
