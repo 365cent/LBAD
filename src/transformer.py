@@ -1304,6 +1304,9 @@ def train_optimized_model(
     
     # Create DataLoader with fallback for CUDA issues
     try:
+        # Set prefetch_factor only when num_workers > 0
+        prefetch_factor = 2 if num_workers > 0 else None
+        
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -1311,12 +1314,12 @@ def train_optimized_model(
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=False,  # Disable persistent workers for CUDA stability
-            prefetch_factor=2 if num_workers > 0 else 2,
+            prefetch_factor=prefetch_factor,  # Only set when num_workers > 0
             drop_last=True if len(dataset) > batch_size * 10 else False,
         )
     except Exception as e:
-        if "CUDA" in str(e) or "worker" in str(e).lower():
-            print(f"⚠️  DataLoader creation failed with CUDA/worker error: {e}")
+        if "CUDA" in str(e) or "worker" in str(e).lower() or "prefetch_factor" in str(e).lower():
+            print(f"⚠️  DataLoader creation failed: {e}")
             print(f"🔄 Falling back to single-process CPU DataLoader...")
             # Fallback to CPU-only DataLoader
             dataloader = DataLoader(
@@ -1326,6 +1329,7 @@ def train_optimized_model(
                 num_workers=0,  # Single process
                 pin_memory=False,  # No pin memory for CPU
                 persistent_workers=False,
+                prefetch_factor=None,  # No prefetch for single worker
                 drop_last=True if len(dataset) > batch_size * 10 else False,
             )
             # Force CPU mode
@@ -1340,6 +1344,12 @@ def train_optimized_model(
     optimizer = optim.AdamW(
         model.parameters(), lr=1e-4, weight_decay=1e-5
     )
+    
+    # Ensure model is on the correct device
+    current_device = next(model.parameters()).device
+    if str(current_device) != str(device):
+        print(f"🔄 Moving model from {current_device} to {device}")
+        model = model.to(device)
     
     scaler = GradScaler(enabled=str(config.device).startswith("cuda"))
 
@@ -1395,12 +1405,18 @@ def train_optimized_model(
             try:
                 x_batch = x_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
+                
+                # Ensure model is on the same device as data
+                if next(model.parameters()).device != device:
+                    model = model.to(device)
+                    
             except RuntimeError as e:
-                if "CUDA" in str(e):
-                    print(f"⚠️  CUDA transfer failed, falling back to CPU: {e}")
+                if "CUDA" in str(e) or "device" in str(e).lower():
+                    print(f"⚠️  Device transfer failed, falling back to CPU: {e}")
                     device = torch.device("cpu")
                     x_batch = x_batch.to(device)
                     y_batch = y_batch.to(device)
+                    model = model.to(device)
                 else:
                     raise
             
@@ -1754,38 +1770,63 @@ def train_optimized_models(
         # Simplified initialization
         model.apply(lambda m: torch.nn.init.xavier_uniform_(m.weight, gain=0.2) if hasattr(m, 'weight') and m.weight.dim() > 1 else None)
         
-        # PyTorch 2.0 compilation for better performance
+                # PyTorch 2.0 compilation for better performance (only for CUDA)
+        model_compiled = False
         try:
-            if hasattr(torch, 'compile') and not config.is_distributed:
-                print(f"🚀 Compiling model with PyTorch 2.0...")
+            if (hasattr(torch, 'compile') and 
+                not config.is_distributed and 
+                str(config.device).startswith("cuda")):
+                print(f"🚀 Compiling model with PyTorch 2.0 for CUDA...")
                 model = torch.compile(model, mode='default', dynamic=False)
+                model_compiled = True
                 print(f"✅ Model compiled successfully")
+            else:
+                print(f"⏩ Skipping model compilation (CPU mode or distributed)")
         except Exception as e:
             print(f"⚠️  Model compilation failed: {e}")
         
-            # Multi-GPU setup if available
-    if config.n_gpus > 1:
-        model = nn.DataParallel(model)
-        print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
-    
-    # Train this model with optimized function
-    try:
-        trained_model = train_optimized_model(
-            model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
-        )
-    except RuntimeError as e:
-        if "CUDA" in str(e) or "worker" in str(e).lower():
-            print(f"⚠️  CUDA training failed: {e}")
-            print(f"🔄 Attempting CPU fallback...")
-            # Force CPU mode and retry
-            config.device = "cpu"
-            device = torch.device("cpu")
-            model = model.cpu()
+        # Multi-GPU setup if available
+        if config.n_gpus > 1:
+            model = nn.DataParallel(model)
+            print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
+        
+        # Train this model with optimized function
+        try:
             trained_model = train_optimized_model(
                 model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
             )
-        else:
-            raise
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "worker" in str(e).lower() or "device" in str(e).lower():
+                print(f"⚠️  CUDA training failed: {e}")
+                print(f"🔄 Attempting CPU fallback...")
+                # Force CPU mode and retry
+                config.device = "cpu"
+                device = torch.device("cpu")
+                
+                # If model was compiled, we need to recreate it without compilation for CPU
+                if model_compiled:
+                    print(f"🔄 Recreating uncompiled model for CPU compatibility...")
+                    # Recreate the model without compilation
+                    model = OptimizedTransformer(
+                        input_dim=embedding_dim,
+                        latent_dim=latent_dim,
+                        n_labels=1,
+                        dropout=0.1,
+                        transformer_layers=transformer_layers,
+                        attention_heads=attention_heads,
+                        use_simple_attention=True
+                    ).to("cpu")
+                    # Re-apply DataParallel if needed
+                    if config.n_gpus > 1:
+                        model = nn.DataParallel(model)
+                else:
+                    model = model.cpu()
+                
+                trained_model = train_optimized_model(
+                    model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
+                )
+            else:
+                raise
         
         # Generate predictions for this class using original embeddings only
         def _infer_with_fallback(model, np_embeddings, prefer_device: torch.device):
