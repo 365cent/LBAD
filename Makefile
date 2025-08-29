@@ -204,14 +204,14 @@ ml-baseline-%:
 	@echo "📊 Running ML baselines for log type: $*"
 	$(PYTHON) $(SRC)/ml_models.py --log-type $*
 
-# XGBoost with One-vs-Rest strategy
+# XGBoost with traditional MultiOutputClassifier approach
 xgboost:
-	@echo "🌲 Running XGBoost One-vs-Rest models..."
-	$(PYTHON) $(SRC)/ml_models.py --xgb-ovr --with-xgb
+	@echo "🌲 Running XGBoost traditional models..."
+	$(PYTHON) $(SRC)/ml_models.py --with-xgb
 
 xgboost-%:
-	@echo "🌲 Running XGBoost OvR for log type: $*"
-	$(PYTHON) $(SRC)/ml_models.py --log-type $* --xgb-ovr --with-xgb
+	@echo "🌲 Running XGBoost traditional for log type: $*"
+	$(PYTHON) $(SRC)/ml_models.py --log-type $* --with-xgb
 
 # f-AnoGAN (GAN-based anomaly detection)
 gan:
@@ -327,7 +327,7 @@ define RUN_FOR_METHOD
 	@echo "🤖 Running transformer for $(1) [method=$(2)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(1) [method=$(2)]"
-	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --embedding-type $(2) --model all --xgb-ovr --with-xgb || true
+	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --embedding-type $(2) --model all --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(1) [method=$(2)]"
 	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(1) --embedding-type $(2) --pos-ratio 0.5 || true
 endef
@@ -471,7 +471,7 @@ run-method:
 	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)] with correct embedding source"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
+	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
 	@echo "🔄 Running quick binary baseline instead..."
@@ -489,7 +489,7 @@ run-method-fast:
 	echo "🤖⚡ Running FAST transformer for $(LOG_TYPE) [method=$(METHOD)] with $$SUBSET_SIZE samples"; \
 	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --sample-size $$SUBSET_SIZE --simple-mode || true
 	@echo "📊⚡ Running FAST ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb --max-train-samples 10000 || true
+	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --with-xgb --max-train-samples 10000 || true
 	@echo "⚑⚡ Running FAST binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
 	@echo "🔄 Running quick binary baseline instead..."
