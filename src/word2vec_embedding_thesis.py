@@ -57,6 +57,34 @@ MIN_COUNT = 1
 WORKERS = 4
 EPOCHS = 10
 
+# Performance tuning for large datasets
+def get_performance_config(dataset_size):
+	"""Get optimized Word2Vec configuration based on dataset size."""
+	if dataset_size > 2000000:  # Very large (>2M entries)
+		return {
+			'vector_size': 150,   # Reduced for speed
+			'epochs': 5,          # Fewer epochs
+			'min_count': 2,       # Higher min_count to reduce vocab
+			'negative': 10,       # Reduced negative sampling
+			'sample': 1e-4        # More aggressive subsampling
+		}
+	elif dataset_size > 500000:  # Large (>500k entries)  
+		return {
+			'vector_size': 200,
+			'epochs': 8,
+			'min_count': 1,
+			'negative': 15,
+			'sample': 1e-5
+		}
+	else:  # Normal size
+		return {
+			'vector_size': VECTOR_SIZE,
+			'epochs': EPOCHS,
+			'min_count': MIN_COUNT,
+			'negative': 20,
+			'sample': 1e-5
+		}
+
 # Global variables for emergency checkpoint saving
 _current_checkpoint_state = None
 _cleanup_functions = []
@@ -124,18 +152,58 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None) -> pd.Dat
 			raise FileNotFoundError(f"No TFRecord files found in {directory}")
 
 	all_logs, all_labels_json, all_log_types = [], [], []
-	spinner = Halo(text='Loading TFRecords', spinner='dots')
-	spinner.start()
-	for file_path in files:
+	
+	# Estimate total records for progress tracking
+	total_file_size = sum(f.stat().st_size for f in files)
+	print(f"📁 Loading TFRecord files: {len(files)} files, {total_file_size/(1024**2):.1f}MB total")
+	
+	try:
+		from tqdm import tqdm
+		file_iterator = tqdm(files, desc="Loading TFRecord files", unit="files")
+	except ImportError:
+		file_iterator = files
+		spinner = Halo(text='Loading TFRecords', spinner='dots')
+		spinner.start()
+	
+	last_update = time.time()
+	start_time = time.time()
+	
+	for file_idx, file_path in enumerate(file_iterator):
 		log_type = file_path.parent.name
+		file_start = time.time()
+		
 		dataset = tf.data.TFRecordDataset(str(file_path), compression_type="GZIP")
 		dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
 		dataset = dataset.prefetch(tf.data.AUTOTUNE)
+		
+		file_records = 0
 		for parsed in dataset:
 			all_logs.append(parsed["l"].numpy().decode("utf-8"))
 			all_labels_json.append(parsed["y"].numpy().decode("utf-8"))
 			all_log_types.append(log_type)
-	spinner.succeed(f"Loaded {len(all_logs)} entries")
+			file_records += 1
+		
+		file_time = time.time() - file_start
+		
+		# Progress update for manual mode
+		if 'spinner' in locals() and (time.time() - last_update) > 5:
+			elapsed = time.time() - start_time
+			total_records = len(all_logs)
+			rate = total_records / elapsed if elapsed > 0 else 0
+			spinner.text = f'Loading TFRecords... {total_records:,} records ({rate:.0f}/sec, {file_idx+1}/{len(files)} files)'
+			last_update = time.time()
+		
+		# Log file completion for large files
+		if file_time > 5 or file_records > 100000:
+			print(f"   ✅ Loaded {file_path.name}: {file_records:,} records in {file_time:.1f}s")
+	
+	if 'spinner' in locals():
+		spinner.succeed(f"Loaded {len(all_logs):,} entries from {len(files)} files")
+	
+	total_time = time.time() - start_time
+	rate = len(all_logs) / total_time if total_time > 0 else 0
+	print(f"📊 TFRecord loading complete: {len(all_logs):,} entries in {total_time:.1f}s ({rate:.0f} records/sec)")
+	
 	return pd.DataFrame({"log": all_logs, "label_json": all_labels_json, "log_type": all_log_types})
 
 
@@ -174,19 +242,183 @@ def create_binary_label_vector(label_json_str, all_attack_types):
 
 
 def tokenize_logs(logs):
-	return [simple_preprocess(text) for text in logs]
+	"""Tokenize logs with progress monitoring for large datasets."""
+	if len(logs) > 100000:
+		print(f"🔤 Tokenizing {len(logs):,} logs...")
+		try:
+			from tqdm import tqdm
+			return [simple_preprocess(text) for text in tqdm(logs, desc="Tokenizing", unit="logs")]
+		except ImportError:
+			# Fallback with manual progress
+			tokenized = []
+			last_update = time.time()
+			for i, text in enumerate(logs):
+				tokenized.append(simple_preprocess(text))
+				
+				# Progress update every 50k logs or 30 seconds
+				if i % 50000 == 0 or (time.time() - last_update) > 30:
+					progress = (i + 1) / len(logs) * 100
+					print(f"   📝 Tokenizing progress: {progress:.1f}% ({i+1:,}/{len(logs):,})")
+					last_update = time.time()
+			
+			return tokenized
+	else:
+		return [simple_preprocess(text) for text in logs]
 
 
 def train_word2vec(corpus_tokens):
-	model = Word2Vec(
-		corpus_tokens,
-		vector_size=VECTOR_SIZE,
-		window=WINDOW,
-		min_count=MIN_COUNT,
-		workers=WORKERS,
-		epochs=EPOCHS,
-		sg=1,
-	)
+	"""Train Word2Vec model with progress monitoring and timeout protection."""
+	print(f"🤖 Training Word2Vec model...")
+	print(f"   📊 Corpus size: {len(corpus_tokens):,} documents")
+	
+	# Get performance-optimized configuration
+	perf_config = get_performance_config(len(corpus_tokens))
+	vector_size = perf_config['vector_size']
+	epochs = perf_config['epochs']
+	min_count = perf_config['min_count']
+	negative = perf_config['negative']
+	sample = perf_config['sample']
+	
+	print(f"   ⚙️  Optimized config: {vector_size}D vectors, epochs={epochs}, min_count={min_count}")
+	print(f"   🚀 Performance tuning: negative={negative}, sample={sample}, workers={WORKERS}")
+	
+	# Calculate vocabulary size for estimation
+	vocab_words = set()
+	total_tokens = 0
+	sample_size = min(1000, len(corpus_tokens))
+	for tokens in corpus_tokens[:sample_size]:  # Sample first 1000 docs
+		vocab_words.update(tokens)
+		total_tokens += len(tokens)
+	
+	estimated_vocab_size = len(vocab_words) * (len(corpus_tokens) / sample_size)
+	avg_tokens_per_doc = total_tokens / sample_size
+	
+	print(f"   📈 Estimated vocabulary: {estimated_vocab_size:,.0f} unique words")
+	print(f"   📝 Average tokens per document: {avg_tokens_per_doc:.1f}")
+	
+	# Estimate training time (updated heuristic)
+	complexity_factor = estimated_vocab_size * avg_tokens_per_doc / 1000000  # Normalize
+	estimated_minutes = (len(corpus_tokens) * epochs * complexity_factor) / (50000 * WORKERS)
+	
+	if estimated_minutes > 120:
+		print(f"   ⏰ Estimated training time: {estimated_minutes/60:.1f} hours (using optimized config)")
+	elif estimated_minutes > 5:
+		print(f"   ⏰ Estimated training time: {estimated_minutes:.1f} minutes")
+	else:
+		print(f"   ⏰ Estimated training time: {estimated_minutes*60:.0f} seconds")
+	
+	# Create a progress callback class
+	class ProgressCallback:
+		def __init__(self, total_examples, epochs):
+			self.total_examples = total_examples
+			self.epochs = epochs
+			self.start_time = time.time()
+			self.last_update = 0
+			self.epoch_start = 0
+			
+		def on_epoch_begin(self, model):
+			self.epoch_start = time.time()
+			current_epoch = model.epochs - model.epochs + 1  # This is a bit tricky to get
+			print(f"   📚 Starting epoch {getattr(model, 'current_epoch', '?')}/{self.epochs}...")
+			
+		def on_batch_end(self, model):
+			current_time = time.time()
+			if current_time - self.last_update > 30:  # Update every 30 seconds
+				elapsed = current_time - self.start_time
+				print(f"   ⏳ Training in progress... ({elapsed/60:.1f} min elapsed)")
+				self.last_update = current_time
+	
+	# Use tqdm for corpus iteration if available
+	try:
+		from tqdm import tqdm
+		print("   🔄 Training with progress monitoring...")
+		
+		# Create model with optimized performance configuration
+		model = Word2Vec(
+			vector_size=vector_size,
+			window=WINDOW,
+			min_count=min_count,
+			workers=WORKERS,
+			sg=1,  # Skip-gram
+			compute_loss=True,  # Enable loss computation for monitoring
+			negative=negative,  # Negative sampling
+			sample=sample,      # Subsampling threshold
+			callbacks=[]  # Gensim callbacks don't work well, we'll use manual progress
+		)
+		
+		# Build vocabulary first
+		print("   📚 Building vocabulary...")
+		vocab_start = time.time()
+		model.build_vocab(corpus_tokens, progress_per=10000)
+		vocab_time = time.time() - vocab_start
+		actual_vocab_size = len(model.wv.key_to_index)
+		print(f"   ✅ Vocabulary built: {actual_vocab_size:,} words in {vocab_time:.1f}s")
+		
+		# Train the model with progress
+		print(f"   🎯 Training {epochs} epochs...")
+		train_start = time.time()
+		
+		for epoch in range(epochs):
+			epoch_start = time.time()
+			print(f"   📖 Epoch {epoch+1}/{epochs}...")
+			
+			# Train one epoch
+			model.train(corpus_tokens, total_examples=len(corpus_tokens), epochs=1)
+			
+			epoch_time = time.time() - epoch_start
+			total_elapsed = time.time() - train_start
+			remaining_epochs = epochs - (epoch + 1)
+			estimated_remaining = (total_elapsed / (epoch + 1)) * remaining_epochs
+			
+			if hasattr(model, 'get_latest_training_loss'):
+				try:
+					loss = model.get_latest_training_loss()
+					print(f"   ✅ Epoch {epoch+1} complete: {epoch_time:.1f}s, loss={loss:.6f}")
+				except:
+					print(f"   ✅ Epoch {epoch+1} complete: {epoch_time:.1f}s")
+			else:
+				print(f"   ✅ Epoch {epoch+1} complete: {epoch_time:.1f}s")
+			
+			if remaining_epochs > 0:
+				if estimated_remaining > 60:
+					print(f"   ⏰ Estimated remaining: {estimated_remaining/60:.1f} minutes")
+				else:
+					print(f"   ⏰ Estimated remaining: {estimated_remaining:.0f} seconds")
+			
+			# Safety check - if epoch takes too long, reduce remaining epochs
+			if epoch_time > 1800:  # 30 minutes per epoch is too long
+				print(f"   ⚠️  Epoch taking too long ({epoch_time/60:.1f} min), stopping early for efficiency")
+				break
+		
+		training_time = time.time() - train_start
+		print(f"   🎉 Training completed in {training_time/60:.1f} minutes")
+		
+	except ImportError:
+		# Fallback without tqdm
+		print("   🔄 Training (no progress bar available)...")
+		start_time = time.time()
+		
+		# Use optimized configuration in fallback mode too
+		model = Word2Vec(
+			corpus_tokens,
+			vector_size=vector_size,
+			window=WINDOW,
+			min_count=min_count,
+			workers=WORKERS,
+			epochs=min(epochs, 5),  # Limit epochs if no progress monitoring
+			sg=1,  # Skip-gram
+			negative=negative,  # Negative sampling
+			sample=sample,      # Subsampling threshold
+		)
+		
+		training_time = time.time() - start_time
+		print(f"   ✅ Training completed in {training_time/60:.1f} minutes")
+	
+	# Model statistics
+	vocab_size = len(model.wv.key_to_index)
+	actual_vector_size = model.wv.vector_size
+	print(f"   📊 Final model: {vocab_size:,} words, {actual_vector_size}D vectors")
+	
 	return model
 
 

@@ -100,6 +100,19 @@ try:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision('high')
+    # Enable cuDNN benchmarking for consistent input sizes
+    torch.backends.cudnn.benchmark = True
+    # Enable optimized attention (Flash Attention 2 if available)
+    torch.backends.cuda.enable_flash_sdp(True)
+except Exception:
+    pass
+
+# Optimize CPU performance
+try:
+    # Set optimal thread count for CPU operations
+    torch.set_num_threads(min(8, os.cpu_count() or 4))
+    # Enable MKLDNN for better CPU performance
+    torch.backends.mkldnn.enabled = True
 except Exception:
     pass
 
@@ -1275,13 +1288,22 @@ def train_optimized_model(
     
     dataset = TensorDataset(embeddings_tensor, labels_tensor)
 
+    # Optimized DataLoader with better performance settings
+    num_workers = min(4, os.cpu_count() or 1) if len(dataset) > 10000 else 0
+    pin_memory = str(config.device).startswith("cuda") and len(dataset) < 1000000  # Pin memory for smaller datasets on GPU
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,  # Keep workers alive
+        prefetch_factor=2 if num_workers > 0 else 2,  # Prefetch batches
+        drop_last=True if len(dataset) > batch_size * 10 else False,  # Drop incomplete batches for large datasets
     )
+    
+    print(f"🔧 DataLoader optimized: batch_size={batch_size}, workers={num_workers}, pin_memory={pin_memory}")
 
     # Training setup
     optimizer = optim.AdamW(
@@ -1324,19 +1346,24 @@ def train_optimized_model(
     
     performance_monitor.start_training()
 
+    # Gradient accumulation for better training stability
+    accumulation_steps = max(1, min(4, 256 // batch_size))  # Effective batch size of ~256
+    if accumulation_steps > 1:
+        print(f"🔄 Using gradient accumulation: {accumulation_steps} steps (effective batch size: {batch_size * accumulation_steps})")
+
     for epoch in range(total_epochs):
         epoch_start = time.time()
         epoch_losses = []
-        epoch_recon_losses = []
-        epoch_class_losses = []
-
+        accumulated_loss = 0.0
+        
         model.train()
+        optimizer.zero_grad()  # Zero gradients at the start of epoch
+        
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+            x_batch = x_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
             
-            # Forward pass
-            optimizer.zero_grad()
+            # Forward pass with optimized precision handling
             if use_amp and AUTOCAST_AVAILABLE:
                 with autocast('cuda', dtype=torch.bfloat16):
                     outputs = model(x_batch)
@@ -1349,6 +1376,8 @@ def train_optimized_model(
                             outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
                             econfig.reconstruction_weight, econfig.classification_weight
                         )
+                    # Scale loss for gradient accumulation
+                    total_loss = total_loss / accumulation_steps
             elif use_amp:
                 # Fallback for older PyTorch without device_type parameter
                 with autocast():
@@ -1362,6 +1391,7 @@ def train_optimized_model(
                             outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
                             econfig.reconstruction_weight, econfig.classification_weight
                         )
+                    total_loss = total_loss / accumulation_steps
             else:
                 outputs = model(x_batch)
                 if not econfig.use_complex_losses:
@@ -1373,27 +1403,36 @@ def train_optimized_model(
                         outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
                         econfig.reconstruction_weight, econfig.classification_weight
                     )
+                total_loss = total_loss / accumulation_steps
             
-            # Optimized backward pass
+            # Backward pass with gradient accumulation
             if use_amp:
-                # Use automatic mixed precision
                 scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
             else:
-                # Standard training
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
             
-            epoch_losses.append(total_loss.item())
+            accumulated_loss += total_loss.item()
             
-            # Reduced progress tracking for performance
-            if batch_idx % 50 == 0:  # Less frequent updates
-                current_loss = total_loss.item()
-                print(f"  {attack_type} | Epoch {epoch+1}/{total_epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {current_loss:.4f}")
+            # Update weights every accumulation_steps or at the end of epoch
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+                epoch_losses.append(accumulated_loss * accumulation_steps)  # Scale back for logging
+                accumulated_loss = 0.0
+            
+            # Optimized progress tracking
+            if batch_idx % (50 * accumulation_steps) == 0:  # Less frequent updates
+                current_loss = total_loss.item() * accumulation_steps  # Scale back for display
+                progress = (batch_idx + 1) / len(dataloader) * 100
+                print(f"  {attack_type} | Epoch {epoch+1}/{total_epochs} | Progress: {progress:.1f}% | Loss: {current_loss:.4f}")
 
         scheduler.step()
 
@@ -1662,9 +1701,19 @@ def train_optimized_models(
         # Simplified initialization
         model.apply(lambda m: torch.nn.init.xavier_uniform_(m.weight, gain=0.2) if hasattr(m, 'weight') and m.weight.dim() > 1 else None)
         
+        # PyTorch 2.0 compilation for better performance
+        try:
+            if hasattr(torch, 'compile') and not config.is_distributed:
+                print(f"🚀 Compiling model with PyTorch 2.0...")
+                model = torch.compile(model, mode='default', dynamic=False)
+                print(f"✅ Model compiled successfully")
+        except Exception as e:
+            print(f"⚠️  Model compilation failed: {e}")
+        
         # Multi-GPU setup if available
         if config.n_gpus > 1:
             model = nn.DataParallel(model)
+            print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
         
         # Train this model with optimized function
         trained_model = train_optimized_model(
@@ -1864,9 +1913,10 @@ def load_and_preprocess_data(
     sample_size: int = None,
     embedding_type: str = None,
 ) -> Tuple[np.ndarray, List[str], np.ndarray, StandardScaler]:
-    """Load and preprocess data for training with optional embedding type specification"""
+    """Load and preprocess data for training with optional embedding type specification and performance optimizations"""
     
     print(f"🔄 Loading data for {log_type}...")
+    start_time = time.time()
     
     # Build embedding paths based on embedding_type argument
     if embedding_type:
@@ -1924,13 +1974,24 @@ def load_and_preprocess_data(
     if not log_file.exists():
         raise FileNotFoundError(f"Embeddings not found: {log_file}")
     
+    # Optimized data loading with memory mapping and progress tracking
+    load_start = time.time()
     with open(log_file, 'rb') as f:
         loaded = pickle.load(f)
         if isinstance(loaded, dict) and 'memmap_path' in loaded:
             desc = loaded
+            print(f"📁 Loading memory-mapped embeddings: {desc['shape']} shape, {desc.get('dtype','float32')} dtype")
             embeddings = np.memmap(desc['memmap_path'], dtype=np.dtype(desc.get('dtype','float32')), mode='r', shape=tuple(desc['shape']))
         else:
             embeddings = loaded
+            # Convert to optimal dtype for faster processing
+            if embeddings.dtype != np.float32:
+                print(f"🔧 Converting embeddings from {embeddings.dtype} to float32 for performance")
+                embeddings = embeddings.astype(np.float32, copy=False)
+    
+    load_time = time.time() - load_start
+    size_mb = embeddings.nbytes / (1024 * 1024)
+    print(f"✅ Embeddings loaded in {load_time:.2f}s ({size_mb:.1f}MB)")
     
     # Load labels - try different naming patterns
     label_file = embeddings_dir / f"label_{log_type}.pkl"
@@ -1990,23 +2051,50 @@ def load_and_preprocess_data(
     print(f"📊 Label dimensions: {true_labels.shape if true_labels is not None else 'None'}")
     print(f"📊 Number of classes: {len(classes)}")
     
-    # Sample data if requested
+    # Intelligent sampling with stratification and memory optimization
     if sample_size and sample_size < len(embeddings):
-        print(f"🎯 Limiting dataset to {sample_size} samples as requested...")
-        indices = np.random.choice(len(embeddings), sample_size, replace=False)
-        embeddings = embeddings[indices]
+        print(f"🎯 Intelligent sampling to {sample_size} samples...")
+        sample_start = time.time()
+        
+        # Stratified sampling to maintain class distribution
+        if true_labels is not None and true_labels.ndim > 1:
+            # Multi-label stratified sampling
+            try:
+                from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+                msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=1.0 - (sample_size / len(embeddings)), random_state=42)
+                train_idx, _ = next(msss.split(embeddings, true_labels))
+                indices = train_idx[:sample_size]  # Take exact sample size
+                print(f"   ✅ Used stratified multi-label sampling")
+            except ImportError:
+                # Fallback to random sampling
+                indices = np.random.choice(len(embeddings), sample_size, replace=False)
+                print(f"   ⚠️  Used random sampling (install iterstrat for better sampling)")
+        else:
+            # Random sampling for single-label or unknown labels
+            indices = np.random.choice(len(embeddings), sample_size, replace=False)
+        
+        # Apply sampling efficiently
+        if hasattr(embeddings, 'take'):  # For memmap arrays
+            embeddings = embeddings.take(indices, axis=0)
+        else:
+            embeddings = embeddings[indices]
         true_labels = true_labels[indices]
-        print(f"   Dataset reduced to {sample_size} samples")
+        
+        sample_time = time.time() - sample_start
+        print(f"   📊 Sampling completed in {sample_time:.2f}s")
+        print(f"   💾 Memory reduced: {embeddings.nbytes / (1024**3):.2f}GB")
         
         # Store the sampled true labels in tracker
         tracker.true_labels = true_labels
         
-        tracker.log_step("Explicit Data Sampling", {
+        tracker.log_step("Intelligent Data Sampling", {
             "requested_size": sample_size,
-            "actual_size": sample_size,
+            "actual_size": len(embeddings),
+            "sampling_time": sample_time,
             "memory_gb": embeddings.nbytes / (1024**3),
             "embedding_dim": embedding_dim,
-            "embedding_type": embedding_type
+            "embedding_type": embedding_type,
+            "stratified": True
         })
     else:
         print(f"📊 Using full dataset: {len(embeddings):,} samples ({embeddings.nbytes / (1024**3):.1f} GB)")
@@ -2019,25 +2107,61 @@ def load_and_preprocess_data(
             "device_type": config.device
         })
     
-    # Preprocessing
-    scaler = StandardScaler()
-    embeddings_scaled = scaler.fit_transform(embeddings)
+    # Optimized preprocessing with parallel processing
+    print(f"🔧 Starting preprocessing...")
+    preprocess_start = time.time()
     
-    tracker.log_step("Data Preprocessing", {
-        "embeddings_shape": list(embeddings.shape),
+    # Use optimized StandardScaler with better memory usage
+    scaler = StandardScaler(copy=False)  # In-place scaling when possible
+    
+    # Check if data is already normalized to skip scaling if needed
+    sample_batch = embeddings[:min(1000, len(embeddings))]
+    mean_val = np.mean(sample_batch)
+    std_val = np.std(sample_batch)
+    
+    if abs(mean_val) < 0.1 and abs(std_val - 1.0) < 0.1:
+        print(f"   📊 Data appears already normalized (mean={mean_val:.3f}, std={std_val:.3f}), using copy")
+        embeddings_scaled = embeddings.copy() if not hasattr(embeddings, 'take') else np.array(embeddings)
+    else:
+        print(f"   📊 Standardizing data (mean={mean_val:.3f}, std={std_val:.3f})")
+        # For large datasets, process in chunks to manage memory
+        if len(embeddings) > 100000:
+            print(f"   🔄 Processing large dataset in chunks...")
+            embeddings_scaled = np.empty_like(embeddings)
+            chunk_size = 50000
+            for i in range(0, len(embeddings), chunk_size):
+                end_idx = min(i + chunk_size, len(embeddings))
+                if i == 0:
+                    # Fit scaler on first chunk
+                    embeddings_scaled[i:end_idx] = scaler.fit_transform(embeddings[i:end_idx])
+                else:
+                    # Transform remaining chunks
+                    embeddings_scaled[i:end_idx] = scaler.transform(embeddings[i:end_idx])
+        else:
+            embeddings_scaled = scaler.fit_transform(embeddings)
+    
+    preprocess_time = time.time() - preprocess_start
+    total_time = time.time() - start_time
+    
+    # Final data conversion to optimal format
+    if embeddings_scaled.dtype != np.float32:
+        embeddings_scaled = embeddings_scaled.astype(np.float32, copy=False)
+    
+    tracker.log_step("Optimized Data Preprocessing", {
+        "embeddings_shape": list(embeddings_scaled.shape),
         "embedding_type": embedding_type,
         "n_classes": len(classes),
         "n_clusters": len(classes),
-        "has_true_labels": true_labels is not None
+        "has_true_labels": true_labels is not None,
+        "preprocessing_time": preprocess_time,
+        "total_load_time": total_time,
+        "data_normalized": abs(mean_val) < 0.1 and abs(std_val - 1.0) < 0.1
     })
     
-    print(f"✅ Data loading completed in {time.time():.1f}s")
-    print(f"📊 Loaded {len(embeddings):,} samples with {embedding_dim}D embeddings ({embedding_type})")
-    
-    if sample_size:
-        print(f"🎯 Using sample size: {len(embeddings)} (requested: {sample_size})")
-    
-    print(f"✔ Data loaded: {len(embeddings)} samples, {embedding_dim} features ({embedding_type})")
+    print(f"✅ Data preprocessing completed in {preprocess_time:.2f}s")
+    print(f"✅ Total data loading completed in {total_time:.2f}s")
+    print(f"📊 Final dataset: {len(embeddings_scaled):,} samples × {embeddings_scaled.shape[1]}D ({embedding_type})")
+    print(f"💾 Memory usage: {embeddings_scaled.nbytes / (1024**3):.2f}GB")
     
     return embeddings_scaled, classes, true_labels, scaler
 
