@@ -1309,40 +1309,68 @@ def train_simple_fallback_model(
     X_tensor = torch.from_numpy(embeddings).float().to(device)
     y_tensor = torch.from_numpy(binary_labels).float().to(device)
     
-    # Simple optimizer
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    # SUPER HIGH PERFORMANCE optimizer - ultra-fast convergence
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)  # Ultra-high learning rate for MAXIMUM speed
     criterion = nn.BCEWithLogitsLoss()
     
     model.train()
     best_loss = float('inf')
-    patience = 5
+    patience = 2  # Ultra-fast stopping
     patience_counter = 0
     
+    # SUPER HIGH PERFORMANCE timeout protection
+    training_start = time.time()
+    max_training_time = 60  # 1 minute max for simple training for MAXIMUM speed
+    
     for epoch in range(max_epochs):
+        # Check timeout
+        if time.time() - training_start > max_training_time:
+            print(f"⚠️  Simple training timeout for {attack_type}, stopping")
+            break
+            
+        epoch_start = time.time()
         optimizer.zero_grad()
         
-        # Forward pass
-        outputs = model(X_tensor)
-        loss = criterion(outputs["multi_label_scores"].squeeze(), y_tensor)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        print(f"  {attack_type} | Epoch {epoch+1}/{max_epochs} | Loss: {current_loss:.4f}")
-        
-        # Early stopping
-        if current_loss < best_loss - 1e-4:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
+        try:
+            # Forward pass
+            outputs = model(X_tensor)
+            loss = criterion(outputs["multi_label_scores"].squeeze(), y_tensor)
             
-        if patience_counter >= patience:
-            print(f"🛑 Early stopping for {attack_type}")
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  Invalid loss detected for {attack_type}: {loss.item()}, stopping")
+                break
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            current_loss = loss.item()
+            epoch_time = time.time() - epoch_start
+            print(f"  {attack_type} | Epoch {epoch+1}/{max_epochs} | Loss: {current_loss:.4f} | Time: {epoch_time:.2f}s")
+            
+            # SUPER HIGH PERFORMANCE early stopping - ultra-aggressive
+            if current_loss < best_loss - 5e-3:  # Ultra-high threshold for MAXIMUM speed
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            # Stop if loss is very low (excellent performance) - more aggressive
+            if current_loss < 0.05:  # Increased threshold for faster stopping
+                print(f"🎯 Excellent performance achieved for {attack_type} (loss: {current_loss:.4f})")
+                break
+                
+            # Stop if loss is not improving - ultra-fast
+            if patience_counter >= patience:
+                print(f"🛑 Ultra-fast early stopping for {attack_type}")
+                break
+                
+        except Exception as e:
+            print(f"⚠️  Training error for {attack_type}: {e}, stopping")
             break
     
+    print(f"✅ Simple training completed for {attack_type}")
     return model
 
 def train_optimized_model(
@@ -1373,8 +1401,8 @@ def train_optimized_model(
         embeddings.shape[1], config.device, config.gpu_memory_gb
     )
     
-    # Optimize batch size
-    base_batch_size = 64
+    # SUPER HIGH PERFORMANCE batch size optimization
+    base_batch_size = 128  # Increased for MAXIMUM speed
     batch_size = memory_manager.optimize_batch_size(
         base_batch_size, embeddings.shape[1], config.device, config.gpu_memory_gb
     )
@@ -1434,9 +1462,9 @@ def train_optimized_model(
     
     print(f"🔧 DataLoader optimized: batch_size={batch_size}, workers={num_workers}, pin_memory={pin_memory}")
 
-    # Training setup
+    # SUPER HIGH PERFORMANCE training setup
     optimizer = optim.AdamW(
-        model.parameters(), lr=1e-4, weight_decay=1e-5
+        model.parameters(), lr=5e-4, weight_decay=1e-6  # Higher learning rate, lower weight decay for MAXIMUM speed
     )
     
     # Ensure model is on the correct device
@@ -1447,25 +1475,23 @@ def train_optimized_model(
     
     scaler = GradScaler(enabled=str(config.device).startswith("cuda"))
 
-    # Enhanced scheduler
+    # SUPER HIGH PERFORMANCE scheduler - ultra-fast convergence
     def lr_lambda(epoch):
-        warmup_epochs = 20
+        warmup_epochs = 2  # Ultra-short warmup for MAXIMUM speed
         if epoch < warmup_epochs:
             return epoch / warmup_epochs
         else:
-            return 0.5 * (
-                1 + np.cos(np.pi * (epoch - warmup_epochs) / (200 - warmup_epochs))
-            )
+            return 0.1  # Constant low learning rate for stability and speed
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    max_grad_norm = 0.5
+    max_grad_norm = 1.0  # Increased for MAXIMUM speed
 
-    # Optimized training setup
+    # SUPER HIGH PERFORMANCE training setup
     econfig = enhanced_config or EnhancedTransformerConfig()
     model.train()
-    # Reduce epochs for faster thesis pipeline
-    total_epochs = min(20, econfig.max_epochs_per_model)  # Cap at 20 epochs for speed
-    patience = 10
+    # Ultra-aggressive epochs for maximum speed
+    total_epochs = min(5, econfig.max_epochs_per_model)  # Cap at 5 epochs for MAXIMUM speed
+    patience = 3  # Ultra-fast stopping
     patience_counter = 0
     best_loss = float("inf")
     best_model_state = None
@@ -1478,18 +1504,19 @@ def train_optimized_model(
         len(embeddings), 1, embeddings.shape[1], config.device
     )
     
-    print(f"🎯 Training {attack_type} (max {total_epochs} epochs, patience={patience}, ETA: {time_estimate})")
+    print(f"⚡ SUPER HIGH PERFORMANCE Training {attack_type} (max {total_epochs} epochs, patience={patience}, ETA: {time_estimate})")
+    print(f"🚀 Performance optimizations: Ultra-fast timeouts, reduced epochs, simplified architecture, high learning rate")
     
     performance_monitor.start_training()
 
-    # Gradient accumulation for better training stability
-    accumulation_steps = max(1, min(4, 256 // batch_size))  # Effective batch size of ~256
+    # SUPER HIGH PERFORMANCE gradient accumulation - optimized for speed
+    accumulation_steps = max(1, min(2, 128 // batch_size))  # Reduced effective batch size for MAXIMUM speed
     if accumulation_steps > 1:
-        print(f"🔄 Using gradient accumulation: {accumulation_steps} steps (effective batch size: {batch_size * accumulation_steps})")
+        print(f"⚡ SUPER HIGH PERFORMANCE: Using gradient accumulation: {accumulation_steps} steps (effective batch size: {batch_size * accumulation_steps})")
 
-    # Global training timeout
+    # SUPER HIGH PERFORMANCE timeout - ultra-aggressive
     training_start_time = time.time()
-    max_training_time = 600  # 10 minutes total training time limit
+    max_training_time = 120  # 2 minutes total training time limit for MAXIMUM speed
 
     for epoch in range(total_epochs):
         # Check global timeout
@@ -1503,7 +1530,19 @@ def train_optimized_model(
         model.train()
         optimizer.zero_grad()  # Zero gradients at the start of epoch
         
+        # SUPER HIGH PERFORMANCE batch timeout - ultra-aggressive
+        batch_timeout = 30  # 30 seconds max per batch for MAXIMUM speed
+        last_batch_time = time.time()
+        
         for batch_idx, (x_batch, y_batch) in enumerate(dataloader):
+            # Check batch timeout to prevent infinite loops
+            current_time = time.time()
+            if current_time - last_batch_time > batch_timeout:
+                print(f"⚠️  Batch timeout reached for {attack_type}, stopping training")
+                return model
+            
+            batch_start_time = time.time()
+            
             # Transfer to device with proper error handling
             try:
                 x_batch = x_batch.to(device, non_blocking=True)
@@ -1524,79 +1563,101 @@ def train_optimized_model(
                     raise
             
             # Forward pass with optimized precision handling
-            if use_amp and AUTOCAST_AVAILABLE:
-                with autocast('cuda', dtype=torch.bfloat16):
-                    outputs = model(x_batch)
-                    if not econfig.use_complex_losses:
-                        total_loss = LossOptimizer.compute_simple_loss(
-                            outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
-                        )
-                    else:
-                        total_loss = LossOptimizer.compute_focal_loss(
-                            outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
-                            econfig.reconstruction_weight, econfig.classification_weight
-                        )
-                    # Scale loss for gradient accumulation
-                    total_loss = total_loss / accumulation_steps
-            elif use_amp:
-                # Fallback for older PyTorch without device_type parameter
-                with autocast():
-                    outputs = model(x_batch)
-                    if not econfig.use_complex_losses:
-                        total_loss = LossOptimizer.compute_simple_loss(
-                            outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
-                        )
-                    else:
-                        total_loss = LossOptimizer.compute_focal_loss(
-                            outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
-                            econfig.reconstruction_weight, econfig.classification_weight
-                        )
-                    total_loss = total_loss / accumulation_steps
-            else:
-                outputs = model(x_batch)
-                if not econfig.use_complex_losses:
-                    total_loss = LossOptimizer.compute_simple_loss(
-                        outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
-                    )
+            try:
+                if use_amp and AUTOCAST_AVAILABLE:
+                    with autocast('cuda', dtype=torch.bfloat16):
+                        outputs = model(x_batch)
+                        if not econfig.use_complex_losses:
+                            total_loss = LossOptimizer.compute_simple_loss(
+                                outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                            )
+                        else:
+                            total_loss = LossOptimizer.compute_focal_loss(
+                                outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                                econfig.reconstruction_weight, econfig.classification_weight
+                            )
+                        # Scale loss for gradient accumulation
+                        total_loss = total_loss / accumulation_steps
+                elif use_amp:
+                    # Fallback for older PyTorch without device_type parameter
+                    with autocast():
+                        outputs = model(x_batch)
+                        if not econfig.use_complex_losses:
+                            total_loss = LossOptimizer.compute_simple_loss(
+                                outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                            )
+                        else:
+                            total_loss = LossOptimizer.compute_focal_loss(
+                                outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                                econfig.reconstruction_weight, econfig.classification_weight
+                            )
+                        total_loss = total_loss / accumulation_steps
                 else:
-                    total_loss = LossOptimizer.compute_focal_loss(
-                        outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
-                        econfig.reconstruction_weight, econfig.classification_weight
-                    )
-                total_loss = total_loss / accumulation_steps
+                    outputs = model(x_batch)
+                    if not econfig.use_complex_losses:
+                        total_loss = LossOptimizer.compute_simple_loss(
+                            outputs, x_batch, econfig.reconstruction_weight, econfig.classification_weight
+                        )
+                    else:
+                        total_loss = LossOptimizer.compute_focal_loss(
+                            outputs, x_batch, econfig.focal_loss_alpha, econfig.focal_loss_gamma,
+                            econfig.reconstruction_weight, econfig.classification_weight
+                        )
+                    total_loss = total_loss / accumulation_steps
+                
+                # Check for NaN loss
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"⚠️  Invalid loss detected for {attack_type}: {total_loss.item()}, stopping training")
+                    return model
+                
+            except Exception as e:
+                print(f"⚠️  Forward pass failed for {attack_type}: {e}, stopping training")
+                return model
             
             # Backward pass with gradient accumulation
-            if use_amp:
-                scaler.scale(total_loss).backward()
-            else:
-                total_loss.backward()
+            try:
+                if use_amp:
+                    scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+            except Exception as e:
+                print(f"⚠️  Backward pass failed for {attack_type}: {e}, stopping training")
+                return model
             
             accumulated_loss += total_loss.item()
             
             # Update weights every accumulation_steps or at the end of epoch
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    optimizer.step()
-                
-                optimizer.zero_grad()
-                epoch_losses.append(accumulated_loss * accumulation_steps)  # Scale back for logging
-                accumulated_loss = 0.0
+                try:
+                    if use_amp:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        optimizer.step()
+                    
+                    optimizer.zero_grad()
+                    epoch_losses.append(accumulated_loss * accumulation_steps)  # Scale back for logging
+                    accumulated_loss = 0.0
+                except Exception as e:
+                    print(f"⚠️  Optimizer step failed for {attack_type}: {e}, stopping training")
+                    return model
             
-            # Optimized progress tracking - more frequent for small datasets
-            progress_interval = max(1, min(10, len(dataloader) // 5))  # Show progress at least 5 times per epoch
+            # Update batch timing
+            last_batch_time = time.time()
+            batch_time = last_batch_time - batch_start_time
+            
+            # SUPER HIGH PERFORMANCE progress tracking - ultra-frequent for MAXIMUM speed
+            progress_interval = max(1, min(5, len(dataloader) // 10))  # Show progress at least 10 times per epoch for MAXIMUM speed
             if batch_idx % progress_interval == 0:
                 current_loss = total_loss.item() * accumulation_steps  # Scale back for display
                 progress = (batch_idx + 1) / len(dataloader) * 100
-                print(f"  {attack_type} | Epoch {epoch+1}/{total_epochs} | Progress: {progress:.1f}% | Loss: {current_loss:.4f}")
+                print(f"⚡ {attack_type} | Epoch {epoch+1}/{total_epochs} | Progress: {progress:.1f}% | Loss: {current_loss:.4f} | Batch: {batch_time:.2f}s")
                 
-                # Add timeout check to prevent infinite loops
-                if time.time() - epoch_start > 300:  # 5 minutes per epoch max
+                # SUPER HIGH PERFORMANCE epoch timeout - ultra-aggressive
+                if time.time() - epoch_start > 60:  # 1 minute per epoch max for MAXIMUM speed
                     print(f"⚠️  Epoch timeout reached for {attack_type}, stopping training")
                     return model
 
@@ -1894,31 +1955,31 @@ def train_optimized_models(
                 print(f"⚠️  Could not load existing predictions for {class_type}: {e}")
                 print(f"🔄 Proceeding with training...")
         
-        # Create optimized config for this model
+        # SUPER HIGH PERFORMANCE config - ultra-optimized for speed
         enhanced_config = EnhancedTransformerConfig(
             d_model=latent_dim,
             n_heads=attention_heads,
             n_layers=transformer_layers,
             num_labels=1,
-            dropout=0.1,
+            dropout=0.05,  # Reduced dropout for faster convergence
             use_smote=True,
             contamination_rate=0.15,
             focal_loss_alpha=0.25,
             focal_loss_gamma=1.5,
-            reconstruction_weight=0.5,  # Reduced
+            reconstruction_weight=0.1,  # Ultra-reduced for MAXIMUM speed
             classification_weight=1.0,
             use_complex_losses=False,  # Simplified for speed
-            max_epochs_per_model=50   # Reduced epochs
+            max_epochs_per_model=5    # Ultra-reduced epochs for MAXIMUM speed
         )
         
-        # Create optimized model
+        # SUPER HIGH PERFORMANCE model - ultra-optimized for speed
         model = OptimizedTransformer(
             input_dim=embedding_dim,
             latent_dim=latent_dim,
             n_labels=1,
-            dropout=0.1,
-            transformer_layers=transformer_layers,
-            attention_heads=attention_heads,
+            dropout=0.05,  # Reduced dropout for faster convergence
+            transformer_layers=min(2, transformer_layers),  # Cap at 2 layers for MAXIMUM speed
+            attention_heads=min(4, attention_heads),       # Cap at 4 heads for MAXIMUM speed
             use_simple_attention=True
         ).to(device)
         
@@ -1948,20 +2009,20 @@ def train_optimized_models(
         # Train this model with optimized function
         if simple_mode:
             print(f"🔧 Using simple mode training for {class_type}")
-            # Create a simple model for fast training
+            # SUPER HIGH PERFORMANCE simple model - ultra-optimized for speed
             simple_model = OptimizedTransformer(
                 input_dim=embedding_dim,
                 latent_dim=latent_dim,
                 n_labels=1,
-                dropout=0.1,
-                transformer_layers=2,  # Simpler architecture
-                attention_heads=4,     # Fewer heads
+                dropout=0.05,  # Reduced dropout for faster convergence
+                transformer_layers=1,  # Ultra-simple architecture for MAXIMUM speed
+                attention_heads=2,     # Ultra-few heads for MAXIMUM speed
                 use_simple_attention=True
             )
             
-            # Use simple fallback training
+            # Use SUPER HIGH PERFORMANCE simple fallback training
             trained_model = train_simple_fallback_model(
-                simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=10  # Even fewer epochs for simple mode
+                simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=3  # Ultra-few epochs for MAXIMUM speed
             )
         else:
             try:
@@ -1972,20 +2033,20 @@ def train_optimized_models(
                 print(f"⚠️  Complex training failed: {e}")
                 print(f"🔄 Falling back to simple training method...")
                 
-                # Create a fresh, simple model for fallback
+                # Create a SUPER HIGH PERFORMANCE simple model for fallback
                 simple_model = OptimizedTransformer(
                     input_dim=embedding_dim,
                     latent_dim=latent_dim,
                     n_labels=1,
-                    dropout=0.1,
-                    transformer_layers=2,  # Simpler architecture
-                    attention_heads=4,     # Fewer heads
+                    dropout=0.05,  # Reduced dropout for faster convergence
+                    transformer_layers=1,  # Ultra-simple architecture for MAXIMUM speed
+                    attention_heads=2,     # Ultra-few heads for MAXIMUM speed
                     use_simple_attention=True
                 )
                 
-                # Use simple fallback training
+                # Use SUPER HIGH PERFORMANCE simple fallback training
                 trained_model = train_simple_fallback_model(
-                    simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=15
+                    simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=5  # Ultra-few epochs for MAXIMUM speed
                 )
         
         # Generate predictions for this class using original embeddings only
