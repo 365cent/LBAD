@@ -128,16 +128,19 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
             )
         )
     
-    # XGBoost if available
+    # XGBoost if available - optimized for imbalanced multi-label data
     if has_xgb and HAS_XGBOOST:
         models['xgb'] = MultiOutputClassifier(
             XGBClassifier(
                 n_estimators=100,
                 max_depth=6,
                 learning_rate=0.1,
+                subsample=0.8,              # Helps with overfitting
+                colsample_bytree=0.8,       # Feature sampling 
+                min_child_weight=3,         # Conservative to avoid overfitting on rare classes
                 random_state=random_state,
                 n_jobs=N_JOBS,
-                tree_method='hist',
+                tree_method='hist',         # Efficient for large datasets
                 verbosity=0,
                 use_label_encoder=False,
                 eval_metric='logloss'
@@ -478,59 +481,84 @@ def create_multilabel_visualization(y_true, y_pred, class_names, model_name, res
     plt.savefig(results_dir / f'{model_name}_labels_per_sample.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-def train_single_xgb_model(params):
-    """Train a single XGBoost model for OvR - for parallel processing"""
-    idx, attack_type, X_train, y_label, n_jobs, class_weight = params
+def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, results_dir):
+    """Train XGBoost using traditional MultiOutputClassifier approach."""
+    print(f"\nTraining traditional XGBoost with MultiOutputClassifier...")
     
-    # Check for sufficient samples of both classes
-    unique_classes, class_counts = np.unique(y_label, return_counts=True)
-    if len(unique_classes) < 2 or np.min(class_counts) < 10:
-        print(f"    Skipping training for '{attack_type}' - insufficient samples (class counts: {class_counts})")
-        return idx, None, 0
+    start_time = time.time()
     
-    # Calculate class weights if needed
-    scale_pos_weight = 1.0
-    if class_weight:
-        pos_count = np.sum(y_label == 1)
-        neg_count = np.sum(y_label == 0)
-        if pos_count > 0 and neg_count > 0:
-            scale_pos_weight = neg_count / pos_count
-    
-    model_start_time = time.time()
-    
-    try:
-        model = XGBClassifier(
-            n_estimators=100, 
-            max_depth=6,         
+    # Use standard MultiOutputClassifier with XGBoost
+    # This approach handles imbalanced data better than One-vs-Rest
+    model = MultiOutputClassifier(
+        XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
             learning_rate=0.1,
-            gamma=0.1,
-            subsample=0.8,       
-            colsample_bytree=0.8, 
-            min_child_weight=3,
-            scale_pos_weight=scale_pos_weight,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=42,
-            n_jobs=n_jobs,
-            tree_method='hist',  
+            n_jobs=N_JOBS,
+            tree_method='hist',
             use_label_encoder=False,
             verbosity=0,
-            importance_type='gain'
+            eval_metric='logloss'
         )
-        model.fit(X_train, y_label)
-    except Exception as e:
-        print(f"    Error training model: {e}. Trying with simpler parameters.")
-        model = XGBClassifier(
-            n_estimators=50,
-            max_depth=4,
-            learning_rate=0.1,
-            random_state=42,
-            n_jobs=n_jobs,
-            use_label_encoder=False,
-            verbosity=0
-        )
-        model.fit(X_train, y_label)
+    )
     
-    training_time = time.time() - model_start_time
-    return idx, model, training_time
+    # Train the model
+    model.fit(X_train, y_train)
+    training_time = time.time() - start_time
+    
+    # Generate predictions
+    print("Generating XGBoost predictions...")
+    y_pred = model.predict(X_test)
+    
+    # Calculate metrics
+    metrics = calculate_multilabel_metrics(y_test, y_pred)
+    
+    # Save detailed results
+    report_path = results_dir / 'xgboost_traditional_report.txt'
+    with open(report_path, 'w') as f:
+        f.write("XGBoost Traditional Multi-Label Classification Report\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Total training time: {training_time:.2f} seconds\n")
+        f.write(f"Approach: MultiOutputClassifier with XGBoost\n\n")
+        
+        f.write("OVERALL METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
+        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
+        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
+        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
+        f.write(f"Micro Precision: {metrics['micro_precision']:.4f}\n")
+        f.write(f"Micro Recall: {metrics['micro_recall']:.4f}\n\n")
+        
+        f.write("PER-CLASS METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}\n")
+        f.write("-" * 60 + "\n")
+        
+        # Calculate support for each class
+        support = y_test.sum(axis=0)
+        
+        for i, cls_name in enumerate(class_names):
+            f1 = metrics['per_class']['f1'][i]
+            precision = metrics['per_class']['precision'][i]
+            recall = metrics['per_class']['recall'][i]
+            sup = int(support[i])
+            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}\n")
+    
+    print(f"XGBoost traditional report saved to: {report_path}")
+    
+    # Save the trained model
+    model_path = MODELS_DIR / f'xgboost_traditional.joblib'
+    joblib.dump(model, model_path)
+    
+    return {
+        'model_name': 'xgboost_traditional',
+        'training_time': training_time,
+        'metrics': metrics
+    }
 
 def train_evaluate_xgboost_ovr(X_train, y_train, X_test, y_test, class_names, results_dir, 
                                use_parallel=True, feature_fraction=0.8):
@@ -696,8 +724,8 @@ def main():
     parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
     parser.add_argument('--knn-train-cap', type=int, default=80000, help='Max samples for KNN training')
     parser.add_argument('--knn-test-cap', type=int, default=30000, help='Max samples for KNN prediction')
-    parser.add_argument('--feature-fraction', type=float, default=0.8, help='Fraction of features to use for XGBoost OvR (0.0-1.0). Default: 0.8')
-    parser.add_argument('--xgb-ovr', action='store_true', help='Run XGBoost with One-vs-Rest strategy (better for multi-label)')
+    parser.add_argument('--feature-fraction', type=float, default=0.8, help='Fraction of features to use for XGBoost (0.0-1.0). Default: 0.8')
+    parser.add_argument('--xgb-ovr', action='store_true', help='Run XGBoost with traditional MultiOutputClassifier (handles imbalanced data better)')
     args = parser.parse_args()
     
     # Find available log types
@@ -836,22 +864,20 @@ def main():
                     print(f"Error training {model_name}: {e}")
                     continue
             
-            # Run XGBoost One-vs-Rest if requested
-            if args.xgb_ovr and HAS_XGBOOST:
+            # Run XGBoost traditional approach if requested
+            if (args.xgb_ovr or args.with_xgb) and HAS_XGBOOST:
                 print(f"\n{'-'*40}")
-                print(f"Training XGBoost One-vs-Rest for {log_type}")
+                print(f"Training XGBoost Traditional for {log_type}")
                 print(f"{'-'*40}")
                 try:
-                    result = train_evaluate_xgboost_ovr(
+                    result = train_traditional_xgboost(
                         X_train_scaled, y_train,
                         X_test_scaled, y_test,
-                        class_names, results_dir,
-                        use_parallel=True,
-                        feature_fraction=args.feature_fraction
+                        class_names, results_dir
                     )
                     results.append(result)
                 except Exception as e:
-                    print(f"Error training XGBoost OvR: {e}")
+                    print(f"Error training XGBoost Traditional: {e}")
                     import traceback
                     traceback.print_exc()
             
