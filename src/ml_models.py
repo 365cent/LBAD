@@ -149,49 +149,83 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
 def find_available_log_types(embedding_type: str = None):
     """Find available log types from embeddings directory."""
     log_types = set()
-    base = EMBEDDINGS_DIR / embedding_type if embedding_type else EMBEDDINGS_DIR
-    if not base.exists():
-        return []
-    for log_dir in base.iterdir():
-        if log_dir.is_dir():
-            name = log_dir.name
-            if (log_dir / f"log_{name}.pkl").exists() and (log_dir / f"label_{name}.pkl").exists():
-                log_types.add(name)
+    
+    # For backward compatibility, check both old and new formats
+    if embedding_type:
+        # New format: embeddings/<embedding_type>/<log_type>/
+        base = EMBEDDINGS_DIR / embedding_type
+        if base.exists():
+            for log_dir in base.iterdir():
+                if log_dir.is_dir():
+                    name = log_dir.name
+                    # Check for both old and new naming conventions
+                    if ((log_dir / f"log_{name}.pkl").exists() and (log_dir / f"label_{name}.pkl").exists()) or \
+                       ((log_dir / "embeddings.pkl").exists() and (log_dir / "labels.pkl").exists()):
+                        log_types.add(name)
+    else:
+        # Legacy format: embeddings/<log_type>/
+        if EMBEDDINGS_DIR.exists():
+            for path in EMBEDDINGS_DIR.iterdir():
+                if path.is_dir():
+                    # Check for embeddings.pkl and labels.pkl in direct subdirs
+                    if (path / "embeddings.pkl").exists() and (path / "labels.pkl").exists():
+                        log_types.add(path.name)
+                    # Also check for log_<type>.pkl format
+                    elif (path / f"log_{path.name}.pkl").exists() and (path / f"label_{path.name}.pkl").exists():
+                        log_types.add(path.name)
+    
     return sorted(list(log_types))
 
 def load_multilabel_data(log_type, embedding_type: str = None):
     """Load embeddings and multi-label data."""
     print(f"Loading {log_type} data...")
     
-    # Candidate search order
+    # Candidate search order - check both old and new formats
     candidates = []
     if embedding_type:
         base = EMBEDDINGS_DIR / embedding_type / log_type
+        # New format
+        candidates.append((base / 'embeddings.pkl', base / 'labels.pkl'))
+        # Old format
         candidates.append((base / f'log_{log_type}.pkl', base / f'label_{log_type}.pkl'))
+    
+    # Legacy format (direct under embeddings/)
     legacy = EMBEDDINGS_DIR / log_type
+    candidates.append((legacy / 'embeddings.pkl', legacy / 'labels.pkl'))
     candidates.append((legacy / f'log_{log_type}.pkl', legacy / f'label_{log_type}.pkl'))
     
     embeddings = label_data = None
+    used_path = None
     for x_path, y_path in candidates:
         if x_path.exists() and y_path.exists():
             with open(x_path, 'rb') as f:
                 embeddings = pickle.load(f)
             with open(y_path, 'rb') as f:
                 label_data = pickle.load(f)
+            used_path = x_path.parent
+            print(f"✅ Loaded data from: {used_path}")
             break
-    if embeddings is None:
-        raise FileNotFoundError(f"Embeddings for {log_type} not found in: " + ", ".join([str(p[0].parent) for p in candidates]))
     
-    # Try to load attack types description file
-    attack_types_file = EMBEDDINGS_DIR / log_type / f'attack_types_{log_type}.txt'
+    if embeddings is None:
+        raise FileNotFoundError(f"Embeddings for {log_type} not found. Searched in: " + ", ".join([str(p[0].parent) for p in candidates]))
+    
+    # Try to load attack types description file - check multiple locations
+    attack_types_files = []
+    if used_path:
+        attack_types_files.append(used_path / f'attack_types_{log_type}.txt')
+        attack_types_files.append(used_path / 'key.txt')
+    attack_types_files.append(EMBEDDINGS_DIR / log_type / f'attack_types_{log_type}.txt')
+    
     description_from_file = None
-    if attack_types_file.exists():
-        try:
-            with open(attack_types_file, 'r') as f:
-                description_from_file = f.read()
-                print(f"✅ Found attack types description file")
-        except Exception as e:
-            print(f"⚠️  Could not read attack types file: {e}")
+    for attack_types_file in attack_types_files:
+        if attack_types_file.exists():
+            try:
+                with open(attack_types_file, 'r') as f:
+                    description_from_file = f.read()
+                    print(f"✅ Found attack types description file: {attack_types_file}")
+                    break
+            except Exception as e:
+                print(f"⚠️  Could not read attack types file {attack_types_file}: {e}")
     
     # Extract binary vectors and class names
     if isinstance(label_data, dict) and 'vectors' in label_data:
@@ -444,6 +478,207 @@ def create_multilabel_visualization(y_true, y_pred, class_names, model_name, res
     plt.savefig(results_dir / f'{model_name}_labels_per_sample.png', dpi=300, bbox_inches='tight')
     plt.close()
 
+def train_single_xgb_model(params):
+    """Train a single XGBoost model for OvR - for parallel processing"""
+    idx, attack_type, X_train, y_label, n_jobs, class_weight = params
+    
+    # Check for sufficient samples of both classes
+    unique_classes, class_counts = np.unique(y_label, return_counts=True)
+    if len(unique_classes) < 2 or np.min(class_counts) < 10:
+        print(f"    Skipping training for '{attack_type}' - insufficient samples (class counts: {class_counts})")
+        return idx, None, 0
+    
+    # Calculate class weights if needed
+    scale_pos_weight = 1.0
+    if class_weight:
+        pos_count = np.sum(y_label == 1)
+        neg_count = np.sum(y_label == 0)
+        if pos_count > 0 and neg_count > 0:
+            scale_pos_weight = neg_count / pos_count
+    
+    model_start_time = time.time()
+    
+    try:
+        model = XGBClassifier(
+            n_estimators=100, 
+            max_depth=6,         
+            learning_rate=0.1,
+            gamma=0.1,
+            subsample=0.8,       
+            colsample_bytree=0.8, 
+            min_child_weight=3,
+            scale_pos_weight=scale_pos_weight,
+            random_state=42,
+            n_jobs=n_jobs,
+            tree_method='hist',  
+            use_label_encoder=False,
+            verbosity=0,
+            importance_type='gain'
+        )
+        model.fit(X_train, y_label)
+    except Exception as e:
+        print(f"    Error training model: {e}. Trying with simpler parameters.")
+        model = XGBClassifier(
+            n_estimators=50,
+            max_depth=4,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=n_jobs,
+            use_label_encoder=False,
+            verbosity=0
+        )
+        model.fit(X_train, y_label)
+    
+    training_time = time.time() - model_start_time
+    return idx, model, training_time
+
+def train_evaluate_xgboost_ovr(X_train, y_train, X_test, y_test, class_names, results_dir, 
+                               use_parallel=True, feature_fraction=0.8):
+    """Train XGBoost using One-vs-Rest strategy for better multi-label performance."""
+    num_labels = len(class_names)
+    print(f"\nStarting One-vs-Rest XGBoost training for {num_labels} attack types...")
+    
+    # Feature selection if requested
+    if feature_fraction < 1.0 and feature_fraction > 0:
+        num_features = X_train.shape[1]
+        num_features_to_keep = max(1, int(num_features * feature_fraction))
+        print(f"Performing feature selection: keeping {num_features_to_keep} of {num_features} features")
+        
+        # Train a quick XGBoost model to get feature importances
+        feature_selector = XGBClassifier(
+            n_estimators=50, 
+            max_depth=5,
+            learning_rate=0.1,
+            n_jobs=N_JOBS,
+            tree_method='hist',
+            random_state=42
+        )
+        
+        # Use sum of labels as target for feature selection
+        any_attack = np.any(y_train == 1, axis=1).astype(np.int8)
+        feature_selector.fit(X_train, any_attack)
+        
+        # Get feature importances and select top features
+        importances = feature_selector.feature_importances_
+        top_indices = np.argsort(importances)[-num_features_to_keep:]
+        
+        # Select only these features
+        X_train = X_train[:, top_indices]
+        X_test = X_test[:, top_indices]
+        print(f"Feature selection complete: X_train shape now {X_train.shape}")
+    
+    trained_models = []
+    training_times = []
+    start_time = time.time()
+    
+    if use_parallel and num_labels > 1 and HAS_XGBOOST:
+        # Parallel training
+        jobs_per_model = max(1, N_JOBS // min(num_labels, multiprocessing.cpu_count()))
+        params_list = [
+            (i, class_names[i], X_train, y_train[:, i], jobs_per_model, True) 
+            for i in range(num_labels)
+        ]
+        
+        with multiprocessing.Pool(min(num_labels, multiprocessing.cpu_count())) as pool:
+            results = list(tqdm(pool.imap(train_single_xgb_model, params_list), 
+                               total=len(params_list), 
+                               desc="Training XGB models", 
+                               ascii=True))
+            
+            # Collect results
+            trained_models = [None] * num_labels
+            for idx, model, training_time in results:
+                trained_models[idx] = model
+                training_times.append(training_time)
+    else:
+        # Sequential training
+        for i in range(num_labels):
+            print(f"  Training model {i+1}/{num_labels} for: '{class_names[i]}'...")
+            y_train_single = y_train[:, i]
+            
+            # Check for sufficient samples
+            unique_classes, class_counts = np.unique(y_train_single, return_counts=True)
+            if len(unique_classes) < 2 or np.min(class_counts) < 10:
+                print(f"    Skipping - insufficient samples")
+                trained_models.append(None)
+                training_times.append(0)
+                continue
+            
+            # Calculate class weight
+            pos_count = np.sum(y_train_single == 1)
+            neg_count = np.sum(y_train_single == 0)
+            scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+            
+            model = XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                gamma=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=3,
+                scale_pos_weight=scale_pos_weight,
+                random_state=42,
+                n_jobs=N_JOBS,
+                tree_method='hist',
+                use_label_encoder=False,
+                verbosity=0
+            )
+            
+            model_start = time.time()
+            model.fit(X_train, y_train_single)
+            training_times.append(time.time() - model_start)
+            trained_models.append(model)
+    
+    total_training_time = time.time() - start_time
+    
+    # Make predictions
+    print("\nGenerating predictions...")
+    y_pred = np.zeros_like(y_test, dtype=np.int8)
+    
+    for i in tqdm(range(num_labels), desc="Making predictions", ascii=True):
+        if trained_models[i] is not None:
+            y_pred[:, i] = trained_models[i].predict(X_test)
+    
+    # Calculate metrics
+    metrics = calculate_multilabel_metrics(y_test, y_pred)
+    
+    # Save detailed results
+    report_path = results_dir / 'xgboost_ovr_report.txt'
+    with open(report_path, 'w') as f:
+        f.write("XGBoost One-vs-Rest Multi-Label Classification Report\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Total training time: {total_training_time:.2f} seconds\n")
+        f.write(f"Feature fraction used: {feature_fraction}\n\n")
+        
+        f.write("OVERALL METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
+        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
+        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
+        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
+        f.write(f"Micro Precision: {metrics['micro_precision']:.4f}\n")
+        f.write(f"Micro Recall: {metrics['micro_recall']:.4f}\n\n")
+        
+        f.write("PER-CLASS METRICS:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8}\n")
+        f.write("-" * 50 + "\n")
+        
+        for i, cls_name in enumerate(class_names):
+            f1 = metrics['per_class']['f1'][i]
+            precision = metrics['per_class']['precision'][i]
+            recall = metrics['per_class']['recall'][i]
+            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f}\n")
+    
+    print(f"XGBoost OvR report saved to: {report_path}")
+    
+    return {
+        'model_name': 'xgboost_ovr',
+        'training_time': total_training_time,
+        'metrics': metrics
+    }
+
 def main():
     """Main function for multi-label ML baseline."""
     parser = argparse.ArgumentParser(description='Multi-Label ML Baseline for Log Analysis')
@@ -461,6 +696,8 @@ def main():
     parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
     parser.add_argument('--knn-train-cap', type=int, default=80000, help='Max samples for KNN training')
     parser.add_argument('--knn-test-cap', type=int, default=30000, help='Max samples for KNN prediction')
+    parser.add_argument('--feature-fraction', type=float, default=0.8, help='Fraction of features to use for XGBoost OvR (0.0-1.0). Default: 0.8')
+    parser.add_argument('--xgb-ovr', action='store_true', help='Run XGBoost with One-vs-Rest strategy (better for multi-label)')
     args = parser.parse_args()
     
     # Find available log types
@@ -598,6 +835,25 @@ def main():
                 except Exception as e:
                     print(f"Error training {model_name}: {e}")
                     continue
+            
+            # Run XGBoost One-vs-Rest if requested
+            if args.xgb_ovr and HAS_XGBOOST:
+                print(f"\n{'-'*40}")
+                print(f"Training XGBoost One-vs-Rest for {log_type}")
+                print(f"{'-'*40}")
+                try:
+                    result = train_evaluate_xgboost_ovr(
+                        X_train_scaled, y_train,
+                        X_test_scaled, y_test,
+                        class_names, results_dir,
+                        use_parallel=True,
+                        feature_fraction=args.feature_fraction
+                    )
+                    results.append(result)
+                except Exception as e:
+                    print(f"Error training XGBoost OvR: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Create summary
             if results:

@@ -54,7 +54,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader, TensorDataset
 from datetime import datetime
 import json as _json_for_progress
@@ -1327,7 +1328,7 @@ def train_optimized_model(
             # Forward pass
             optimizer.zero_grad()
             if use_amp:
-                with autocast(device_type='cuda', dtype=torch.bfloat16):
+                with autocast('cuda', dtype=torch.bfloat16):
                     outputs = model(x_batch)
                     if not econfig.use_complex_losses:
                         total_loss = LossOptimizer.compute_simple_loss(

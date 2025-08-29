@@ -196,14 +196,14 @@ ml-baseline-%:
 	@echo "📊 Running ML baselines for log type: $*"
 	$(PYTHON) $(SRC)/ml_models.py --log-type $*
 
-# XGBoost specifically
+# XGBoost with One-vs-Rest strategy
 xgboost:
-	@echo "🌲 Running XGBoost models..."
-	$(PYTHON) $(SRC)/xgboost_ml.py
+	@echo "🌲 Running XGBoost One-vs-Rest models..."
+	$(PYTHON) $(SRC)/ml_models.py --xgb-ovr --with-xgb
 
 xgboost-%:
-	@echo "🌲 Running XGBoost for context: $*"
-	$(PYTHON) $(SRC)/xgboost_ml.py --context $*
+	@echo "🌲 Running XGBoost OvR for log type: $*"
+	$(PYTHON) $(SRC)/ml_models.py --log-type $* --xgb-ovr --with-xgb
 
 # f-AnoGAN (GAN-based anomaly detection)
 gan:
@@ -318,8 +318,7 @@ define RUN_FOR_METHOD
 	@echo "🤖 Running transformer for $(1) [method=$(2)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(1) [method=$(2)]"
-	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --embedding-type $(2) --model all || true
-	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(1) --embedding-type $(2) || true
+	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --embedding-type $(2) --model all --xgb-ovr --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(1) [method=$(2)]"
 	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(1) --embedding-type $(2) --pos-ratio 0.5 || true
 endef
@@ -435,7 +434,6 @@ run-method:
 	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)] with correct embedding source"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all || true
-	@$(PYTHON) $(SRC)/xgboost_ml.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) || true
+	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
