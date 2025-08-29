@@ -3,6 +3,16 @@ import logging
 import os
 import mimetypes
 from pathlib import Path
+
+# Ensure Matplotlib can write cache/config on HPC
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    pass
+
 import tensorflow as tf
 import re
 

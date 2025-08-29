@@ -94,13 +94,13 @@ pipeline-eval: evaluate compare
 # =============================================================================
 
 # Preprocessing
-preprocess:
+preprocess: ensure-cache
 	@echo "📊 Preprocessing all log types..."
-	$(PYTHON) $(SRC)/preprocessing.py
+	$(HF_ENV) $(PYTHON) $(SRC)/preprocessing.py
 
-preprocess-%:
+preprocess-%: ensure-cache
 	@echo "📊 Preprocessing log type: $*"
-	$(PYTHON) $(SRC)/preprocessing.py --log-type $*
+	$(HF_ENV) $(PYTHON) $(SRC)/preprocessing.py --log-type $*
 
 # Embeddings generation
 embeddings:
@@ -149,11 +149,11 @@ word2vec-thesis-%:
 # Train transformer models
 train: setup-cache
 	@echo "🤖 Training transformer models for all log types..."
-	$(PYTHON) $(SRC)/transformer.py
+	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py
 
 train-%: setup-cache
 	@echo "🤖 Training transformer model for log type: $*"
-	$(PYTHON) $(SRC)/transformer.py --log-type $*
+	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $*
 
 # Train with sample data (faster)
 train-sample:
@@ -347,7 +347,7 @@ thesis-%: ensure-cache preprocess-% embeddings-%
 
 summarize:
 	@echo "🧾 Summarizing results into results/thesis_summary.json|.md"
-	$(PYTHON) $(SRC)/summarize_results.py || true
+	$(HF_ENV) $(PYTHON) $(SRC)/summarize_results.py || true
 
 # =============================================================================
 # Quick Start Examples
@@ -438,6 +438,6 @@ run-method:
 	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)] with correct embedding source"
 	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --use-enhanced-features || true
 	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
+	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
+	@$(HF_ENV) $(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
