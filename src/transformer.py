@@ -2216,7 +2216,7 @@ def process_log_type_with_args(
         "log_type": log_type,
         "embedding_type": embedding_type or "auto-detected",
         "dataset_info": {
-            "total_samples": len(embeddings_scaled),
+            "total_samples": len(embeddings),  # Use embeddings from load_and_preprocess_data
             "training_samples": len(X_train_smote),
             "test_samples": len(X_test),
             "original_train_samples": len(X_train),
