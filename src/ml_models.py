@@ -501,7 +501,8 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
             tree_method='hist',
             use_label_encoder=False,
             verbosity=0,
-            eval_metric='logloss'
+            eval_metric='logloss',
+            base_score=0.5  # Fix: Ensure base_score is within (0,1) for logistic loss
         )
     )
     

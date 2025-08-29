@@ -65,7 +65,17 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def get_performance_config(dataset_size, n_features):
     """Get optimized model parameters based on dataset characteristics."""
-    if dataset_size > 100000:  # Large dataset
+    if dataset_size > 1000000:  # Very large dataset (1M+)
+        return {
+            'lr_max_iter': 500,
+            'rf_n_estimators': 100,
+            'rf_max_depth': 10,
+            'xgb_n_estimators': 100,
+            'xgb_max_depth': 4,
+            'use_subsampling': True,
+            'max_train_size': 100000  # Aggressive subsampling for thesis speed
+        }
+    elif dataset_size > 100000:  # Large dataset
         return {
             'lr_max_iter': 1000,
             'rf_n_estimators': 200,
