@@ -29,6 +29,9 @@ help:
 	@echo "🧪 Thesis orchestration:"
 	@echo "  thesis             Preprocess → generate all embeddings → run models → summarize"
 	@echo "  thesis-<type>      Run thesis pipeline for a specific log type"
+	@echo "  thesis-fast        ⚡ FAST: Run thesis pipeline with 1/10 subset (quick testing)"
+	@echo "  thesis-fast-<type> ⚡ FAST: Run fast pipeline for specific log type"
+	@echo "  quick-test         🚀⚡ SUPER QUICK: Test with wp-error + logbert only (1/10 subset)"
 	@echo "  vars (override): LOG_TYPES=..., EMBEDDINGS=logbert|fasttext|word2vec"
 	@echo ""
 	@echo "🚀 MAIN PIPELINES:"
@@ -337,6 +340,34 @@ thesis: ensure-cache preprocess embeddings
 	@$(MAKE) summarize
 	@echo "✅ Thesis pipeline completed"
 
+# FAST SUBSET VERSION - 1/10 size for quick testing
+thesis-fast: ensure-cache preprocess embeddings
+	@echo "🚀⚡ Running FAST thesis pipeline (1/10 subset) across methods: $(EMBEDDINGS)"
+	@for LT in $(LOG_TYPES); do \
+		for E in $(EMBEDDINGS); do \
+			$(MAKE) run-method-fast LOG_TYPE=$$LT METHOD=$$E; \
+		done; \
+	done
+	@$(MAKE) summarize
+	@echo "✅ Fast thesis pipeline completed"
+
+thesis-fast-%: ensure-cache preprocess-% embeddings-%
+	@echo "🚀⚡ Running FAST thesis pipeline for log type: $* (1/10 subset) across methods: $(EMBEDDINGS)"
+	@for E in $(EMBEDDINGS); do \
+		$(MAKE) run-method-fast LOG_TYPE=$* METHOD=$$E; \
+	 done
+	@$(MAKE) summarize
+	@echo "✅ Fast thesis pipeline completed for $*"
+
+# SUPER QUICK TEST - single log type with logbert only (for urgent testing)
+quick-test: ensure-cache
+	@echo "🚀⚡ SUPER QUICK TEST: wp-error with logbert embeddings (1/10 subset)"
+	@echo "📊 This will take ~5-10 minutes instead of hours"
+	@$(MAKE) run-method-fast LOG_TYPE=wp-error METHOD=logbert
+	@$(MAKE) summarize
+	@echo "✅ Super quick test completed!"
+	@echo "📁 Check results/wp-error/ for outputs"
+
 thesis-%: ensure-cache preprocess-% embeddings-%
 	@echo "🚀 Running thesis pipeline for log type: $* across methods: $(EMBEDDINGS)"
 	@for E in $(EMBEDDINGS); do \
@@ -440,4 +471,20 @@ run-method:
 	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
+	@$(HF_ENV) $(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
+
+# FAST VERSION with 1/10 subset for quick testing
+run-method-fast:
+	@echo "⚡➡️  FAST: Checking embeddings for $(LOG_TYPE) [method=$(METHOD)] - using 1/10 subset"
+	@if [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ] || [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
+		echo "❌ Missing embeddings for $(LOG_TYPE) in embeddings/$(METHOD). Skipping model runs for this method."; \
+		exit 0; \
+	fi
+	@# Calculate subset size (1/10 of dataset, minimum 1000 samples)
+	@SUBSET_SIZE=$$($(PYTHON) -c "import pickle; import numpy as np; data=pickle.load(open('embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl','rb')); print(max(1000, len(data)//10))"); \
+	echo "🤖⚡ Running FAST transformer for $(LOG_TYPE) [method=$(METHOD)] with $$SUBSET_SIZE samples"; \
+	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --sample-size $$SUBSET_SIZE --use-enhanced-features || true
+	@echo "📊⚡ Running FAST ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
+	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb --max-train-samples 10000 || true
+	@echo "⚑⚡ Running FAST binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
