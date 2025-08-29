@@ -39,6 +39,15 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import pickle
+
+# Ensure Matplotlib can write cache/config on HPC
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    pass
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE

@@ -13,10 +13,21 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+
+# Ensure Matplotlib can write cache/config on HPC
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf

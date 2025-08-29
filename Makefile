@@ -12,8 +12,11 @@ LOG_TYPES := wp-access wp-error dns monitor share vpn audit auth
 # Embedding methods to use (override: make thesis EMBEDDINGS="logbert fasttext")
 EMBEDDINGS ?= logbert fasttext word2vec
 
-# Local HF/transformers/torch cache to avoid $HOME/.cache quota issues
-HF_ENV := HF_HOME="$(PWD)/hf_cache" TRANSFORMERS_CACHE="$(PWD)/hf_cache" HUGGINGFACE_HUB_CACHE="$(PWD)/hf_cache" XDG_CACHE_HOME="$(PWD)/.cache" TORCH_HOME="$(PWD)/.cache/torch"
+# Local HF/transformers/torch/matplotlib cache to avoid $HOME/.cache quota issues
+HF_ENV := HF_HOME="$(PWD)/hf_cache" TRANSFORMERS_CACHE="$(PWD)/hf_cache" HUGGINGFACE_HUB_CACHE="$(PWD)/hf_cache" XDG_CACHE_HOME="$(PWD)/.cache" TORCH_HOME="$(PWD)/.cache/torch" MPLCONFIGDIR="$(PWD)/.mplconfig"
+
+# Setup cache directories (alias for ensure-cache)
+setup-cache: ensure-cache
 
 # =============================================================================
 # Main Pipeline Commands
@@ -70,11 +73,11 @@ help:
 # =============================================================================
 
 # Full pipeline for all log types
-pipeline-all: preprocess embeddings train evaluate
+pipeline-all: setup-cache preprocess embeddings train evaluate
 	@echo "✅ Complete pipeline finished for all log types"
 
 # Full pipeline for specific log type
-pipeline-%:
+pipeline-%: setup-cache
 	@echo "🚀 Running complete pipeline for log type: $*"
 	$(MAKE) preprocess-$*
 	$(MAKE) embeddings-$*
@@ -144,11 +147,11 @@ word2vec-thesis-%:
 # =============================================================================
 
 # Train transformer models
-train:
+train: setup-cache
 	@echo "🤖 Training transformer models for all log types..."
 	$(PYTHON) $(SRC)/transformer.py
 
-train-%:
+train-%: setup-cache
 	@echo "🤖 Training transformer model for log type: $*"
 	$(PYTHON) $(SRC)/transformer.py --log-type $*
 
@@ -300,7 +303,8 @@ clean-all: clean
 # =============================================================================
 
 ensure-cache:
-	@mkdir -p hf_cache .cache/torch
+	@mkdir -p hf_cache .cache/torch .mplconfig gensim_data
+	@echo "✅ Cache directories ensured in project root"
 
 # Prepare legacy layout for a given log type and embedding method, then run models
 define RUN_FOR_METHOD
