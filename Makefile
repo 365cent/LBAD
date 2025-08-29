@@ -474,7 +474,8 @@ run-method:
 	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb || true
 	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
-	@# $(HF_ENV) $(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
+	@echo "🔄 Running quick binary baseline instead..."
+	@$(PYTHON) quick_binary_baseline.py || true
 
 # FAST VERSION with 1/10 subset for quick testing
 run-method-fast:
@@ -491,4 +492,5 @@ run-method-fast:
 	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb --max-train-samples 10000 || true
 	@echo "⚑⚡ Running FAST binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
 	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
-	@# $(HF_ENV) $(PYTHON) $(SRC)/supervised_binary.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --pos-ratio 0.5 || true
+	@echo "🔄 Running quick binary baseline instead..."
+	@$(PYTHON) quick_binary_baseline.py || true
