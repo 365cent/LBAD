@@ -1251,6 +1251,60 @@ def generate_pseudo_labels_for_attack_type(
     return binary_labels
 
 
+def train_simple_fallback_model(
+    model: OptimizedTransformer,
+    embeddings: np.ndarray,
+    binary_labels: np.ndarray,
+    attack_type: str,
+    config: SystemConfig,
+    max_epochs: int = 20
+) -> OptimizedTransformer:
+    """Simple fallback training without complex optimizations."""
+    print(f"🔧 Using simple fallback training for {attack_type}")
+    
+    device = torch.device("cpu")  # Force CPU for stability
+    model = model.to(device)
+    
+    # Simple data preparation
+    X_tensor = torch.from_numpy(embeddings).float().to(device)
+    y_tensor = torch.from_numpy(binary_labels).float().to(device)
+    
+    # Simple optimizer
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.BCEWithLogitsLoss()
+    
+    model.train()
+    best_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+    
+    for epoch in range(max_epochs):
+        optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = model(X_tensor)
+        loss = criterion(outputs["multi_label_scores"].squeeze(), y_tensor)
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        current_loss = loss.item()
+        print(f"  {attack_type} | Epoch {epoch+1}/{max_epochs} | Loss: {current_loss:.4f}")
+        
+        # Early stopping
+        if current_loss < best_loss - 1e-4:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f"🛑 Early stopping for {attack_type}")
+            break
+    
+    return model
+
 def train_optimized_model(
     model: OptimizedTransformer,
     embeddings: np.ndarray,
@@ -1369,7 +1423,8 @@ def train_optimized_model(
     # Optimized training setup
     econfig = enhanced_config or EnhancedTransformerConfig()
     model.train()
-    total_epochs = econfig.max_epochs_per_model
+    # Reduce epochs for faster thesis pipeline
+    total_epochs = min(20, econfig.max_epochs_per_model)  # Cap at 20 epochs for speed
     patience = 10
     patience_counter = 0
     best_loss = float("inf")
@@ -1392,7 +1447,15 @@ def train_optimized_model(
     if accumulation_steps > 1:
         print(f"🔄 Using gradient accumulation: {accumulation_steps} steps (effective batch size: {batch_size * accumulation_steps})")
 
+    # Global training timeout
+    training_start_time = time.time()
+    max_training_time = 600  # 10 minutes total training time limit
+
     for epoch in range(total_epochs):
+        # Check global timeout
+        if time.time() - training_start_time > max_training_time:
+            print(f"⚠️  Global training timeout reached for {attack_type} ({max_training_time//60} minutes), stopping")
+            break
         epoch_start = time.time()
         epoch_losses = []
         accumulated_loss = 0.0
@@ -1485,11 +1548,17 @@ def train_optimized_model(
                 epoch_losses.append(accumulated_loss * accumulation_steps)  # Scale back for logging
                 accumulated_loss = 0.0
             
-            # Optimized progress tracking
-            if batch_idx % (50 * accumulation_steps) == 0:  # Less frequent updates
+            # Optimized progress tracking - more frequent for small datasets
+            progress_interval = max(1, min(10, len(dataloader) // 5))  # Show progress at least 5 times per epoch
+            if batch_idx % progress_interval == 0:
                 current_loss = total_loss.item() * accumulation_steps  # Scale back for display
                 progress = (batch_idx + 1) / len(dataloader) * 100
                 print(f"  {attack_type} | Epoch {epoch+1}/{total_epochs} | Progress: {progress:.1f}% | Loss: {current_loss:.4f}")
+                
+                # Add timeout check to prevent infinite loops
+                if time.time() - epoch_start > 300:  # 5 minutes per epoch max
+                    print(f"⚠️  Epoch timeout reached for {attack_type}, stopping training")
+                    return model
 
         scheduler.step()
 
@@ -1543,6 +1612,7 @@ def train_optimized_models(
     tracker: ProgressTracker,
     log_type: str,
     scaler: "StandardScaler" = None,
+    simple_mode: bool = False,
 ) -> Tuple[List[OptimizedTransformer], "StandardScaler"]:
     """
     Train optimized separate models for each attack type.
@@ -1791,42 +1861,47 @@ def train_optimized_models(
             print(f"🔗 Using DataParallel with {config.n_gpus} GPUs")
         
         # Train this model with optimized function
-        try:
-            trained_model = train_optimized_model(
-                model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
+        if simple_mode:
+            print(f"🔧 Using simple mode training for {class_type}")
+            # Create a simple model for fast training
+            simple_model = OptimizedTransformer(
+                input_dim=embedding_dim,
+                latent_dim=latent_dim,
+                n_labels=1,
+                dropout=0.1,
+                transformer_layers=2,  # Simpler architecture
+                attention_heads=4,     # Fewer heads
+                use_simple_attention=True
             )
-        except RuntimeError as e:
-            if "CUDA" in str(e) or "worker" in str(e).lower() or "device" in str(e).lower():
-                print(f"⚠️  CUDA training failed: {e}")
-                print(f"🔄 Attempting CPU fallback...")
-                # Force CPU mode and retry
-                config.device = "cpu"
-                device = torch.device("cpu")
-                
-                # If model was compiled, we need to recreate it without compilation for CPU
-                if model_compiled:
-                    print(f"🔄 Recreating uncompiled model for CPU compatibility...")
-                    # Recreate the model without compilation
-                    model = OptimizedTransformer(
-                        input_dim=embedding_dim,
-                        latent_dim=latent_dim,
-                        n_labels=1,
-                        dropout=0.1,
-                        transformer_layers=transformer_layers,
-                        attention_heads=attention_heads,
-                        use_simple_attention=True
-                    ).to("cpu")
-                    # Re-apply DataParallel if needed
-                    if config.n_gpus > 1:
-                        model = nn.DataParallel(model)
-                else:
-                    model = model.cpu()
-                
+            
+            # Use simple fallback training
+            trained_model = train_simple_fallback_model(
+                simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=10  # Even fewer epochs for simple mode
+            )
+        else:
+            try:
                 trained_model = train_optimized_model(
                     model, combined_embeddings, combined_binary_labels, class_type, config, tracker, log_type, enhanced_config
                 )
-            else:
-                raise
+            except (RuntimeError, KeyboardInterrupt, Exception) as e:
+                print(f"⚠️  Complex training failed: {e}")
+                print(f"🔄 Falling back to simple training method...")
+                
+                # Create a fresh, simple model for fallback
+                simple_model = OptimizedTransformer(
+                    input_dim=embedding_dim,
+                    latent_dim=latent_dim,
+                    n_labels=1,
+                    dropout=0.1,
+                    transformer_layers=2,  # Simpler architecture
+                    attention_heads=4,     # Fewer heads
+                    use_simple_attention=True
+                )
+                
+                # Use simple fallback training
+                trained_model = train_simple_fallback_model(
+                    simple_model, combined_embeddings, combined_binary_labels, class_type, config, max_epochs=15
+                )
         
         # Generate predictions for this class using original embeddings only
         def _infer_with_fallback(model, np_embeddings, prefer_device: torch.device):
@@ -2321,6 +2396,7 @@ def process_log_type_with_args(
     use_enhanced_features: bool = True,
     evaluate_with_clustering: bool = True,
     embedding_type: str = None,
+    simple_mode: bool = False,
 ):
     """Process a single log type with the new separate models approach"""
     
@@ -2433,7 +2509,7 @@ def process_log_type_with_args(
     model_training_start = time.time()
     
     models, _ = train_optimized_models(
-        X_train_smote, classes, None, config, tracker, log_type, scaler
+        X_train_smote, classes, None, config, tracker, log_type, scaler, simple_mode
     )
     
     # Record training completion time
@@ -2843,6 +2919,7 @@ def main():
     parser.add_argument("--disable-enhanced-features", action="store_true", help="Disable enhanced features and use standard transformer")
     parser.add_argument("--evaluate-with-clustering", action="store_true", default=True, help="Perform clustering analysis during evaluation")
     parser.add_argument("--disable-clustering", action="store_true", help="Disable clustering analysis")
+    parser.add_argument("--simple-mode", action="store_true", help="Use simple, fast training mode (bypasses complex optimizations)")
     
     args = parser.parse_args()
     
@@ -2879,7 +2956,8 @@ def main():
         sample_size=args.sample_size,
         use_enhanced_features=use_enhanced_features,
         evaluate_with_clustering=evaluate_with_clustering,
-        embedding_type=args.embedding_type
+        embedding_type=args.embedding_type,
+        simple_mode=args.simple_mode
     )
     
     print(f"Completed {args.log_type} in {time.time():.2f} seconds")

@@ -487,7 +487,7 @@ run-method-fast:
 	@# Calculate subset size (1/10 of dataset, minimum 1000 samples)
 	@SUBSET_SIZE=$$($(PYTHON) -c "import pickle; import numpy as np; data=pickle.load(open('embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl','rb')); print(max(1000, len(data)//10))"); \
 	echo "🤖⚡ Running FAST transformer for $(LOG_TYPE) [method=$(METHOD)] with $$SUBSET_SIZE samples"; \
-	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --sample-size $$SUBSET_SIZE --use-enhanced-features || true
+	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --sample-size $$SUBSET_SIZE --simple-mode || true
 	@echo "📊⚡ Running FAST ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
 	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --xgb-ovr --with-xgb --max-train-samples 10000 || true
 	@echo "⚑⚡ Running FAST binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
