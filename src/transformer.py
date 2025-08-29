@@ -30,6 +30,7 @@ import time
 import warnings
 import math
 import json
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1017,13 +1018,35 @@ class MultiLabelEvaluator:
         results['per_label_precision'] = {}
         results['per_label_recall'] = {}
         results['per_label_accuracy'] = {}
+        results['per_label_specificity'] = {}
+        results['per_label_false_positive_rate'] = {}
+        results['per_label_confusion_matrix'] = {}
+        
+        # Calculate confusion matrix for each label
+        multilabel_cm = multilabel_confusion_matrix(y_true, y_pred)
         
         for i in range(num_labels):
             label_name = f'label_{i}'
+            
+            # Basic metrics
             results['per_label_f1'][label_name] = f1_score(y_true[:, i], y_pred[:, i])
             results['per_label_precision'][label_name] = precision_score(y_true[:, i], y_pred[:, i])
             results['per_label_recall'][label_name] = recall_score(y_true[:, i], y_pred[:, i])
             results['per_label_accuracy'][label_name] = accuracy_score(y_true[:, i], y_pred[:, i])
+            
+            # Confusion matrix for this label
+            cm = multilabel_cm[i]
+            tn, fp, fn, tp = cm.ravel()
+            
+            # Store confusion matrix values
+            results['per_label_confusion_matrix'][label_name] = [int(tp), int(fp), int(tn), int(fn)]
+            
+            # Calculate additional metrics
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+            
+            results['per_label_specificity'][label_name] = float(specificity)
+            results['per_label_false_positive_rate'][label_name] = float(fpr)
         
         # Multi-label confusion matrices
         results['multilabel_confusion_matrix'] = multilabel_confusion_matrix(y_true, y_pred).tolist()
@@ -1056,16 +1079,33 @@ class MultiLabelEvaluator:
         if 'per_label_f1' in results:
             report.append("PER-LABEL METRICS:")
             report.append("-" * 40)
-            report.append(f"{'Label':<15} {'F1':<8} {'Precision':<12} {'Recall':<8} {'Accuracy':<10}")
-            report.append("-" * 55)
+            report.append(f"{'Label':<15} {'F1':<8} {'Precision':<12} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8}")
+            report.append("-" * 75)
             
             for label in results['per_label_f1'].keys():
                 f1 = results['per_label_f1'][label]
                 precision = results['per_label_precision'][label]
                 recall = results['per_label_recall'][label]
                 accuracy = results['per_label_accuracy'][label]
+                specificity = results.get('per_label_specificity', {}).get(label, 0.0)
+                fpr = results.get('per_label_false_positive_rate', {}).get(label, 0.0)
                 
-                report.append(f"{label:<15} {f1:<8.4f} {precision:<12.4f} {recall:<8.4f} {accuracy:<10.4f}")
+                report.append(f"{label:<15} {f1:<8.4f} {precision:<12.4f} {recall:<8.4f} {accuracy:<10.4f} {specificity:<12.4f} {fpr:<8.4f}")
+            
+            # Add detailed confusion matrix information if available
+            if 'per_label_confusion_matrix' in results:
+                report.append("")
+                report.append("DETAILED PER-LABEL CONFUSION MATRIX:")
+                report.append("-" * 40)
+                report.append(f"{'Label':<15} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}")
+                report.append("-" * 55)
+                
+                for label in results['per_label_f1'].keys():
+                    cm = results['per_label_confusion_matrix'].get(label, [0, 0, 0, 0])
+                    tp, fp, tn, fn = cm
+                    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+                    
+                    report.append(f"{label:<15} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}")
         
         report.append("")
         report.append("=" * 80)
@@ -1809,6 +1849,51 @@ def train_optimized_models(
         
         print(f"🔍 Debug: embeddings shape {combined_embeddings.shape}, binary_labels shape {combined_binary_labels.shape}")
         
+        # Check if predictions already exist for this class and embeddings (unless force restart is requested)
+        prediction_check_path = Path(f"results/{log_type}/class_predictions_{class_type}.pkl")
+        if prediction_check_path.exists() and not force_restart:
+            try:
+                with open(prediction_check_path, 'rb') as f:
+                    existing_pred = pickle.load(f)
+                
+                # Check if the existing predictions match current data
+                if (existing_pred.get('embedding_hash') == hashlib.md5(combined_embeddings.tobytes()).hexdigest() and
+                    existing_pred.get('class_type') == class_type and
+                    existing_pred.get('log_type') == log_type):
+                    
+                    print(f"✅ Predictions already exist for {class_type} with matching embeddings")
+                    print(f"   📁 Loading from: {prediction_check_path}")
+                    
+                    # Load existing predictions
+                    class_probs = existing_pred['probabilities']
+                    class_preds = existing_pred['predictions']
+                    
+                    # Store results without training
+                    models.append(None)  # No model needed
+                    all_probabilities.append(class_probs)
+                    all_predictions.append(class_preds)
+                    
+                    print(f"📊 Loaded predictions: {np.sum(class_preds)}/{len(class_preds)} samples classified as {class_type}")
+                    
+                    # Show detailed prediction analysis if true labels available
+                    if original_true_labels is not None:
+                        if class_type == 'normal':
+                            actual_normal = np.sum(np.sum(original_true_labels, axis=1) == 0)
+                            predicted_normal = np.sum(class_preds)
+                            print(f"📈 Normal class analysis: {actual_normal} actual vs {predicted_normal} predicted")
+                        else:
+                            attack_idx = classes.index(class_type)
+                            actual_attack = np.sum(original_true_labels[:, attack_idx])
+                            predicted_attack = np.sum(class_preds)
+                            print(f"📈 {class_type} analysis: {actual_attack} actual vs {predicted_attack} predicted")
+                    
+                    # Skip to next class
+                    continue
+                    
+            except Exception as e:
+                print(f"⚠️  Could not load existing predictions for {class_type}: {e}")
+                print(f"🔄 Proceeding with training...")
+        
         # Create optimized config for this model
         enhanced_config = EnhancedTransformerConfig(
             d_model=latent_dim,
@@ -1935,6 +2020,37 @@ def train_optimized_models(
         all_probabilities.append(class_probs)
         all_predictions.append(class_preds)
         
+        # Save individual class predictions for future reuse
+        try:
+            # Create results directory if it doesn't exist
+            results_dir = Path(f"results/{log_type}")
+            results_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save class-specific predictions
+            class_prediction_data = {
+                'class_type': class_type,
+                'log_type': log_type,
+                'embedding_hash': hashlib.md5(original_embeddings.tobytes()).hexdigest(),
+                'probabilities': class_probs,
+                'predictions': class_preds,
+                'model_info': {
+                    'input_dim': embedding_dim,
+                    'latent_dim': latent_dim,
+                    'transformer_layers': transformer_layers,
+                    'attention_heads': attention_heads,
+                    'training_timestamp': time.time()
+                }
+            }
+            
+            class_prediction_file = results_dir / f"class_predictions_{class_type}.pkl"
+            with open(class_prediction_file, 'wb') as f:
+                pickle.dump(class_prediction_data, f)
+            
+            print(f"💾 Saved class predictions to: {class_prediction_file}")
+            
+        except Exception as e:
+            print(f"⚠️  Could not save class predictions for {class_type}: {e}")
+        
         print(f"✅ Completed training for {class_type}")
         print(f"📊 Predictions: {np.sum(class_preds)}/{len(class_preds)} samples classified as {class_type}")
         
@@ -2006,16 +2122,22 @@ def train_optimized_models(
             train_all_predictions = []
             train_all_probabilities = []
             
-            for model in models:
-                model.eval()
-                with torch.no_grad():
-                    train_embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
-                    outputs = model(train_embeddings_tensor)
-                    class_scores = outputs["multi_label_scores"]
-                    class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()
-                    class_preds = (class_probs >= 0.5).astype(int)
-                    train_all_predictions.append(class_preds)
-                    train_all_probabilities.append(class_probs)
+            for i, model in enumerate(models):
+                if model is None:
+                    # Use existing predictions that were loaded
+                    train_all_predictions.append(all_predictions[i])
+                    train_all_probabilities.append(all_probabilities[i])
+                else:
+                    # Generate predictions from trained model
+                    model.eval()
+                    with torch.no_grad():
+                        train_embeddings_tensor = torch.from_numpy(embeddings).float().to(device)
+                        outputs = model(train_embeddings_tensor)
+                        class_scores = outputs["multi_label_scores"]
+                        class_probs = torch.sigmoid(class_scores).cpu().numpy().flatten()
+                        class_preds = (class_probs >= 0.5).astype(int)
+                        train_all_predictions.append(class_preds)
+                        train_all_probabilities.append(class_probs)
             
             # Combine training predictions
             if len(train_all_predictions) > len(classes):  # Has normal class
@@ -2073,13 +2195,31 @@ def train_optimized_models(
         except Exception as e:
             print(f"❌ Failed to save training predictions: {e}")
 
+    # Count skipped vs trained models
+    trained_models = [m for m in models if m is not None]
+    skipped_models = [m for m in models if m is None]
+    
+    print(f"\n📊 MODEL TRAINING SUMMARY:")
+    print(f"   Total classes processed: {len(models)}")
+    print(f"   Models trained: {len(trained_models)}")
+    print(f"   Predictions loaded from cache: {len(skipped_models)}")
+    
+    if skipped_models:
+        print(f"   ⏩ Skipped classes (used cached predictions):")
+        for i, model in enumerate(models):
+            if model is None:
+                class_name = all_classes[i] if i < len(all_classes) else f"class_{i}"
+                print(f"     - {class_name}")
+    
     # Simplified logging
     tracker.log_step("Optimized Model Training Complete", {
         "total_models": len(models),
+        "trained_models": len(trained_models),
+        "skipped_models": len(skipped_models),
         "attack_classes": len(classes),
         "architecture": f"{latent_dim}D latent, {transformer_layers} layers, {attention_heads} heads",
         "training_samples": len(embeddings),
-        "optimization": "Simplified losses, reduced epochs, efficient architecture"
+        "optimization": "Simplified losses, reduced epochs, efficient architecture, prediction caching"
     })
     
     # Clear memory after training

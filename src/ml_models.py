@@ -14,6 +14,7 @@ import json
 import pickle
 import argparse
 import time
+import hashlib
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -30,8 +31,6 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
-import multiprocessing
-from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -69,6 +68,72 @@ if CPU_COUNT:
     N_JOBS = max(1, CPU_COUNT - 1)
 else:
     N_JOBS = -1
+
+def check_existing_predictions(log_type, model_name, embedding_type=None, force_restart=False):
+    """Check if predictions already exist for a specific model and log type."""
+    if force_restart:
+        return None, None
+    
+    # Create results directory path
+    results_dir = RESULTS_DIR / f"multilabel_{log_type}"
+    
+    # Look for existing prediction files
+    prediction_file = results_dir / f"{model_name}_predictions.pkl"
+    metrics_file = results_dir / f"{model_name}_metrics.pkl"
+    
+    if prediction_file.exists() and metrics_file.exists():
+        try:
+            # Load existing predictions and metrics
+            with open(prediction_file, 'rb') as f:
+                existing_data = pickle.load(f)
+            
+            with open(metrics_file, 'rb') as f:
+                existing_metrics = pickle.load(f)
+            
+            # Check if the data matches current configuration
+            if (existing_data.get('log_type') == log_type and
+                existing_data.get('model_name') == model_name and
+                existing_data.get('embedding_type') == embedding_type):
+                
+                print(f"✅ Found existing predictions for {model_name} on {log_type}")
+                print(f"   📁 Loading from: {prediction_file}")
+                return existing_data, existing_metrics
+            
+        except Exception as e:
+            print(f"⚠️  Could not load existing predictions for {model_name}: {e}")
+    
+    return None, None
+
+def save_predictions_and_metrics(log_type, model_name, predictions, metrics, embedding_type=None):
+    """Save predictions and metrics for future reuse."""
+    try:
+        # Create results directory
+        results_dir = RESULTS_DIR / f"multilabel_{log_type}"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save predictions
+        prediction_data = {
+            'log_type': log_type,
+            'model_name': model_name,
+            'embedding_type': embedding_type,
+            'predictions': predictions['y_pred'],
+            'probabilities': predictions.get('y_prob'),
+            'timestamp': time.time()
+        }
+        
+        prediction_file = results_dir / f"{model_name}_predictions.pkl"
+        with open(prediction_file, 'wb') as f:
+            pickle.dump(prediction_data, f)
+        
+        # Save metrics
+        metrics_file = results_dir / f"{model_name}_metrics.pkl"
+        with open(metrics_file, 'wb') as f:
+            pickle.dump(metrics, f)
+        
+        print(f"💾 Saved predictions and metrics for {model_name} to: {results_dir}")
+        
+    except Exception as e:
+        print(f"⚠️  Could not save predictions for {model_name}: {e}")
 
 def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False):
     """Create multi-label ML models."""
@@ -323,17 +388,130 @@ def calculate_multilabel_metrics(y_true, y_pred, y_prob=None):
     per_class_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
     per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
     
+    # Calculate additional per-class metrics
+    per_class_accuracy = []
+    per_class_specificity = []
+    per_class_fpr = []
+    per_class_npv = []
+    per_class_tp = []
+    per_class_fp = []
+    per_class_tn = []
+    per_class_fn = []
+    
+    # Calculate confusion matrix for each class
+    multilabel_cm = multilabel_confusion_matrix(y_true, y_pred)
+    
+    for i in range(y_true.shape[1]):
+        cm = multilabel_cm[i]
+        tn, fp, fn, tp = cm.ravel()
+        
+        # Store confusion matrix values
+        per_class_tp.append(int(tp))
+        per_class_fp.append(int(fp))
+        per_class_tn.append(int(tn))
+        per_class_fn.append(int(fn))
+        
+        # Calculate additional metrics
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+        
+        per_class_accuracy.append(float(accuracy))
+        per_class_specificity.append(float(specificity))
+        per_class_fpr.append(float(fpr))
+        per_class_npv.append(float(npv))
+    
     metrics['per_class'] = {
         'f1': per_class_f1.tolist(),
         'precision': per_class_precision.tolist(),
-        'recall': per_class_recall.tolist()
+        'recall': per_class_recall.tolist(),
+        'accuracy': per_class_accuracy,
+        'specificity': per_class_specificity,
+        'false_positive_rate': per_class_fpr,
+        'negative_predictive_value': per_class_npv,
+        'true_positives': per_class_tp,
+        'false_positives': per_class_fp,
+        'true_negatives': per_class_tn,
+        'false_negatives': per_class_fn
     }
     
     return metrics
 
 def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test, y_test, 
-                                   class_names, results_dir):
+                                   class_names, results_dir, log_type=None, embedding_type=None, force_restart=False):
     """Train and evaluate a multi-label model."""
+    
+    # Check for existing predictions first
+    if log_type:
+        existing_data, existing_metrics = check_existing_predictions(log_type, model_name, embedding_type, force_restart)
+        if existing_data is not None and existing_metrics is not None:
+            print(f"⏩ Skipping training for {model_name} - using existing predictions")
+            
+            # Create report from existing data
+            report_path = results_dir / f'{model_name}_multilabel_report.txt'
+            with open(report_path, 'w') as f:
+                f.write(f"{model_name.upper()} Multi-Label Classification Report (FROM CACHE)\n")
+                f.write("=" * 60 + "\n")
+                f.write(f"Using cached predictions from: {existing_data.get('timestamp', 'unknown')}\n")
+                f.write(f"Test samples: {len(existing_data['predictions'])}\n")
+                f.write(f"Number of classes: {len(class_names)}\n\n")
+                
+                f.write("OVERALL METRICS:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"Subset Accuracy: {existing_metrics['subset_accuracy']:.4f}\n")
+                f.write(f"Hamming Loss: {existing_metrics['hamming_loss']:.4f}\n")
+                f.write(f"Micro F1: {existing_metrics['micro_f1']:.4f}\n")
+                f.write(f"Macro F1: {existing_metrics['macro_f1']:.4f}\n")
+                f.write(f"Weighted F1: {existing_metrics['weighted_f1']:.4f}\n")
+                f.write(f"Samples F1: {existing_metrics['samples_f1']:.4f}\n")
+                f.write(f"Jaccard (Micro): {existing_metrics['jaccard_micro']:.4f}\n")
+                f.write(f"Jaccard (Macro): {existing_metrics['jaccard_macro']:.4f}\n\n")
+                
+                f.write("PER-CLASS METRICS:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
+                f.write("-" * 90 + "\n")
+                
+                # Calculate support for each class
+                support = y_test.sum(axis=0)
+                
+                for i, cls_name in enumerate(class_names):
+                    f1 = existing_metrics['per_class']['f1'][i]
+                    precision = existing_metrics['per_class']['precision'][i]
+                    recall = existing_metrics['per_class']['recall'][i]
+                    accuracy = existing_metrics['per_class']['accuracy'][i]
+                    specificity = existing_metrics['per_class']['specificity'][i]
+                    fpr = existing_metrics['per_class']['false_positive_rate'][i]
+                    sup = int(support[i])
+                    
+                    f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
+                
+                # Add detailed confusion matrix information
+                f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
+                f.write("-" * 60 + "\n")
+                
+                for i, cls_name in enumerate(class_names):
+                    tp = existing_metrics['per_class']['true_positives'][i]
+                    fp = existing_metrics['per_class']['false_positives'][i]
+                    tn = existing_metrics['per_class']['true_negatives'][i]
+                    fn = existing_metrics['per_class']['false_negatives'][i]
+                    npv = existing_metrics['per_class']['negative_predictive_value'][i]
+                    
+                    f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
+            
+            print(f"📊 Report created from cache: {report_path}")
+            
+            # Return cached results
+            return {
+                'model_name': model_name,
+                'training_time': 0.0,  # No training time
+                'metrics': existing_metrics,
+                'cached': True
+            }
+    
     print(f"Training {model_name.upper()} model...")
     start_time = time.time()
     
@@ -382,8 +560,8 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
         
         f.write("PER-CLASS METRICS:\n")
         f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}\n")
-        f.write("-" * 60 + "\n")
+        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
+        f.write("-" * 90 + "\n")
         
         # Calculate support for each class
         support = y_test.sum(axis=0)
@@ -392,17 +570,44 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
             f1 = metrics['per_class']['f1'][i]
             precision = metrics['per_class']['precision'][i]
             recall = metrics['per_class']['recall'][i]
+            accuracy = metrics['per_class']['accuracy'][i]
+            specificity = metrics['per_class']['specificity'][i]
+            fpr = metrics['per_class']['false_positive_rate'][i]
             sup = int(support[i])
             
-            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}\n")
+            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
+        
+        # Add detailed confusion matrix information
+        f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
+        f.write("-" * 60 + "\n")
+        
+        for i, cls_name in enumerate(class_names):
+            tp = metrics['per_class']['true_positives'][i]
+            fp = metrics['per_class']['false_positives'][i]
+            tn = metrics['per_class']['true_negatives'][i]
+            fn = metrics['per_class']['false_negatives'][i]
+            npv = metrics['per_class']['negative_predictive_value'][i]
+            
+            f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
     
     # Create visualization
     create_multilabel_visualization(y_test, y_pred, class_names, model_name, results_dir)
     
+    # Save predictions and metrics for future reuse
+    if log_type:
+        predictions_data = {
+            'y_pred': y_pred,
+            'y_prob': y_prob
+        }
+        save_predictions_and_metrics(log_type, model_name, predictions_data, metrics, embedding_type)
+    
     return {
         'model_name': model_name,
         'training_time': training_time,
-        'metrics': metrics
+        'metrics': metrics,
+        'cached': False
     }
 
 def create_multilabel_visualization(y_true, y_pred, class_names, model_name, results_dir):
@@ -481,8 +686,76 @@ def create_multilabel_visualization(y_true, y_pred, class_names, model_name, res
     plt.savefig(results_dir / f'{model_name}_labels_per_sample.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, results_dir):
+def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, results_dir, 
+                             log_type=None, embedding_type=None, force_restart=False):
     """Train XGBoost using traditional MultiOutputClassifier approach."""
+    
+    # Check for existing predictions first
+    if log_type:
+        existing_data, existing_metrics = check_existing_predictions(log_type, 'xgboost_traditional', embedding_type, force_restart)
+        if existing_data is not None and existing_metrics is not None:
+            print(f"⏩ Skipping training for xgboost_traditional - using existing predictions")
+            
+            # Create report from existing data
+            report_path = results_dir / 'xgboost_traditional_report.txt'
+            with open(report_path, 'w') as f:
+                f.write("XGBoost Traditional Multi-Label Classification Report (FROM CACHE)\n")
+                f.write("=" * 60 + "\n")
+                f.write(f"Using cached predictions from: {existing_data.get('timestamp', 'unknown')}\n")
+                f.write(f"Approach: MultiOutputClassifier with XGBoost\n\n")
+                
+                f.write("OVERALL METRICS:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"Subset Accuracy: {existing_metrics['subset_accuracy']:.4f}\n")
+                f.write(f"Hamming Loss: {existing_metrics['hamming_loss']:.4f}\n")
+                f.write(f"Micro F1: {existing_metrics['micro_f1']:.4f}\n")
+                f.write(f"Macro F1: {existing_metrics['macro_f1']:.4f}\n")
+                f.write(f"Micro Precision: {existing_metrics['micro_precision']:.4f}\n")
+                f.write(f"Micro Recall: {existing_metrics['micro_recall']:.4f}\n\n")
+                
+                f.write("PER-CLASS METRICS:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
+                f.write("-" * 90 + "\n")
+                
+                # Calculate support for each class
+                support = y_test.sum(axis=0)
+                
+                for i, cls_name in enumerate(class_names):
+                    f1 = existing_metrics['per_class']['f1'][i]
+                    precision = existing_metrics['per_class']['precision'][i]
+                    recall = existing_metrics['per_class']['recall'][i]
+                    accuracy = existing_metrics['per_class']['accuracy'][i]
+                    specificity = existing_metrics['per_class']['specificity'][i]
+                    fpr = existing_metrics['per_class']['false_positive_rate'][i]
+                    sup = int(support[i])
+                    f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
+                
+                # Add detailed confusion matrix information
+                f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
+                f.write("-" * 60 + "\n")
+                
+                for i, cls_name in enumerate(class_names):
+                    tp = existing_metrics['per_class']['true_positives'][i]
+                    fp = existing_metrics['per_class']['false_positives'][i]
+                    tn = existing_metrics['per_class']['true_negatives'][i]
+                    fn = existing_metrics['per_class']['false_negatives'][i]
+                    npv = existing_metrics['per_class']['negative_predictive_value'][i]
+                    
+                    f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
+            
+            print(f"📊 Report created from cache: {report_path}")
+            
+            # Return cached results
+            return {
+                'model_name': 'xgboost_traditional',
+                'training_time': 0.0,  # No training time
+                'metrics': existing_metrics,
+                'cached': True
+            }
+    
     print(f"\nTraining traditional XGBoost with MultiOutputClassifier...")
     
     start_time = time.time()
@@ -536,8 +809,8 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
         
         f.write("PER-CLASS METRICS:\n")
         f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}\n")
-        f.write("-" * 60 + "\n")
+        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
+        f.write("-" * 90 + "\n")
         
         # Calculate support for each class
         support = y_test.sum(axis=0)
@@ -546,8 +819,26 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
             f1 = metrics['per_class']['f1'][i]
             precision = metrics['per_class']['precision'][i]
             recall = metrics['per_class']['recall'][i]
+            accuracy = metrics['per_class']['accuracy'][i]
+            specificity = metrics['per_class']['specificity'][i]
+            fpr = metrics['per_class']['false_positive_rate'][i]
             sup = int(support[i])
-            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}\n")
+            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
+        
+        # Add detailed confusion matrix information
+        f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
+        f.write("-" * 60 + "\n")
+        
+        for i, cls_name in enumerate(class_names):
+            tp = metrics['per_class']['true_positives'][i]
+            fp = metrics['per_class']['false_positives'][i]
+            tn = metrics['per_class']['true_negatives'][i]
+            fn = metrics['per_class']['false_negatives'][i]
+            npv = metrics['per_class']['negative_predictive_value'][i]
+            
+            f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
     
     print(f"XGBoost traditional report saved to: {report_path}")
     
@@ -555,158 +846,22 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
     model_path = MODELS_DIR / f'xgboost_traditional.joblib'
     joblib.dump(model, model_path)
     
+    # Save predictions and metrics for future reuse
+    if log_type:
+        predictions_data = {
+            'y_pred': y_pred,
+            'y_prob': None  # XGBoost traditional doesn't provide probabilities in this format
+        }
+        save_predictions_and_metrics(log_type, 'xgboost_traditional', predictions_data, metrics, embedding_type)
+    
     return {
         'model_name': 'xgboost_traditional',
         'training_time': training_time,
-        'metrics': metrics
+        'metrics': metrics,
+        'cached': False
     }
 
-def train_evaluate_xgboost_ovr(X_train, y_train, X_test, y_test, class_names, results_dir, 
-                               use_parallel=True, feature_fraction=0.8):
-    """Train XGBoost using One-vs-Rest strategy for better multi-label performance."""
-    num_labels = len(class_names)
-    print(f"\nStarting One-vs-Rest XGBoost training for {num_labels} attack types...")
-    
-    # Feature selection if requested
-    if feature_fraction < 1.0 and feature_fraction > 0:
-        num_features = X_train.shape[1]
-        num_features_to_keep = max(1, int(num_features * feature_fraction))
-        print(f"Performing feature selection: keeping {num_features_to_keep} of {num_features} features")
-        
-        # Train a quick XGBoost model to get feature importances
-        feature_selector = XGBClassifier(
-            n_estimators=50, 
-            max_depth=5,
-            learning_rate=0.1,
-            n_jobs=N_JOBS,
-            tree_method='hist',
-            random_state=42
-        )
-        
-        # Use sum of labels as target for feature selection
-        any_attack = np.any(y_train == 1, axis=1).astype(np.int8)
-        feature_selector.fit(X_train, any_attack)
-        
-        # Get feature importances and select top features
-        importances = feature_selector.feature_importances_
-        top_indices = np.argsort(importances)[-num_features_to_keep:]
-        
-        # Select only these features
-        X_train = X_train[:, top_indices]
-        X_test = X_test[:, top_indices]
-        print(f"Feature selection complete: X_train shape now {X_train.shape}")
-    
-    trained_models = []
-    training_times = []
-    start_time = time.time()
-    
-    if use_parallel and num_labels > 1 and HAS_XGBOOST:
-        # Parallel training
-        jobs_per_model = max(1, N_JOBS // min(num_labels, multiprocessing.cpu_count()))
-        params_list = [
-            (i, class_names[i], X_train, y_train[:, i], jobs_per_model, True) 
-            for i in range(num_labels)
-        ]
-        
-        with multiprocessing.Pool(min(num_labels, multiprocessing.cpu_count())) as pool:
-            results = list(tqdm(pool.imap(train_single_xgb_model, params_list), 
-                               total=len(params_list), 
-                               desc="Training XGB models", 
-                               ascii=True))
-            
-            # Collect results
-            trained_models = [None] * num_labels
-            for idx, model, training_time in results:
-                trained_models[idx] = model
-                training_times.append(training_time)
-    else:
-        # Sequential training
-        for i in range(num_labels):
-            print(f"  Training model {i+1}/{num_labels} for: '{class_names[i]}'...")
-            y_train_single = y_train[:, i]
-            
-            # Check for sufficient samples
-            unique_classes, class_counts = np.unique(y_train_single, return_counts=True)
-            if len(unique_classes) < 2 or np.min(class_counts) < 10:
-                print(f"    Skipping - insufficient samples")
-                trained_models.append(None)
-                training_times.append(0)
-                continue
-            
-            # Calculate class weight
-            pos_count = np.sum(y_train_single == 1)
-            neg_count = np.sum(y_train_single == 0)
-            scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
-            
-            model = XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                gamma=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_weight=3,
-                scale_pos_weight=scale_pos_weight,
-                random_state=42,
-                n_jobs=N_JOBS,
-                tree_method='hist',
-                use_label_encoder=False,
-                verbosity=0
-            )
-            
-            model_start = time.time()
-            model.fit(X_train, y_train_single)
-            training_times.append(time.time() - model_start)
-            trained_models.append(model)
-    
-    total_training_time = time.time() - start_time
-    
-    # Make predictions
-    print("\nGenerating predictions...")
-    y_pred = np.zeros_like(y_test, dtype=np.int8)
-    
-    for i in tqdm(range(num_labels), desc="Making predictions", ascii=True):
-        if trained_models[i] is not None:
-            y_pred[:, i] = trained_models[i].predict(X_test)
-    
-    # Calculate metrics
-    metrics = calculate_multilabel_metrics(y_test, y_pred)
-    
-    # Save detailed results
-    report_path = results_dir / 'xgboost_ovr_report.txt'
-    with open(report_path, 'w') as f:
-        f.write("XGBoost One-vs-Rest Multi-Label Classification Report\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"Total training time: {total_training_time:.2f} seconds\n")
-        f.write(f"Feature fraction used: {feature_fraction}\n\n")
-        
-        f.write("OVERALL METRICS:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
-        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
-        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
-        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
-        f.write(f"Micro Precision: {metrics['micro_precision']:.4f}\n")
-        f.write(f"Micro Recall: {metrics['micro_recall']:.4f}\n\n")
-        
-        f.write("PER-CLASS METRICS:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8}\n")
-        f.write("-" * 50 + "\n")
-        
-        for i, cls_name in enumerate(class_names):
-            f1 = metrics['per_class']['f1'][i]
-            precision = metrics['per_class']['precision'][i]
-            recall = metrics['per_class']['recall'][i]
-            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f}\n")
-    
-    print(f"XGBoost OvR report saved to: {report_path}")
-    
-    return {
-        'model_name': 'xgboost_ovr',
-        'training_time': total_training_time,
-        'metrics': metrics
-    }
+
 
 def main():
     """Main function for multi-label ML baseline."""
@@ -725,8 +880,7 @@ def main():
     parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
     parser.add_argument('--knn-train-cap', type=int, default=80000, help='Max samples for KNN training')
     parser.add_argument('--knn-test-cap', type=int, default=30000, help='Max samples for KNN prediction')
-    parser.add_argument('--feature-fraction', type=float, default=0.8, help='Fraction of features to use for XGBoost (0.0-1.0). Default: 0.8')
-    parser.add_argument('--xgb-ovr', action='store_true', help='Run XGBoost with traditional MultiOutputClassifier (handles imbalanced data better)')
+    parser.add_argument('--force-restart', action='store_true', help='Force restart training (ignore existing predictions)')
     args = parser.parse_args()
     
     # Find available log types
@@ -849,7 +1003,8 @@ def main():
                             models[model_name],
                             X_train_local, y_train_local,
                             X_test_local, y_test_local,
-                            class_names, results_dir
+                            class_names, results_dir,
+                            log_type, args.embedding_type, args.force_restart
                         )
                     else:
                         result = train_evaluate_multilabel_model(
@@ -857,7 +1012,8 @@ def main():
                             models[model_name],
                             X_train_scaled, y_train,
                             X_test_scaled, y_test,
-                            class_names, results_dir
+                            class_names, results_dir,
+                            log_type, args.embedding_type, args.force_restart
                         )
                     results.append(result)
                     
@@ -866,7 +1022,7 @@ def main():
                     continue
             
             # Run XGBoost traditional approach if requested
-            if (args.xgb_ovr or args.with_xgb) and HAS_XGBOOST:
+            if args.with_xgb and HAS_XGBOOST:
                 print(f"\n{'-'*40}")
                 print(f"Training XGBoost Traditional for {log_type}")
                 print(f"{'-'*40}")
@@ -874,7 +1030,8 @@ def main():
                     result = train_traditional_xgboost(
                         X_train_scaled, y_train,
                         X_test_scaled, y_test,
-                        class_names, results_dir
+                        class_names, results_dir,
+                        log_type, args.embedding_type, args.force_restart
                     )
                     results.append(result)
                 except Exception as e:
@@ -887,16 +1044,23 @@ def main():
                 print(f"\n{'='*60}")
                 print(f"SUMMARY FOR {log_type.upper()}")
                 print(f"{'='*60}")
-                print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming Loss':<15} {'Time (s)':<10}")
-                print("-" * 70)
+                
+                # Count cached vs trained models
+                cached_count = sum(1 for r in results if r.get('cached', False))
+                trained_count = len(results) - cached_count
+                
+                print(f"📊 Models trained: {trained_count}, Predictions loaded from cache: {cached_count}")
+                print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming Loss':<15} {'Time (s)':<10} {'Status':<8}")
+                print("-" * 78)
                 
                 for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
                     model_name = result['model_name']
                     metrics = result['metrics']
                     time_taken = result['training_time']
+                    status = "CACHED" if result.get('cached', False) else "TRAINED"
                     
                     print(f"{model_name:<20} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} "
-                          f"{metrics['hamming_loss']:<15.4f} {time_taken:<10.2f}")
+                          f"{metrics['hamming_loss']:<15.4f} {time_taken:<10.2f} {status:<8}")
                 
                 # Save summary
                 summary_path = results_dir / 'summary.json'
