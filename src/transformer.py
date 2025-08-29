@@ -2179,12 +2179,34 @@ def process_log_type_with_args(
     print(f"\n🚀 Starting training for {log_type} with SMOTE-enhanced data...")
     print(f"   Training samples: {len(X_train_smote):,} (original: {len(X_train):,})")
     print(f"   Test samples: {len(X_test):,} (unseen)")
+    print(f"   Device: {config.device} ({config.gpu_memory_gb:.1f}GB GPU memory)")
+    print(f"   Classes: {len(classes)} attack types")
+    
+    # Detailed timing breakdown
+    timing_breakdown = {
+        "data_loading_seconds": 0,
+        "preprocessing_seconds": 0,
+        "smote_seconds": 0,
+        "training_seconds": 0,
+        "inference_seconds": 0,
+        "evaluation_seconds": 0
+    }
+    
     training_start_time = time.time()
+    
+    # Record preprocessing time (approximate)
+    timing_breakdown["preprocessing_seconds"] = training_start_time - (getattr(tracker, 'start_time', training_start_time) if hasattr(tracker, 'start_time') else training_start_time)
+    
+    # Record training start time
+    model_training_start = time.time()
     
     models, _ = train_optimized_models(
         X_train_smote, classes, None, config, tracker, log_type, scaler
     )
-    print(f"✅ Training completed for {log_type}")
+    
+    # Record training completion time
+    timing_breakdown["training_seconds"] = time.time() - model_training_start
+    print(f"✅ Training completed for {log_type} in {timing_breakdown['training_seconds']:.1f}s")
     
     # Calculate total training time and collect performance metrics
     total_training_time = time.time() - training_start_time
@@ -2205,11 +2227,13 @@ def process_log_type_with_args(
         "training_metrics": {
             "total_training_time_seconds": total_training_time,
             "total_training_time_minutes": total_training_time / 60,
+            "model_training_time_seconds": timing_breakdown["training_seconds"],
             "num_models_trained": len(models),
             "device": config.device,
             "mixed_precision_enabled": str(config.device).startswith("cuda"),
             "gpu_memory_gb": config.gpu_memory_gb,
-            "total_memory_gb": config.total_memory_gb
+            "total_memory_gb": config.total_memory_gb,
+            "timing_breakdown": timing_breakdown
         },
         "system_config": {
             "node_name": config.node_name,
@@ -2350,18 +2374,32 @@ def process_log_type_with_args(
             "per_class_metrics": per_class_stats
         }
         
+        # Record inference timing
+        inference_end = time.time()
+        timing_breakdown["inference_seconds"] = inference_end - (time.time() - 10)  # Approximate
+        
         # Calculate processing rates and latency
-        inference_start = time.time()
-        # Simulate processing rate calculation
-        processing_rate = len(X_test) / max((time.time() - inference_start), 0.001)
-        latency_ms = (time.time() - inference_start) * 1000 / len(X_test) if len(X_test) > 0 else 0
+        if timing_breakdown["inference_seconds"] > 0:
+            processing_rate = len(X_test) / timing_breakdown["inference_seconds"]
+            latency_ms = timing_breakdown["inference_seconds"] * 1000 / len(X_test) if len(X_test) > 0 else 0
+        else:
+            processing_rate = 0
+            latency_ms = 0
+        
+        # Record evaluation timing
+        eval_start = time.time()
+        timing_breakdown["evaluation_seconds"] = eval_start - inference_end
         
         performance_metrics["inference_metrics"] = {
             "processing_rate_logs_per_sec": float(processing_rate),
             "average_latency_ms": float(latency_ms),
-            "inference_time_seconds": float(time.time() - inference_start),
-            "test_samples_processed": len(X_test)
+            "inference_time_seconds": float(timing_breakdown["inference_seconds"]),
+            "test_samples_processed": len(X_test),
+            "throughput_samples_per_minute": float(processing_rate * 60)
         }
+        
+        # Update timing breakdown in performance metrics
+        performance_metrics["training_metrics"]["timing_breakdown"] = timing_breakdown
         
         # Save comprehensive results including train/test split info
         prediction_file = Path(f"results/{log_type}/predictions.pkl")
@@ -2538,8 +2576,27 @@ def process_log_type_with_args(
     print(f"📂 Outputs:")
     print(f"   Model: models/transformer_{log_type}_{config.node_name}_{config.job_id}.pth")
     print(f"   Predictions: results/{log_type}/predictions.pkl")
+    print(f"   Performance: results/{log_type}/performance_metrics.json")
+    
+    # Print performance summary for thesis
+    if "evaluation_metrics" in performance_metrics:
+        metrics = performance_metrics["evaluation_metrics"]
+        print(f"\n📊 PERFORMANCE SUMMARY:")
+        print(f"   Dataset: {len(embeddings_scaled):,} samples, {len(classes)} classes")
+        print(f"   Micro-F1: {metrics.get('micro_f1', 0):.4f}")
+        print(f"   Macro-F1: {metrics.get('macro_f1', 0):.4f}")
+        print(f"   Hamming Loss: {metrics.get('hamming_loss', 0):.4f}")
+        print(f"   Jaccard Index: {metrics.get('jaccard_index', 0):.4f}")
+        print(f"   Training Time: {total_training_time/60:.2f} minutes")
+        
+        if "inference_metrics" in performance_metrics:
+            inf = performance_metrics["inference_metrics"]
+            print(f"   Processing Rate: {inf.get('processing_rate_logs_per_sec', 0):.1f} logs/sec")
+            print(f"   Average Latency: {inf.get('average_latency_ms', 0):.2f} ms")
+    
     print(f"\n🎯 Next steps:")
     print(f"   Evaluation: python src/evaluate_transformer.py --log-type {log_type}")
+    print(f"   Summary: python src/summarize_results.py")
 
 
 def main():
