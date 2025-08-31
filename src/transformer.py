@@ -123,56 +123,39 @@ def load_logbert_embeddings():
     if not embeddings_dir.exists():
         raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
     
-    embeddings, labels = {}, {}
-    skipped_files = []
+    embeddings, labels, skipped = {}, {}, []
+    
+    def safe_load(path):
+        try:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        except (EOFError, pickle.PickleError, Exception) as e:
+            print(f"✗ {path.name}: {e}")
+            return None
     
     for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
         log_type = embed_dir.name
         log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
         
         if not (log_pkl.exists() and label_pkl.exists()):
-            print(f"Warning: Missing files for {log_type}")
             continue
             
-        try:
-            # Check file integrity by attempting to load
-            print(f"Loading {log_type}...")
-            
-            # Load log embeddings with error handling
-            with open(log_pkl, 'rb') as f:
-                try:
-                    embeddings[log_type] = pickle.load(f)
-                except (EOFError, pickle.PickleError, Exception) as e:
-                    print(f"Error loading {log_pkl}: {e}")
-                    skipped_files.append(f"{log_type}_log")
-                    continue
-            
-            # Load labels with error handling
-            with open(label_pkl, 'rb') as f:
-                try:
-                    labels[log_type] = pickle.load(f)
-                except (EOFError, pickle.PickleError, Exception) as e:
-                    print(f"Error loading {label_pkl}: {e}")
-                    # Remove the embeddings too since we can't use them without labels
-                    if log_type in embeddings:
-                        del embeddings[log_type]
-                    skipped_files.append(f"{log_type}_label")
-                    continue
-                    
-            print(f"Successfully loaded {log_type}")
-            
-        except Exception as e:
-            print(f"Unexpected error loading {log_type}: {e}")
-            skipped_files.append(log_type)
-            continue
-    
-    if skipped_files:
-        print(f"Warning: Skipped corrupted files: {', '.join(skipped_files)}")
+        print(f"Loading {log_type}...", end=" ")
+        
+        log_data = safe_load(log_pkl)
+        label_data = safe_load(label_pkl)
+        
+        if log_data is not None and label_data is not None:
+            embeddings[log_type] = log_data
+            labels[log_type] = label_data
+            print("✓")
+        else:
+            skipped.append(log_type)
     
     if not embeddings:
-        raise ValueError("No valid embeddings could be loaded. All pickle files appear to be corrupted.")
+        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
     
-    print(f"Loaded LogBERT embeddings for {len(embeddings)} log types")
+    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
     return embeddings, labels
 
 def flatten_hierarchy(h, parent=None):
@@ -302,13 +285,28 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
 
-        N = Yb.shape[0]
-        normal = int((Yb.sum(1) == 0).sum().item())
-        print("\nClass distribution after SMOTE/undersample:")
-        print(f"- normal: {normal} ({100.0*normal/N:.2f}%)")
+        # Show distribution changes
+        N_orig, N_new = Y.shape[0], Yb.shape[0]
+        normal_orig = int((Y.sum(1) == 0).sum().item())
+        normal_new = int((Yb.sum(1) == 0).sum().item())
+        
+        print(f"\nClass distribution ({N_orig} → {N_new} samples):")
+        print(f"{'Class':<20} {'Original':<15} {'After SMOTE':<15} {'Change'}")
+        print("-" * 65)
+        
+        # Normal samples
+        change = normal_new - normal_orig
+        sign = "++" if change > 0 else "--" if change < 0 else "  "
+        print(f"{'normal':<20} {normal_orig:>6} ({100.0*normal_orig/N_orig:>5.1f}%) {normal_new:>6} ({100.0*normal_new/N_new:>5.1f}%) {sign}{abs(change)}")
+        
+        # Attack classes (only show non-zero)
         for j, name in enumerate(label_names):
-            cnt = int(Yb[:, j].sum().item()); pct = 100.0 * cnt / N
-            print(f"- {name}: {cnt} ({pct:.2f}%)")
+            cnt_orig = int(Y[:, j].sum().item())
+            cnt_new = int(Yb[:, j].sum().item())
+            if cnt_orig > 0 or cnt_new > 0:  # Only show classes that exist
+                change = cnt_new - cnt_orig
+                sign = "++" if change > 0 else "--" if change < 0 else "  "
+                print(f"{name:<20} {cnt_orig:>6} ({100.0*cnt_orig/N_orig:>5.1f}%) {cnt_new:>6} ({100.0*cnt_new/N_new:>5.1f}%) {sign}{abs(change)}")
 
     # Train
     best_val_loss = float('inf')
@@ -324,7 +322,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
             attn = attn.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with torch.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                 recon_loss = mse_loss(recon, feats)
@@ -359,7 +357,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 max_pooling = max_pooling.to(device, non_blocking=True)
                 attn = attn.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                     recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                     recon_loss = mse_loss(recon, feats)
