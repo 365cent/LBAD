@@ -511,7 +511,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         
         # Progress checkpoints every 5% [[memory:4887036]]
         if (epoch + 1) % max(1, epochs // 20) == 0:
-            spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}"
+            spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
