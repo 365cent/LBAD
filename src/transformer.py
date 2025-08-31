@@ -240,31 +240,41 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
     use_amp = device.type in ["cuda", "mps"]  # Enable for M2
     scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
-    # Feature-aware SMOTE with majority downsampling
+    # Load ALL training data for SMOTE processing
     with torch.no_grad():
         Xc, Xm, Xmx, Xa, Y = [], [], [], [], []
         for c, m, x, a, t in train_loader:
             Xc.append(c.cpu()); Xm.append(m.cpu()); Xmx.append(x.cpu()); Xa.append(a.cpu()); Y.append(t.cpu())
         Xc = torch.cat(Xc); Xm = torch.cat(Xm); Xmx = torch.cat(Xmx); Xa = torch.cat(Xa); Y = torch.cat(Y)
         
-        # Use mean & max pooling for feature-aware sampling (more semantic)
-        F_semantic = torch.cat([Xm, Xmx], dim=1)  # Focus on semantic features
-        F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
-        n, L = Y.shape
-        counts = Y.sum(0)
-        
-        # Extreme rebalancing for 98% anomaly data
+        # Show actual training data loaded into SMOTE
+        n_total = Y.shape[0]
         normal_count = int((Y.sum(1) == 0).sum().item())
+        anomaly_count = n_total - normal_count
+        print(f"SMOTE input: {n_total:,} samples ({normal_count:,} normal, {anomaly_count:,} anomalies)")
+        
+        # Show per-class counts in actual training data
+        node_names = list(flatten_hierarchy(hierarchy))
+        print("Actual training classes:", end=" ")
+        for j, name in enumerate(node_names):
+            if j < Y.shape[1]:
+                cnt = int(Y[:, j].sum().item())
+                if cnt > 0:
+                    print(f"{name}:{cnt}", end=" ")
+        print()
+        
+        # SMOTE processing
+        F_semantic = torch.cat([Xm, Xmx], dim=1)
+        F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
+        counts = Y.sum(0)
         max_count = int(counts.max().item())
         
-        # Cap majority at 5% of current size for extreme rebalancing
+        # Rebalancing parameters
         downsample_cap = max(max_count // 20, 500)
-        oversample_target = max(normal_count * 10, 2000)  # 10x normal samples
-        
-        # Silent rebalancing for clean output
+        oversample_target = max(normal_count * 10, 2000)
         
         # Aggressive downsampling
-        keep = torch.ones(n, dtype=torch.bool)
+        keep = torch.ones(n_total, dtype=torch.bool)
         g = torch.Generator().manual_seed(42)
         
         for j in range(L):
@@ -313,19 +323,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
 
-        # Show original training data distribution (before SMOTE)
-        N_orig = Y.shape[0]
-        normal_orig = int((Y.sum(1) == 0).sum().item())
-        
-        print(f"Training data: {normal_orig} normal ({100.0*normal_orig/N_orig:.1f}%), {N_orig-normal_orig} anomalies ({100.0*(N_orig-normal_orig)/N_orig:.1f}%)")
-        
-        # Show per-class counts in training data
-        print("Training classes:", end=" ")
-        for j, name in enumerate(label_names):
-            cnt = int(Y[:, j].sum().item())
-            if cnt > 0:
-                print(f"{name}:{cnt}", end=" ")
-        print()
+        # Clean output - training data already shown above
         
         # Compute class weights for loss
         pos_weights = []
