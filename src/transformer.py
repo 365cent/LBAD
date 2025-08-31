@@ -221,7 +221,9 @@ def load_datasets(embeddings, labels, batch_size=128):
         
         # Show per-class distribution
         node_names = list(flatten_hierarchy(hierarchy))
+        normal_count = total - anomalies
         print("Per-class distribution:")
+        print(f"  normal: {normal_count} ({normal_count/total:.2%})")
         for i, name in enumerate(node_names):
             if i < targets.shape[1]:
                 count = int(targets[:, i].sum())
@@ -251,21 +253,12 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         n_total = Y.shape[0]
         normal_count = int((Y.sum(1) == 0).sum().item())
         anomaly_count = n_total - normal_count
-        print(f"SMOTE input: {n_total:,} samples ({normal_count:,} normal, {anomaly_count:,} anomalies)")
-        
-        # Show per-class counts in actual training data
-        node_names = list(flatten_hierarchy(hierarchy))
-        print("Actual training classes:", end=" ")
-        for j, name in enumerate(node_names):
-            if j < Y.shape[1]:
-                cnt = int(Y[:, j].sum().item())
-                if cnt > 0:
-                    print(f"{name}:{cnt}", end=" ")
-        print()
+        # Clean SMOTE processing (data already shown above)
         
         # SMOTE processing
         F_semantic = torch.cat([Xm, Xmx], dim=1)
         F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
+        L = Y.shape[1]
         counts = Y.sum(0)
         max_count = int(counts.max().item())
         
@@ -517,8 +510,6 @@ def main():
         # Get indices for normal and anomaly samples
         normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
         anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
-        
-        print(f"Dataset: {len(normal_idx)} normal ({len(normal_idx)/len(dataset):.1%}), {len(anomaly_idx)} anomalies ({len(anomaly_idx)/len(dataset):.1%})")
         
         # Stratified sampling
         def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
