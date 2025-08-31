@@ -261,8 +261,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         downsample_cap = max(max_count // 20, 500)
         oversample_target = max(normal_count * 10, 2000)  # 10x normal samples
         
-        print(f"Rebalancing: normal={normal_count}, max_class={max_count}")
-        print(f"Targets: downsample to {downsample_cap}, oversample to {oversample_target}")
+        # Silent rebalancing for clean output
         
         # Aggressive downsampling
         keep = torch.ones(n, dtype=torch.bool)
@@ -314,34 +313,25 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
 
-        # Show training split distribution changes  
-        N_train, N_new = Y.shape[0], Yb.shape[0]
-        normal_train = int((Y.sum(1) == 0).sum().item())
-        normal_new = int((Yb.sum(1) == 0).sum().item())
+        # Show original training data distribution (before SMOTE)
+        N_orig = Y.shape[0]
+        normal_orig = int((Y.sum(1) == 0).sum().item())
         
-        print(f"\nTraining split rebalancing ({N_train} → {N_new} samples):")
-        print(f"{'Class':<20} {'Train Split':<12} {'After SMOTE':<12} {'Change'}")
-        print("-" * 55)
+        print(f"Training data: {normal_orig} normal ({100.0*normal_orig/N_orig:.1f}%), {N_orig-normal_orig} anomalies ({100.0*(N_orig-normal_orig)/N_orig:.1f}%)")
         
-        # Normal samples
-        change = normal_new - normal_train
-        sign = "++" if change > 0 else "--" if change < 0 else "  "
-        print(f"{'normal':<20} {normal_train:>5} ({100.0*normal_train/N_train:>4.1f}%) {normal_new:>5} ({100.0*normal_new/N_new:>4.1f}%) {sign}{abs(change)}")
-        
-        # Attack classes and compute class weights
-        pos_weights = []
+        # Show per-class counts in training data
+        print("Training classes:", end=" ")
         for j, name in enumerate(label_names):
-            cnt_train = int(Y[:, j].sum().item())
-            cnt_new = int(Yb[:, j].sum().item())
-            if cnt_train > 0 or cnt_new > 0:
-                change = cnt_new - cnt_train
-                sign = "++" if change > 0 else "--" if change < 0 else "  "
-                print(f"{name:<20} {cnt_train:>5} ({100.0*cnt_train/N_train:>4.1f}%) {cnt_new:>5} ({100.0*cnt_new/N_new:>4.1f}%) {sign}{abs(change)}")
-            
-            # Balanced weights
-            pos_count = max(cnt_new, 1)
-            neg_count = max(N_new - pos_count, 1)
-            pos_weight = min(neg_count / pos_count, 50.0)
+            cnt = int(Y[:, j].sum().item())
+            if cnt > 0:
+                print(f"{name}:{cnt}", end=" ")
+        print()
+        
+        # Compute class weights for loss
+        pos_weights = []
+        for j in range(len(label_names)):
+            cnt = max(int(Yb[:, j].sum().item()), 1)
+            pos_weight = min(Yb.shape[0] / (2 * cnt), 50.0)
             pos_weights.append(pos_weight)
         
         bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weights, device=device))
