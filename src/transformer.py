@@ -305,6 +305,10 @@ def smote_data(train_loader, val_loader):
                 clusters = 25
 
             try:
+                # Only apply SMOTE to small classes - skip if already high count
+                if len(pos_idx) > 1000:  # Skip classes that are already well-represented
+                    continue
+                    
                 smote = KMeansSMOTE(
                     sampling_strategy=ratio,
                     k_neighbors=k_neighbors,
