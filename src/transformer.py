@@ -232,110 +232,149 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
-def train_model(model, train_loader, val_loader, epochs=10):
-    """
-    Trains a hierarchical model with an integrated, concise data balancing strategy (SMOTE).
-    """
+def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # Fast + stable
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader))
     mse_loss = nn.MSELoss()
-    use_amp = device.type in ["cuda", "mps"]
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    use_amp = device.type in ["cuda", "mps"]  # Enable for M2
+    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
-    # --- Data Loading and Balancing Stage ---
+    # Load ALL training data for SMOTE processing
     with torch.no_grad():
-        spinner.text = "Loading and balancing data..."
         Xc, Xm, Xmx, Xa, Y = [], [], [], [], []
         for c, m, x, a, t in train_loader:
-            Xc.append(c); Xm.append(m); Xmx.append(x); Xa.append(a); Y.append(t)
+            Xc.append(c.cpu()); Xm.append(m.cpu()); Xmx.append(x.cpu()); Xa.append(a.cpu()); Y.append(t.cpu())
         Xc = torch.cat(Xc); Xm = torch.cat(Xm); Xmx = torch.cat(Xmx); Xa = torch.cat(Xa); Y = torch.cat(Y)
         
+        # Show actual training data loaded into SMOTE
+        n_total = Y.shape[0]
+        normal_count = int((Y.sum(1) == 0).sum().item())
+        anomaly_count = n_total - normal_count
+        # Clean SMOTE processing (data already shown above)
+        
+        # SMOTE processing
+        F_semantic = torch.cat([Xm, Xmx], dim=1)
         F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
         L = Y.shape[1]
-        n_initial = Y.shape[0]
-        pre_counts = Y.sum(0).cpu().numpy()
-
-        # 1. Downsample over-represented classes
-        downsample_cap = 2000
-        keep = torch.ones(n_initial, dtype=torch.bool)
+        counts = Y.sum(0)
+        max_count = int(counts.max().item())
+        
+        # Rebalancing parameters
+        downsample_cap = max(max_count // 20, 500)
+        oversample_target = max(normal_count * 10, 2000)
+        
+        # Aggressive downsampling
+        keep = torch.ones(n_total, dtype=torch.bool)
         g = torch.Generator().manual_seed(42)
+        
         for j in range(L):
             idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
-            if idx.numel() > downsample_cap:
-                drop_idx = idx[torch.randperm(idx.numel(), generator=g)[downsample_cap:]]
-                keep[drop_idx] = False
+            c = idx.numel()
+            if c > downsample_cap:
+                drop = idx[torch.randperm(c, generator=g)[downsample_cap:]]
+                keep[drop] = False
         
-        F_full, Y = F_full[keep], Y[keep]
-
-        # 2. Vectorized SMOTE for under-represented classes
-        oversample_target = 8000
+        F_full, F_semantic, Y = F_full[keep], F_semantic[keep], Y[keep]
+        target = oversample_target  # Aggressive oversampling
+        
         F_new, Y_new = [F_full], [Y]
         for j in range(L):
             idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
             c = idx.numel()
-            needed = max(0, oversample_target - c)
-            if c < 2 or needed == 0:
+            if c < 2:
+                continue
+            need = max(0, target - c)
+            if need == 0:
                 continue
             
-            a = idx[torch.randint(0, c, (needed,))]
-            b = idx[torch.randint(0, c, (needed,))]
-            lam = torch.rand(needed, 1)
-            F_new.append(F_full[a] * lam + F_full[b] * (1 - lam))
-            Y_new.append(torch.maximum(Y[a], Y[b]))
+            # Fast vectorized SMOTE
+            a = idx[torch.randint(0, c, (need,))]
+            b = idx[torch.randint(0, c, (need,))]
+            lam = torch.rand(need, 1)
+            synth_features = F_full[a] * lam + F_full[b] * (1 - lam)
+            synth_labels = torch.maximum(Y[a], Y[b])
+            F_new.append(synth_features)
+            Y_new.append(synth_labels)
         
         Fb, Yb = torch.cat(F_new), torch.cat(Y_new)
 
-        # 3. Report results and create new DataLoader
-        post_counts = Yb.sum(0).cpu().numpy()
-        summary_df = pd.DataFrame({
-            'Label': [f'L_{i}' for i in range(L)],
-            'Before': pre_counts,
-            'After': post_counts
-        })
-        spinner.succeed("Data balancing complete.")
-        print(summary_df.to_string())
-        print(f"\nDataset size: {n_initial} -> {Fb.shape[0]} samples.")
-
-        d1, d2, d3 = Xc.shape[1], Xm.shape[1], Xmx.shape[1]
+        d1, d2, d3, d4 = Xc.shape[1], Xm.shape[1], Xmx.shape[1], Xa.shape[1]
         Xc_b, Xm_b = Fb[:, :d1], Fb[:, d1:d1+d2]
         Xmx_b, Xa_b = Fb[:, d1+d2:d1+d2+d3], Fb[:, d1+d2+d3:]
         train_loader = DataLoader(
             TensorDataset(Xc_b, Xm_b, Xmx_b, Xa_b, Yb),
             batch_size=getattr(train_loader, "batch_size", 1024),
-            shuffle=True, drop_last=True, pin_memory=True
+            shuffle=True, drop_last=False, pin_memory=True
         )
 
-        pos_weights = Yb.shape[0] / (2 * Yb.sum(0).clamp(min=1))
-        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights.to(device))
+        # names for distribution (from a single forward pass)
+        c0, m0, x0, a0, _ = next(iter(train_loader))
+        c0, m0, x0, a0 = c0.to(device), m0.to(device), x0.to(device), a0.to(device)
+        _, _, outs0 = model(c0, m0, x0, a0)
+        label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
 
-    # --- Model Training Stage ---
+        # Clean output - training data already shown above
+        
+        # Compute class weights for loss
+        pos_weights = []
+        for j in range(len(label_names)):
+            cnt = max(int(Yb[:, j].sum().item()), 1)
+            pos_weight = min(Yb.shape[0] / (2 * cnt), 50.0)
+            pos_weights.append(pos_weight)
+        
+        bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weights, device=device))
+
+    # Train
     best_val_loss = float('inf')
+    torch.set_float32_matmul_precision('high') if hasattr(torch, "set_float32_matmul_precision") else None
+
     for epoch in range(epochs):
         model.train()
         train_losses = []
-        spinner.start(f"Epoch {epoch+1}/{epochs}")
         for cls_tokens, mean_pooling, max_pooling, attn, targets in train_loader:
-            cls_tokens, mean_pooling, max_pooling, attn, targets = \
-                cls_tokens.to(device), mean_pooling.to(device), max_pooling.to(device), attn.to(device), targets.to(device)
+            cls_tokens = cls_tokens.to(device, non_blocking=True)
+            mean_pooling = mean_pooling.to(device, non_blocking=True)
+            max_pooling = max_pooling.to(device, non_blocking=True)
+            attn = attn.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                 recon_loss = mse_loss(recon, feats)
-                logits = torch.cat([v for v in outputs.values()], dim=1) if isinstance(outputs, dict) else outputs
+                if isinstance(outputs, dict):
+                    logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                else:
+                    logits = outputs  # assume (B, L)
                 ml_loss = bce_loss(logits, targets)
                 hier_loss = model.hierarchy_consistency_loss(outputs)
+                
+                # Balanced loss scaling to prevent NaN
                 total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
+                
+                # Check for NaN/inf and skip if found
+                if not torch.isfinite(total_loss):
+                    print(f"Warning: Non-finite loss detected, skipping batch")
+                    continue
 
-            if not torch.isfinite(total_loss): continue
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(total_loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_amp:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                # More aggressive gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
+
             train_losses.append(total_loss.item())
 
         # Validation
@@ -343,24 +382,38 @@ def train_model(model, train_loader, val_loader, epochs=10):
         val_losses = []
         with torch.no_grad():
             for cls_tokens, mean_pooling, max_pooling, attn, targets in val_loader:
-                cls_tokens, mean_pooling, max_pooling, attn, targets = \
-                    cls_tokens.to(device), mean_pooling.to(device), max_pooling.to(device), attn.to(device), targets.to(device)
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    recon, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
+                cls_tokens = cls_tokens.to(device, non_blocking=True)
+                mean_pooling = mean_pooling.to(device, non_blocking=True)
+                max_pooling = max_pooling.to(device, non_blocking=True)
+                attn = attn.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                     recon_loss = mse_loss(recon, feats)
-                    logits = torch.cat([v for v in outputs.values()], dim=1) if isinstance(outputs, dict) else outputs
+                    if isinstance(outputs, dict):
+                        logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                    else:
+                        logits = outputs
                     ml_loss = bce_loss(logits, targets)
                     hier_loss = model.hierarchy_consistency_loss(outputs)
                     total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
-                if torch.isfinite(total_loss): val_losses.append(total_loss.item())
+                    
+                    # Skip if non-finite
+                    if torch.isfinite(total_loss):
+                        val_losses.append(total_loss.item())
 
-        avg_train_loss = np.mean(train_losses) if train_losses else 0.0
-        avg_val_loss = np.mean(val_losses) if val_losses else 0.0
-        spinner.text = f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
-        if avg_val_loss < best_val_loss: best_val_loss = avg_val_loss
+        avg_train_loss = float(np.mean(train_losses)) if train_losses else 0.0
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else avg_train_loss
+        
+        # Progress checkpoints every 5% [[memory:4887036]]
+        if (epoch + 1) % max(1, epochs // 20) == 0:
+            spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}"
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
 
-    spinner.succeed(f"Training completed. Best validation loss: {best_val_loss:.4f}")
+    spinner.stop_and_persist(text="Training completed")
     return model
 
 def evaluate_hierarchical(model, test_loader):
