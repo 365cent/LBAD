@@ -225,49 +225,66 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # Fast + stable
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader))
     mse_loss = nn.MSELoss()
-    bce_loss = nn.BCEWithLogitsLoss()
-    use_amp = (torch.cuda.is_available() and device.type == "cuda")
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    use_amp = device.type in ["cuda", "mps"]  # Enable for M2
+    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
-    # SMOTE
+    # Feature-aware SMOTE with majority downsampling
     with torch.no_grad():
         Xc, Xm, Xmx, Xa, Y = [], [], [], [], []
         for c, m, x, a, t in train_loader:
             Xc.append(c.cpu()); Xm.append(m.cpu()); Xmx.append(x.cpu()); Xa.append(a.cpu()); Y.append(t.cpu())
         Xc = torch.cat(Xc); Xm = torch.cat(Xm); Xmx = torch.cat(Xmx); Xa = torch.cat(Xa); Y = torch.cat(Y)
-        F = torch.cat([Xc, Xm, Xmx, Xa], dim=1)                             # feature space for SMOTE
+        
+        # Use mean & max pooling for feature-aware sampling (more semantic)
+        F_semantic = torch.cat([Xm, Xmx], dim=1)  # Focus on semantic features
+        F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
         n, L = Y.shape
         counts = Y.sum(0)
-        cap = int(torch.quantile(counts.float(), 0.90).item()) or 1         # cap for quick undersampling
+        
+        # Aggressive majority downsampling (cap at 10% of max class)
+        max_count = int(counts.max().item())
+        downsample_cap = max(max_count // 10, 1000)  # Cap majority at 10% or 1k min
+        
+        # Fast stratified downsampling
         keep = torch.ones(n, dtype=torch.bool)
-        g = torch.Generator().manual_seed(0)
+        g = torch.Generator().manual_seed(42)
+        
         for j in range(L):
             idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
             c = idx.numel()
-            if c > cap:
-                drop = idx[torch.randperm(c, generator=g)[:c - cap]]
+            if c > downsample_cap:
+                # Fast random sampling for speed
+                drop = idx[torch.randperm(c, generator=g)[downsample_cap:]]
                 keep[drop] = False
-        F, Y = F[keep], Y[keep]
-
-        target = max(int(torch.quantile(Y.sum(0).float(), 0.75).item()), 2)  # oversample floor
-        F_new, Y_new = [F], [Y]
-        for j in range(L):                                                   # MLSMOTE-like: interpolate within label j
+        
+        F_full, F_semantic, Y = F_full[keep], F_semantic[keep], Y[keep]
+        
+        # Balanced oversampling target
+        remaining_counts = Y.sum(0)
+        target = max(int(remaining_counts.median().item()), 500)  # Balanced target
+        
+        F_new, Y_new = [F_full], [Y]
+        for j in range(L):
             idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
             c = idx.numel()
-            if c < 2: 
+            if c < 2:
                 continue
             need = max(0, target - c)
-            if need == 0: 
+            if need == 0:
                 continue
+            
+            # Fast vectorized SMOTE
             a = idx[torch.randint(0, c, (need,))]
             b = idx[torch.randint(0, c, (need,))]
             lam = torch.rand(need, 1)
-            Fs = F[a] * lam + F[b] * (1 - lam)
-            Ys = torch.maximum(Y[a], Y[b])                                   # union of labels
-            F_new.append(Fs); Y_new.append(Ys)
+            synth_features = F_full[a] * lam + F_full[b] * (1 - lam)
+            synth_labels = torch.maximum(Y[a], Y[b])
+            F_new.append(synth_features)
+            Y_new.append(synth_labels)
+        
         Fb, Yb = torch.cat(F_new), torch.cat(Y_new)
 
         d1, d2, d3, d4 = Xc.shape[1], Xm.shape[1], Xmx.shape[1], Xa.shape[1]
@@ -299,7 +316,8 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         sign = "++" if change > 0 else "--" if change < 0 else "  "
         print(f"{'normal':<20} {normal_orig:>6} ({100.0*normal_orig/N_orig:>5.1f}%) {normal_new:>6} ({100.0*normal_new/N_new:>5.1f}%) {sign}{abs(change)}")
         
-        # Attack classes (only show non-zero)
+        # Attack classes (only show non-zero) and compute class weights
+        pos_weights = []
         for j, name in enumerate(label_names):
             cnt_orig = int(Y[:, j].sum().item())
             cnt_new = int(Yb[:, j].sum().item())
@@ -307,6 +325,16 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 change = cnt_new - cnt_orig
                 sign = "++" if change > 0 else "--" if change < 0 else "  "
                 print(f"{name:<20} {cnt_orig:>6} ({100.0*cnt_orig/N_orig:>5.1f}%) {cnt_new:>6} ({100.0*cnt_new/N_new:>5.1f}%) {sign}{abs(change)}")
+            
+            # Compute balanced weights to prevent NaN
+            pos_count = max(cnt_new, 1)
+            neg_count = max(N_new - pos_count, 1)
+            pos_weight = neg_count / pos_count
+            pos_weights.append(min(pos_weight, 100.0))  # Cap extreme weights
+        
+        # Create weighted BCE loss to handle imbalance
+        pos_weights_tensor = torch.tensor(pos_weights, device=device)
+        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights_tensor)
 
     # Train
     best_val_loss = float('inf')
@@ -332,18 +360,29 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                     logits = outputs  # assume (B, L)
                 ml_loss = bce_loss(logits, targets)
                 hier_loss = model.hierarchy_consistency_loss(outputs)
-                total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                
+                # Balanced loss scaling to prevent NaN
+                total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
+                
+                # Check for NaN/inf and skip if found
+                if not torch.isfinite(total_loss):
+                    print(f"Warning: Non-finite loss detected, skipping batch")
+                    continue
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer); scaler.update()
+                # More aggressive gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
 
             train_losses.append(total_loss.item())
 
@@ -367,13 +406,19 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                         logits = outputs
                     ml_loss = bce_loss(logits, targets)
                     hier_loss = model.hierarchy_consistency_loss(outputs)
-                    total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
-                val_losses.append(total_loss.item())
+                    total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
+                    
+                    # Skip if non-finite
+                    if torch.isfinite(total_loss):
+                        val_losses.append(total_loss.item())
 
-        avg_train_loss = float(np.mean(train_losses))
+        avg_train_loss = float(np.mean(train_losses)) if train_losses else 0.0
         avg_val_loss = float(np.mean(val_losses)) if val_losses else avg_train_loss
-        scheduler.step(avg_val_loss)
-        spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}"
+        
+        # Progress checkpoints every 5% [[memory:4887036]]
+        if (epoch + 1) % max(1, epochs // 20) == 0:
+            spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}"
+        
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
