@@ -11,11 +11,9 @@ import halo
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Optimize for M2 GPU if available
 if device.type == "mps":
-    # Enable optimized memory format for MPS
     torch.backends.mps.allow_tf32 = True
-    print("Enabled MPS optimizations for M2 GPU")
+    print("Enabled MPS optimizations for Silicon GPU")
 
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
@@ -31,16 +29,13 @@ class HierarchicalTransformer(nn.Module):
         self.cls_proj, self.mean_proj = nn.Linear(768, hidden_dim), nn.Linear(768, hidden_dim)
         self.max_proj, self.attn_proj = nn.Linear(768, hidden_dim), nn.Linear(10, hidden_dim)
 
-        # encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # bottleneck & decoder
         self.bottleneck = nn.Linear(hidden_dim, hidden_dim // 2)
         self.decoder = nn.Sequential(nn.Linear(hidden_dim // 2, hidden_dim), nn.ReLU(),
                                      nn.Linear(hidden_dim, 2314))
 
-        # hierarchical heads and parent-child mappings
         self.heads = nn.ModuleDict()
         self.parent_child_map = {}
         self.node_to_index = {}
@@ -86,22 +81,30 @@ class HierarchicalTransformer(nn.Module):
         recon = self.decoder(z)
         
         # compute logits (not sigmoid yet for BCEWithLogitsLoss)
-        outputs = {name: head(z) for name, head in self.heads.items()}
+        outputs = {name: torch.clamp(head(z), -10.0, 10.0) for name, head in self.heads.items()}
         return recon, z, outputs
 
     def hierarchy_consistency_loss(self, outputs):
         """Penalty if child probability > parent probability"""
-        consistency_loss = 0.0
+        consistency_loss = torch.tensor(0.0, device=next(iter(outputs.values())).device)
+        count = 0
+
         for parent, children in self.parent_child_map.items():
             if parent in outputs:
-                parent_prob = torch.sigmoid(outputs[parent])
+                # Clamp logits before sigmoid for numerical stability
+                parent_logits = torch.clamp(outputs[parent], -10.0, 10.0)
+                parent_prob = torch.sigmoid(parent_logits)
+
                 for child in children:
                     if child in outputs:
-                        child_prob = torch.sigmoid(outputs[child])
-                        # penalize when child > parent
+                        child_logits = torch.clamp(outputs[child], -10.0, 10.0)
+                        child_prob = torch.sigmoid(child_logits)
                         violation = F.relu(child_prob - parent_prob)
                         consistency_loss += violation.mean()
-        return consistency_loss
+                        count += 1
+
+        # Return average if we have any violations, otherwise return 0
+        return consistency_loss / max(count, 1)
 
     def propagate_labels(self, outputs):
         """Propagate active parent labels to children"""
@@ -109,7 +112,6 @@ class HierarchicalTransformer(nn.Module):
         for name, logits in outputs.items():
             propagated[name] = torch.sigmoid(logits)
         
-        # if parent active, activate children
         for parent, children in self.parent_child_map.items():
             if parent in propagated:
                 parent_active = (propagated[parent] > 0.5).float()
@@ -195,7 +197,6 @@ def load_datasets(embeddings, labels, batch_size=128):
         cls_tokens, mean_pooling = log_vectors[:, :768], log_vectors[:, 768:1536]
         max_pooling, attn = log_vectors[:, 1536:2304], log_vectors[:, 2304:]
         
-        # create multi-label targets
         if log_type in labels:
             targets = create_multilabel_targets(labels[log_type], hierarchy)
         else:
@@ -219,7 +220,6 @@ def load_datasets(embeddings, labels, batch_size=128):
         anomalies = (targets.sum(axis=1) > 0).sum()
         print(f"[{log_type}] {total} samples | anomalies: {anomalies} ({anomalies/total:.2%})")
         
-        # Show per-class distribution
         node_names = list(flatten_hierarchy(hierarchy))
         normal_count = total - anomalies
         print("Per-class distribution:")
@@ -236,98 +236,59 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # Fast + stable
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # More stable learning rate
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train_loader))
     mse_loss = nn.MSELoss()
     use_amp = device.type in ["cuda", "mps"]  # Enable for M2
     scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
-    # Load ALL training data for SMOTE processing
+    # Get label names and compute class weights from original training data
     with torch.no_grad():
-        Xc, Xm, Xmx, Xa, Y = [], [], [], [], []
-        for c, m, x, a, t in train_loader:
-            Xc.append(c.cpu()); Xm.append(m.cpu()); Xmx.append(x.cpu()); Xa.append(a.cpu()); Y.append(t.cpu())
-        Xc = torch.cat(Xc); Xm = torch.cat(Xm); Xmx = torch.cat(Xmx); Xa = torch.cat(Xa); Y = torch.cat(Y)
-        
-        # Show actual training data loaded into SMOTE
-        n_total = Y.shape[0]
-        normal_count = int((Y.sum(1) == 0).sum().item())
-        anomaly_count = n_total - normal_count
-        # Clean SMOTE processing (data already shown above)
-        
-        # SMOTE processing
-        F_semantic = torch.cat([Xm, Xmx], dim=1)
-        F_full = torch.cat([Xc, Xm, Xmx, Xa], dim=1)
-        L = Y.shape[1]
-        counts = Y.sum(0)
-        max_count = int(counts.max().item())
-        
-        # Rebalancing parameters
-        downsample_cap = max(max_count // 20, 500)
-        oversample_target = max(normal_count * 10, 2000)
-        
-        # Aggressive downsampling
-        keep = torch.ones(n_total, dtype=torch.bool)
-        g = torch.Generator().manual_seed(42)
-        
-        for j in range(L):
-            idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
-            c = idx.numel()
-            if c > downsample_cap:
-                drop = idx[torch.randperm(c, generator=g)[downsample_cap:]]
-                keep[drop] = False
-        
-        F_full, F_semantic, Y = F_full[keep], F_semantic[keep], Y[keep]
-        target = oversample_target  # Aggressive oversampling
-        
-        F_new, Y_new = [F_full], [Y]
-        for j in range(L):
-            idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
-            c = idx.numel()
-            if c < 2:
-                continue
-            need = max(0, target - c)
-            if need == 0:
-                continue
-            
-            # Fast vectorized SMOTE
-            a = idx[torch.randint(0, c, (need,))]
-            b = idx[torch.randint(0, c, (need,))]
-            lam = torch.rand(need, 1)
-            synth_features = F_full[a] * lam + F_full[b] * (1 - lam)
-            synth_labels = torch.maximum(Y[a], Y[b])
-            F_new.append(synth_features)
-            Y_new.append(synth_labels)
-        
-        Fb, Yb = torch.cat(F_new), torch.cat(Y_new)
-
-        d1, d2, d3, d4 = Xc.shape[1], Xm.shape[1], Xmx.shape[1], Xa.shape[1]
-        Xc_b, Xm_b = Fb[:, :d1], Fb[:, d1:d1+d2]
-        Xmx_b, Xa_b = Fb[:, d1+d2:d1+d2+d3], Fb[:, d1+d2+d3:]
-        train_loader = DataLoader(
-            TensorDataset(Xc_b, Xm_b, Xmx_b, Xa_b, Yb),
-            batch_size=getattr(train_loader, "batch_size", 1024),
-            shuffle=True, drop_last=False, pin_memory=True
-        )
-
-        # names for distribution (from a single forward pass)
         c0, m0, x0, a0, _ = next(iter(train_loader))
         c0, m0, x0, a0 = c0.to(device), m0.to(device), x0.to(device), a0.to(device)
         _, _, outs0 = model(c0, m0, x0, a0)
-        label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
+        label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(len(outs0))]
+        all_targets = []
+        for _, _, _, _, targets in train_loader:
+            all_targets.append(targets.cpu())
+        Y = torch.cat(all_targets)
 
-        # Clean output - training data already shown above
-        
-        # Compute class weights for loss
+        # Compute balanced class weights with proper bounds
         pos_weights = []
         for j in range(len(label_names)):
-            cnt = max(int(Yb[:, j].sum().item()), 1)
-            pos_weight = min(Yb.shape[0] / (2 * cnt), 50.0)
-            pos_weights.append(pos_weight)
-        
-        bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weights, device=device))
+            cnt = int(Y[:, j].sum().item())
+            if cnt > 0:
+                # Balanced weight: inverse frequency with reasonable bounds
+                weight = (Y.shape[0] - cnt) / max(cnt, 1)
+                weight = min(max(weight, 1.0), 10.0)
+            else:
+                weight = 1.0  # Default weight for classes with no samples
+            pos_weights.append(weight)
 
-    # Train
+        # Use focal loss for better stability with imbalanced data
+        class FocalBCEWithLogitsLoss(nn.BCEWithLogitsLoss):
+            def __init__(self, alpha=1.0, gamma=2.0, **kwargs):
+                super().__init__(**kwargs)
+                self.alpha = alpha
+                self.gamma = gamma
+
+            def forward(self, input, target):
+                bce_loss = super().forward(input, target)
+                pt = torch.exp(-bce_loss)
+                focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+                return focal_loss
+
+        bce_loss = FocalBCEWithLogitsLoss(alpha=1.0, gamma=1.0, pos_weight=torch.tensor(pos_weights, device=device))
+
+    # Initialize model weights properly
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    model.apply(init_weights)
+
     best_val_loss = float('inf')
     torch.set_float32_matmul_precision('high') if hasattr(torch, "set_float32_matmul_precision") else None
 
@@ -343,41 +304,40 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
+
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                 recon_loss = mse_loss(recon, feats)
+                recon_loss = torch.clamp(recon_loss, 0, 100.0)
+
                 if isinstance(outputs, dict):
                     logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
                 else:
-                    logits = outputs  # assume (B, L)
+                    logits = outputs
+
+                logits = torch.clamp(logits, -10.0, 10.0)
                 ml_loss = bce_loss(logits, targets)
+                ml_loss = torch.clamp(ml_loss, 0, 100.0)
+
                 hier_loss = model.hierarchy_consistency_loss(outputs)
-                
-                # Balanced loss scaling to prevent NaN
-                total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
-                
-                # Check for NaN/inf and skip if found
-                if not torch.isfinite(total_loss):
-                    print(f"Warning: Non-finite loss detected, skipping batch")
-                    continue
+                hier_loss = torch.clamp(hier_loss, 0, 10.0)
+
+                total_loss = 0.001 * recon_loss + ml_loss + 0.01 * hier_loss
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
-                # More aggressive gradient clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                if torch.isfinite(grad_norm):
-                    scaler.step(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
                 scaler.update()
             else:
                 total_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                if torch.isfinite(grad_norm):
-                    optimizer.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+            scheduler.step()
 
             train_losses.append(total_loss.item())
-
-        # Validation
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -391,17 +351,25 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                     recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                     recon_loss = mse_loss(recon, feats)
+
+                    recon_loss = torch.clamp(recon_loss, 0, 100.0)
+
                     if isinstance(outputs, dict):
                         logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
                     else:
                         logits = outputs
+
+                    logits = torch.clamp(logits, -10.0, 10.0)
+
                     ml_loss = bce_loss(logits, targets)
+                    ml_loss = torch.clamp(ml_loss, 0, 100.0)
+
                     hier_loss = model.hierarchy_consistency_loss(outputs)
-                    total_loss = 0.1 * recon_loss + ml_loss + 0.1 * hier_loss
-                    
-                    # Skip if non-finite
-                    if torch.isfinite(total_loss):
-                        val_losses.append(total_loss.item())
+                    hier_loss = torch.clamp(hier_loss, 0, 10.0)
+
+                    total_loss = 0.001 * recon_loss + ml_loss + 0.01 * hier_loss
+
+                    val_losses.append(total_loss.item())
 
         avg_train_loss = float(np.mean(train_losses)) if train_losses else 0.0
         avg_val_loss = float(np.mean(val_losses)) if val_losses else avg_train_loss
@@ -429,11 +397,7 @@ def evaluate_model(model, test_loader, log_type):
             attn = attn.to(device)
             
             _, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
-            
-            # apply hierarchy propagation
             propagated = model.propagate_labels(outputs)
-            
-            # collect predictions
             batch_preds = np.zeros((cls_tokens.shape[0], len(node_names)))
             for name, probs in propagated.items():
                 if name in model.node_to_index:
@@ -446,43 +410,37 @@ def evaluate_model(model, test_loader, log_type):
     all_preds = np.vstack(all_preds)
     all_targets = np.vstack(all_targets)
     
-    # per-class metrics
     print("\n=== Per-Class Metrics ===")
     print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print("-" * 55)
-    
+
     class_metrics = []
     for i, name in enumerate(node_names):
         if i < all_targets.shape[1]:
             y_true = all_targets[:, i]
             y_pred = all_preds[:, i]
-            
-            if y_true.sum() > 0:  # only evaluate if class has samples
+
+            if y_true.sum() > 0:
                 prec, rec, f1, _ = precision_recall_fscore_support(
                     y_true, y_pred, average='binary', zero_division=0
                 )
                 class_metrics.append([prec, rec, f1])
                 print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f}")
     
-    # overall metrics
     print("\n=== Overall Metrics ===")
-    
-    # micro-averaged (global)
+
     micro_prec, micro_rec, micro_f1, _ = precision_recall_fscore_support(
         all_targets.ravel(), all_preds.ravel(), average='micro', zero_division=0
     )
     print(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}")
-    
-    # macro-averaged
+
     if class_metrics:
         macro_metrics = np.mean(class_metrics, axis=0)
         print(f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}")
-    
-    # jaccard score (multi-label)
+
     jaccard = jaccard_score(all_targets, all_preds, average='samples', zero_division=0)
     print(f"Jaccard Score (samples): {jaccard:.3f}")
-    
-    # anomaly detection (any attack vs none)
+
     any_attack_true = (all_targets.sum(axis=1) > 0).astype(int)
     any_attack_pred = (all_preds.sum(axis=1) > 0).astype(int)
     
@@ -492,7 +450,6 @@ def evaluate_model(model, test_loader, log_type):
         )
         print(f"\nAnomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}")
     
-    # Save evaluation report
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     results_dir = Path("results")
@@ -532,7 +489,6 @@ def evaluate_model(model, test_loader, log_type):
     print(f"\nEvaluation report saved: {report_path}")
 
 def main():
-    # load data
     embeddings, labels = load_logbert_embeddings()
     datasets = load_datasets(embeddings, labels)
     
@@ -541,16 +497,13 @@ def main():
         print(f"Processing {log_type}")
         print('='*50)
         
-        # Stratified split to preserve class distribution
         dataset = data['loader'].dataset
         all_targets = torch.stack([dataset[i][4] for i in range(len(dataset))])
         anomaly_mask = (all_targets.sum(dim=1) > 0)
-        
-        # Get indices for normal and anomaly samples
+
         normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
         anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
-        
-        # Stratified sampling
+
         def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
             n = len(indices)
             n_train = int(train_ratio * n)
@@ -573,15 +526,12 @@ def main():
         test_loader = DataLoader(test_set, batch_size=128, shuffle=False)
         
         print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
-        
-        # initialize and train model
+
         model = HierarchicalTransformer(hierarchy).to(device)
         model = train_model(model, train_loader, val_loader, epochs=10)
-        
-        # evaluate
+
         evaluate_model(model, test_loader, log_type)
-        
-        # save model
+
         Path("models").mkdir(exist_ok=True)
         torch.save(model.state_dict(), f"models/hierarchical_{log_type}.pth")
         print(f"\nModel saved to models/hierarchical_{log_type}.pth")
