@@ -253,11 +253,18 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         n, L = Y.shape
         counts = Y.sum(0)
         
-        # Aggressive majority downsampling (cap at 10% of max class)
+        # Extreme rebalancing for 98% anomaly data
+        normal_count = int((Y.sum(1) == 0).sum().item())
         max_count = int(counts.max().item())
-        downsample_cap = max(max_count // 10, 1000)  # Cap majority at 10% or 1k min
         
-        # Fast stratified downsampling
+        # Cap majority at 5% of current size for extreme rebalancing
+        downsample_cap = max(max_count // 20, 500)
+        oversample_target = max(normal_count * 10, 2000)  # 10x normal samples
+        
+        print(f"Rebalancing: normal={normal_count}, max_class={max_count}")
+        print(f"Targets: downsample to {downsample_cap}, oversample to {oversample_target}")
+        
+        # Aggressive downsampling
         keep = torch.ones(n, dtype=torch.bool)
         g = torch.Generator().manual_seed(42)
         
@@ -265,15 +272,11 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
             idx = torch.nonzero(Y[:, j] == 1, as_tuple=True)[0]
             c = idx.numel()
             if c > downsample_cap:
-                # Fast random sampling for speed
                 drop = idx[torch.randperm(c, generator=g)[downsample_cap:]]
                 keep[drop] = False
         
         F_full, F_semantic, Y = F_full[keep], F_semantic[keep], Y[keep]
-        
-        # Balanced oversampling target
-        remaining_counts = Y.sum(0)
-        target = max(int(remaining_counts.median().item()), 500)  # Balanced target
+        target = oversample_target  # Aggressive oversampling
         
         F_new, Y_new = [F_full], [Y]
         for j in range(L):
@@ -518,19 +521,40 @@ def main():
         print(f"Processing {log_type}")
         print('='*50)
         
-        # split dataset
+        # Stratified split to preserve class distribution
         dataset = data['loader'].dataset
-        n_total = len(dataset)
-        n_val = int(0.1 * n_total)
-        n_test = int(0.1 * n_total)
-        n_train = n_total - n_val - n_test
+        all_targets = torch.stack([dataset[i][4] for i in range(len(dataset))])
+        anomaly_mask = (all_targets.sum(dim=1) > 0)
         
-        train_set, val_set, test_set = random_split(dataset, [n_train, n_val, n_test])
+        # Get indices for normal and anomaly samples
+        normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
+        anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
+        
+        print(f"Dataset: {len(normal_idx)} normal ({len(normal_idx)/len(dataset):.1%}), {len(anomaly_idx)} anomalies ({len(anomaly_idx)/len(dataset):.1%})")
+        
+        # Stratified sampling
+        def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
+            n = len(indices)
+            n_train = int(train_ratio * n)
+            n_val = int(val_ratio * n)
+            perm = torch.randperm(n)
+            return indices[perm[:n_train]], indices[perm[n_train:n_train+n_val]], indices[perm[n_train+n_val:]]
+        
+        normal_train, normal_val, normal_test = stratified_split(normal_idx)
+        anomaly_train, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
+        
+        train_indices = torch.cat([normal_train, anomaly_train])
+        val_indices = torch.cat([normal_val, anomaly_val])
+        test_indices = torch.cat([normal_test, anomaly_test])
+        
+        train_set = torch.utils.data.Subset(dataset, train_indices)
+        val_set = torch.utils.data.Subset(dataset, val_indices)
+        test_set = torch.utils.data.Subset(dataset, test_indices)
         train_loader = DataLoader(train_set, batch_size=128, shuffle=True)
         val_loader = DataLoader(val_set, batch_size=128, shuffle=False)
         test_loader = DataLoader(test_set, batch_size=128, shuffle=False)
         
-        print(f"Train: {n_train}, Val: {n_val}, Test: {n_test}")
+        print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
         
         # initialize and train model
         model = HierarchicalTransformer(hierarchy).to(device)
