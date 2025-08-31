@@ -20,7 +20,7 @@ print(f"Using device: {device}")
 if device.type == "mps":
     torch.backends.mps.allow_tf32 = True
     print("Enabled MPS optimizations for Silicon GPU")
-else if device.type == "cuda":
+elif device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high") 
     print("Enabled CUDA optimizations for NVIDIA GPU")
