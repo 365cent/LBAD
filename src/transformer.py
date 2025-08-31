@@ -403,6 +403,26 @@ def smote_data(train_loader, val_loader):
             torch.from_numpy(y_aug).float()
         )
 
+        # Print data distribution after SMOTE
+        print(f"\nData distribution after SMOTE: {len(aug_dataset)} samples")
+        y_aug_tensor = torch.from_numpy(y_aug)
+        normal_aug = (y_aug_tensor.sum(dim=1) == 0).sum().item()
+        print(f"  normal: {normal_aug} ({normal_aug/len(aug_dataset):.2%})")
+        node_names = []
+        def collect_names(hier):
+            for node, children in hier.items():
+                node_names.append(node)
+                if isinstance(children, dict):
+                    for child, leaves in children.items():
+                        node_names.append(child)
+                        node_names.extend(leaves)
+        collect_names(hierarchy)
+        for i, name in enumerate(node_names[:y_aug.shape[1]]):
+            count = int(y_aug[:, i].sum())
+            if count > 0:
+                print(f"  {name}: {count} ({count/len(aug_dataset):.2%})")
+
+
         # Return new dataloader
         return DataLoader(aug_dataset, batch_size=batch_size, shuffle=True)
 
