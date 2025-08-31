@@ -239,7 +239,8 @@ def load_datasets(embeddings, labels, batch_size=128):
     return datasets
 
 def smote_data(train_loader, val_loader):
-    """Apply SMOTE augmentation with dimensionality reduction and cleaning."""
+    spinner = halo.Halo(text="Applying SMOTE", spinner="dots")
+    spinner.start()
     try:
         # Extract all training data
         all_cls, all_mean, all_max, all_attn, all_targets = [], [], [], [], []
@@ -298,8 +299,8 @@ def smote_data(train_loader, val_loader):
 
             try:
                 pipe = ImbPipeline([
-                    ('over', KMeansSMOTE(k_neighbors=k_neighbors, random_state=42, cluster_balance_threshold=0.1)),
-                    ('clean', SMOTETomek(tomek='auto')),
+                    ('over', KMeansSMOTE(k_neighbors=k_neighbors, random_state=42, cluster_balance_threshold=0.01)),
+                    ('clean', SMOTETomek(tomek=None)),
                     ('under', RandomUnderSampler(sampling_strategy=0.8, random_state=42))
                 ])
 
@@ -351,9 +352,10 @@ def smote_data(train_loader, val_loader):
             return DataLoader(aug_dataset, batch_size=batch_size, shuffle=True)
 
     except Exception as e:
-        print(f"SMOTE processing failed: {e}")
+        spinner.stop_and_persist(text="SMOTE failed")
         return train_loader
 
+    spinner.stop_and_persist(text="SMOTE completed")
     return train_loader
 
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
@@ -435,7 +437,11 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 recon_loss = torch.clamp(recon_loss, 0, 100.0)
 
                 if isinstance(outputs, dict):
-                    logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                    if outputs:
+                        logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                    else:
+                        # Fallback for empty outputs dict
+                        logits = torch.zeros(targets.size(0), len(label_names), device=device)
                 else:
                     logits = outputs
 
@@ -480,7 +486,11 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                     recon_loss = torch.clamp(recon_loss, 0, 100.0)
 
                     if isinstance(outputs, dict):
-                        logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                        if outputs:
+                            logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                        else:
+                            # Fallback for empty outputs dict
+                            logits = torch.zeros(targets.size(0), len(label_names), device=device)
                     else:
                         logits = outputs
 
@@ -631,8 +641,16 @@ def main():
 
         def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
             n = len(indices)
+            if n == 0:
+                return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)
+
             n_train = int(train_ratio * n)
             n_val = int(val_ratio * n)
+
+            # Ensure we have at least 1 sample for each split if possible
+            n_train = max(1, min(n_train, n - 2)) if n > 2 else n_train
+            n_val = max(1, min(n_val, n - n_train - 1)) if n > n_train + 1 else n_val
+
             perm = torch.randperm(n)
             return indices[perm[:n_train]], indices[perm[n_train:n_train+n_val]], indices[perm[n_train+n_val:]]
         
