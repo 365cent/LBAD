@@ -7,6 +7,8 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 import halo
+import pandas as pd
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
