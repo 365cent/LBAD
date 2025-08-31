@@ -240,20 +240,10 @@ def load_datasets(embeddings, labels, batch_size=128):
 
 def smote_data(train_loader, val_loader):
     # Apply SMOTE to highly imbalanced embeddings with block-aware preprocessing
-
-    import numpy as np
-    import torch
-    from torch.utils.data import TensorDataset, DataLoader
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
-    from imblearn.over_sampling import KMeansSMOTE
-    import halo
-
-    # reasonable defaults
-    target_ratio = 0.2          # target minority:majority after oversampling (per class)
+    target_ratio = 1          # target minority:majority after oversampling (per class)
     max_neg_per_pos = 20        # negatives kept per positive in the per-class subset
     min_pos = 10                # skip classes with fewer positives than this
-    pca_dims = (128, 128, 128, 8)  # CLS / MEAN / MAX / ATTN
+    pca_dims = (128, 128, 128, 10)  # CLS / MEAN / MAX / ATTN
     random_state = 42
 
     spinner = halo.Halo(text="Applying SMOTE", spinner="dots")
