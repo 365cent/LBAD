@@ -218,6 +218,15 @@ def load_datasets(embeddings, labels, batch_size=128):
         total = log_vectors.shape[0]
         anomalies = (targets.sum(axis=1) > 0).sum()
         print(f"[{log_type}] {total} samples | anomalies: {anomalies} ({anomalies/total:.2%})")
+        
+        # Show per-class distribution
+        node_names = list(flatten_hierarchy(hierarchy))
+        print("Per-class distribution:")
+        for i, name in enumerate(node_names):
+            if i < targets.shape[1]:
+                count = int(targets[:, i].sum())
+                if count > 0:
+                    print(f"  {name}: {count} ({count/total:.2%})")
     
     return datasets
 
@@ -302,39 +311,37 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(Yb.shape[1])]
 
-        # Show distribution changes
-        N_orig, N_new = Y.shape[0], Yb.shape[0]
-        normal_orig = int((Y.sum(1) == 0).sum().item())
+        # Show training split distribution changes  
+        N_train, N_new = Y.shape[0], Yb.shape[0]
+        normal_train = int((Y.sum(1) == 0).sum().item())
         normal_new = int((Yb.sum(1) == 0).sum().item())
         
-        print(f"\nClass distribution ({N_orig} → {N_new} samples):")
-        print(f"{'Class':<20} {'Original':<15} {'After SMOTE':<15} {'Change'}")
-        print("-" * 65)
+        print(f"\nTraining split rebalancing ({N_train} → {N_new} samples):")
+        print(f"{'Class':<20} {'Train Split':<12} {'After SMOTE':<12} {'Change'}")
+        print("-" * 55)
         
         # Normal samples
-        change = normal_new - normal_orig
+        change = normal_new - normal_train
         sign = "++" if change > 0 else "--" if change < 0 else "  "
-        print(f"{'normal':<20} {normal_orig:>6} ({100.0*normal_orig/N_orig:>5.1f}%) {normal_new:>6} ({100.0*normal_new/N_new:>5.1f}%) {sign}{abs(change)}")
+        print(f"{'normal':<20} {normal_train:>5} ({100.0*normal_train/N_train:>4.1f}%) {normal_new:>5} ({100.0*normal_new/N_new:>4.1f}%) {sign}{abs(change)}")
         
-        # Attack classes (only show non-zero) and compute class weights
+        # Attack classes and compute class weights
         pos_weights = []
         for j, name in enumerate(label_names):
-            cnt_orig = int(Y[:, j].sum().item())
+            cnt_train = int(Y[:, j].sum().item())
             cnt_new = int(Yb[:, j].sum().item())
-            if cnt_orig > 0 or cnt_new > 0:  # Only show classes that exist
-                change = cnt_new - cnt_orig
+            if cnt_train > 0 or cnt_new > 0:
+                change = cnt_new - cnt_train
                 sign = "++" if change > 0 else "--" if change < 0 else "  "
-                print(f"{name:<20} {cnt_orig:>6} ({100.0*cnt_orig/N_orig:>5.1f}%) {cnt_new:>6} ({100.0*cnt_new/N_new:>5.1f}%) {sign}{abs(change)}")
+                print(f"{name:<20} {cnt_train:>5} ({100.0*cnt_train/N_train:>4.1f}%) {cnt_new:>5} ({100.0*cnt_new/N_new:>4.1f}%) {sign}{abs(change)}")
             
-            # Compute balanced weights to prevent NaN
+            # Balanced weights
             pos_count = max(cnt_new, 1)
             neg_count = max(N_new - pos_count, 1)
-            pos_weight = neg_count / pos_count
-            pos_weights.append(min(pos_weight, 100.0))  # Cap extreme weights
+            pos_weight = min(neg_count / pos_count, 50.0)
+            pos_weights.append(pos_weight)
         
-        # Create weighted BCE loss to handle imbalance
-        pos_weights_tensor = torch.tensor(pos_weights, device=device)
-        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights_tensor)
+        bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weights, device=device))
 
     # Train
     best_val_loss = float('inf')
