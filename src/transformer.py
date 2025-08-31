@@ -20,6 +20,10 @@ print(f"Using device: {device}")
 if device.type == "mps":
     torch.backends.mps.allow_tf32 = True
     print("Enabled MPS optimizations for Silicon GPU")
+else if device.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high") 
+    print("Enabled CUDA optimizations for NVIDIA GPU")
 
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
@@ -240,9 +244,9 @@ def load_datasets(embeddings, labels, batch_size=128):
 
 def smote_data(train_loader, val_loader):
     # Apply SMOTE to highly imbalanced embeddings with block-aware preprocessing
-    target_ratio = 1          # target minority:majority after oversampling (per class)
+    target_ratio = 0.2          # target minority:majority after oversampling (per class)
     max_neg_per_pos = 20        # negatives kept per positive in the per-class subset
-    min_pos = 10                # skip classes with fewer positives than this
+    min_pos = 5                # skip classes with fewer positives than this
     pca_dims = (128, 128, 128, 10)  # CLS / MEAN / MAX / ATTN
     random_state = 42
 
@@ -484,7 +488,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
             attn = attn.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
 
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
@@ -533,7 +537,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 max_pooling = max_pooling.to(device, non_blocking=True)
                 attn = attn.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                     recon_loss = mse_loss(recon, feats)
