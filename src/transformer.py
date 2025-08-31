@@ -11,6 +11,12 @@ import halo
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Optimize for M2 GPU if available
+if device.type == "mps":
+    # Enable optimized memory format for MPS
+    torch.backends.mps.allow_tf32 = True
+    print("Enabled MPS optimizations for M2 GPU")
+
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
     "escalate": {"escalated_command": ["escalated_sudo_session"], "attacker_change_user": [], "reverse_shell": []},
@@ -118,14 +124,54 @@ def load_logbert_embeddings():
         raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
     
     embeddings, labels = {}, {}
+    skipped_files = []
+    
     for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
         log_type = embed_dir.name
         log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
-        if log_pkl.exists() and label_pkl.exists():
-            with open(log_pkl, 'rb') as f: embeddings[log_type] = pickle.load(f)
-            with open(label_pkl, 'rb') as f: labels[log_type] = pickle.load(f)
-        else:
-            raise FileNotFoundError(f"Labels not found: {label_pkl}")
+        
+        if not (log_pkl.exists() and label_pkl.exists()):
+            print(f"Warning: Missing files for {log_type}")
+            continue
+            
+        try:
+            # Check file integrity by attempting to load
+            print(f"Loading {log_type}...")
+            
+            # Load log embeddings with error handling
+            with open(log_pkl, 'rb') as f:
+                try:
+                    embeddings[log_type] = pickle.load(f)
+                except (EOFError, pickle.PickleError, Exception) as e:
+                    print(f"Error loading {log_pkl}: {e}")
+                    skipped_files.append(f"{log_type}_log")
+                    continue
+            
+            # Load labels with error handling
+            with open(label_pkl, 'rb') as f:
+                try:
+                    labels[log_type] = pickle.load(f)
+                except (EOFError, pickle.PickleError, Exception) as e:
+                    print(f"Error loading {label_pkl}: {e}")
+                    # Remove the embeddings too since we can't use them without labels
+                    if log_type in embeddings:
+                        del embeddings[log_type]
+                    skipped_files.append(f"{log_type}_label")
+                    continue
+                    
+            print(f"Successfully loaded {log_type}")
+            
+        except Exception as e:
+            print(f"Unexpected error loading {log_type}: {e}")
+            skipped_files.append(log_type)
+            continue
+    
+    if skipped_files:
+        print(f"Warning: Skipped corrupted files: {', '.join(skipped_files)}")
+    
+    if not embeddings:
+        raise ValueError("No valid embeddings could be loaded. All pickle files appear to be corrupted.")
+    
     print(f"Loaded LogBERT embeddings for {len(embeddings)} log types")
     return embeddings, labels
 
