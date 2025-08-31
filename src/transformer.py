@@ -7,8 +7,6 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 import halo
-import pandas as pd
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -365,7 +363,7 @@ def train_model(model, train_loader, val_loader, epochs=10):
     spinner.succeed(f"Training completed. Best validation loss: {best_val_loss:.4f}")
     return model
 
-def evaluate_model(model, test_loader, log_type):
+def evaluate_hierarchical(model, test_loader):
     model.eval()
     all_preds, all_targets = [], []
     node_names = list(model.node_to_index.keys())
@@ -440,45 +438,6 @@ def evaluate_model(model, test_loader, log_type):
             any_attack_true, any_attack_pred, average='binary', zero_division=0
         )
         print(f"\nAnomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}")
-    
-    # Save evaluation report
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    report_path = results_dir / f"hierarchical_{log_type}_evaluation_{timestamp}.txt"
-    
-    with open(report_path, 'w') as f:
-        f.write(f"Hierarchical Transformer Evaluation Report\n")
-        f.write(f"Log Type: {log_type}\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Dataset: {len(all_targets)} test samples\n")
-        f.write("="*50 + "\n\n")
-        
-        f.write("Per-Class Metrics:\n")
-        f.write(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10}\n")
-        f.write("-" * 55 + "\n")
-        
-        for i, name in enumerate(node_names):
-            if i < all_targets.shape[1]:
-                y_true = all_targets[:, i]
-                y_pred = all_preds[:, i]
-                if y_true.sum() > 0:
-                    prec, rec, f1, _ = precision_recall_fscore_support(
-                        y_true, y_pred, average='binary', zero_division=0
-                    )
-                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f}\n")
-        
-        f.write(f"\nOverall Metrics:\n")
-        f.write(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n")
-        if class_metrics:
-            macro_metrics = np.mean(class_metrics, axis=0)
-            f.write(f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}\n")
-        f.write(f"Jaccard Score: {jaccard:.3f}\n")
-        if len(np.unique(any_attack_true)) > 1:
-            f.write(f"Anomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}\n")
-    
-    print(f"\nEvaluation report saved: {report_path}")
 
 def main():
     # load data
@@ -528,7 +487,7 @@ def main():
         model = train_model(model, train_loader, val_loader, epochs=10)
         
         # evaluate
-        evaluate_model(model, test_loader, log_type)
+        evaluate_hierarchical(model, test_loader)
         
         # save model
         Path("models").mkdir(exist_ok=True)
