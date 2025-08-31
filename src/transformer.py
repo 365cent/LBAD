@@ -6,6 +6,12 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from imblearn.over_sampling import KMeansSMOTE
+from imblearn.combine import SMOTETomek
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
 import halo
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -232,15 +238,134 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
-def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
-    spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
-    spinner.start()
+def smote_data(train_loader, val_loader):
+    """Apply SMOTE augmentation with dimensionality reduction and cleaning."""
+    try:
+        # Extract all training data
+        all_cls, all_mean, all_max, all_attn, all_targets = [], [], [], [], []
+        for cls_batch, mean_batch, max_batch, attn_batch, targets_batch in train_loader:
+            all_cls.append(cls_batch.numpy())
+            all_mean.append(mean_batch.numpy())
+            all_max.append(max_batch.numpy())
+            all_attn.append(attn_batch.numpy())
+            all_targets.append(targets_batch.numpy())
 
+        # Stack into arrays
+        cls = np.vstack(all_cls)
+        mean = np.vstack(all_mean)
+        maxp = np.vstack(all_max)
+        attn = np.vstack(all_attn)
+        y = np.vstack(all_targets)
+
+        # Standardize each component
+        scaler_cls = StandardScaler()
+        scaler_mean = StandardScaler()
+        scaler_max = StandardScaler()
+        scaler_attn = StandardScaler()
+
+        cls_scaled = scaler_cls.fit_transform(cls)
+        mean_scaled = scaler_mean.fit_transform(mean)
+        max_scaled = scaler_max.fit_transform(maxp)
+        attn_scaled = scaler_attn.fit_transform(attn)
+
+        # PCA with reasonable dimensions
+        pca_cls = PCA(n_components=min(128, cls.shape[1]//2), svd_solver='auto')
+        pca_mean = PCA(n_components=min(128, mean.shape[1]//2))
+        pca_max = PCA(n_components=min(128, maxp.shape[1]//2))
+        pca_attn = PCA(n_components=min(10, attn.shape[1]//2))
+
+        cls_pca = pca_cls.fit_transform(cls_scaled)
+        mean_pca = pca_mean.fit_transform(mean_scaled)
+        max_pca = pca_max.fit_transform(max_scaled)
+        attn_pca = pca_attn.fit_transform(attn_scaled)
+
+        # Combine PCA features
+        X_pca = np.hstack([cls_pca, mean_pca, max_pca, attn_pca])
+
+        augmented_features, augmented_targets = [], []
+
+        for class_idx in range(y.shape[1]):
+            y_binary = y[:, class_idx]
+            pos_count = y_binary.sum()
+
+            if pos_count < 5:  # Need at least 5 samples for SMOTE
+                continue
+
+            # Adjust k_neighbors based on available samples
+            k_neighbors = min(5, pos_count - 1)
+            if k_neighbors < 2:
+                continue
+
+            try:
+                pipe = ImbPipeline([
+                    ('over', KMeansSMOTE(k_neighbors=k_neighbors, random_state=42, cluster_balance_threshold=0.1)),
+                    ('clean', SMOTETomek(tomek='auto')),
+                    ('under', RandomUnderSampler(sampling_strategy=0.8, random_state=42))
+                ])
+
+                X_resampled, y_resampled = pipe.fit_resample(X_pca, y_binary)
+
+                # Reconstruct full target matrix
+                y_full = np.zeros((len(y_resampled), y.shape[1]))
+                y_full[:, class_idx] = y_resampled
+
+                augmented_features.append(X_resampled)
+                augmented_targets.append(y_full)
+
+            except Exception as e:
+                print(f"SMOTE failed for class {class_idx}: {e}")
+                continue
+
+        if augmented_features:
+            X_aug = np.vstack(augmented_features)
+            y_aug = np.vstack(augmented_targets)
+
+            # Split PCA features back
+            cls_pca_aug = X_aug[:, :cls_pca.shape[1]]
+            mean_pca_aug = X_aug[:, cls_pca.shape[1]:cls_pca.shape[1] + mean_pca.shape[1]]
+            max_pca_aug = X_aug[:, cls_pca.shape[1] + mean_pca.shape[1]:cls_pca.shape[1] + mean_pca.shape[1] + max_pca.shape[1]]
+            attn_pca_aug = X_aug[:, cls_pca.shape[1] + mean_pca.shape[1] + max_pca.shape[1]:]
+
+            # Inverse PCA transform
+            cls_reconstructed = pca_cls.inverse_transform(cls_pca_aug)
+            mean_reconstructed = pca_mean.inverse_transform(mean_pca_aug)
+            max_reconstructed = pca_max.inverse_transform(max_pca_aug)
+            attn_reconstructed = pca_attn.inverse_transform(attn_pca_aug)
+
+            # Inverse scaling
+            cls_final = scaler_cls.inverse_transform(cls_reconstructed)
+            mean_final = scaler_mean.inverse_transform(mean_reconstructed)
+            max_final = scaler_max.inverse_transform(max_reconstructed)
+            attn_final = scaler_attn.inverse_transform(attn_reconstructed)
+
+            # Create dataset
+            batch_size = getattr(train_loader, 'batch_size', 128)
+            aug_dataset = TensorDataset(
+                torch.from_numpy(cls_final).float(),
+                torch.from_numpy(mean_final).float(),
+                torch.from_numpy(max_final).float(),
+                torch.from_numpy(attn_final).float(),
+                torch.from_numpy(y_aug).float()
+            )
+
+            return DataLoader(aug_dataset, batch_size=batch_size, shuffle=True)
+
+    except Exception as e:
+        print(f"SMOTE processing failed: {e}")
+        return train_loader
+
+    return train_loader
+
+def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
+    train = smote_data(train_loader, val_loader)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # More stable learning rate
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train_loader))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
     mse_loss = nn.MSELoss()
     use_amp = device.type in ["cuda", "mps"]  # Enable for M2
     scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+
+    spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
+    spinner.start()
 
     # Get label names and compute class weights from original training data
     with torch.no_grad():
@@ -249,7 +374,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(len(outs0))]
         all_targets = []
-        for _, _, _, _, targets in train_loader:
+        for _, _, _, _, targets in train:  # Use SMOTE-augmented data for weights
             all_targets.append(targets.cpu())
         Y = torch.cat(all_targets)
 
@@ -295,7 +420,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
     for epoch in range(epochs):
         model.train()
         train_losses = []
-        for cls_tokens, mean_pooling, max_pooling, attn, targets in train_loader:
+        for cls_tokens, mean_pooling, max_pooling, attn, targets in train:
             cls_tokens = cls_tokens.to(device, non_blocking=True)
             mean_pooling = mean_pooling.to(device, non_blocking=True)
             max_pooling = max_pooling.to(device, non_blocking=True)
