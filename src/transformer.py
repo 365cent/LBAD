@@ -243,171 +243,112 @@ def load_datasets(embeddings, labels, batch_size=128):
     return datasets
 
 def smote_data(train_loader, val_loader):
-    # Apply SMOTE to highly imbalanced embeddings with block-aware preprocessing
-    target_ratio = 0.2          # target minority:majority after oversampling (per class)
-    max_neg_per_pos = 20        # negatives kept per positive in the per-class subset
-    min_pos = 5                # skip classes with fewer positives than this
-    pca_dims = (128, 128, 128, 10)  # CLS / MEAN / MAX / ATTN
+    # Apply SMOTE with special handling for extremely imbalanced classes
+    target_ratio = 0.1
+    max_neg_per_pos = 15
+    min_pos = 1  # Allow even single-sample classes
+    pca_dims = (64, 64, 64, 8)  # Reduced for efficiency
     random_state = 42
 
     spinner = halo.Halo(text="Applying SMOTE", spinner="dots")
     spinner.start()
-    msg = "SMOTE completed"
 
     try:
-        # Extract all training data
-        all_cls, all_mean, all_max, all_attn, all_targets = [], [], [], [], []
-        for cls_b, mean_b, max_b, attn_b, y_b in train_loader:
-            all_cls.append(cls_b.detach().cpu().numpy())
-            all_mean.append(mean_b.detach().cpu().numpy())
-            all_max.append(max_b.detach().cpu().numpy())
-            all_attn.append(attn_b.detach().cpu().numpy())
-            all_targets.append(y_b.detach().cpu().numpy())
-
-        # Stack into arrays
-        cls = np.vstack(all_cls)
-        mean = np.vstack(all_mean)
-        maxp = np.vstack(all_max)
-        attn = np.vstack(all_attn)
-        y = np.vstack(all_targets)  # shape [N, L]
+        # Extract and stack training data
+        all_data = [[], [], [], [], []]
+        for batch in train_loader:
+            for i, tensor in enumerate(batch):
+                all_data[i].append(tensor.detach().cpu().numpy())
+        cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
         N, L = y.shape
 
-        # Standardize each component
-        scaler_cls = StandardScaler().fit(cls)
-        scaler_mean = StandardScaler().fit(mean)
-        scaler_max = StandardScaler().fit(maxp)
-        scaler_attn = StandardScaler().fit(attn)
+        # Preprocessing pipeline
+        scalers = [StandardScaler().fit(data) for data in [cls, mean, maxp, attn]]
+        scaled = [scaler.transform(data) for scaler, data in zip(scalers, [cls, mean, maxp, attn])]
+        
+        # Energy equalization and PCA
+        eq_data = [data * (1.0 / np.sqrt(data.shape[1])) for data in scaled]
+        pcas = [PCA(n_components=min(dim, data.shape[1]), svd_solver='auto').fit(data) 
+                for dim, data in zip(pca_dims, eq_data)]
+        Xr = np.hstack([pca.transform(data) for pca, data in zip(pcas, eq_data)])
 
-        cls_s = scaler_cls.transform(cls)
-        mean_s = scaler_mean.transform(mean)
-        max_s = scaler_max.transform(maxp)
-        attn_s = scaler_attn.transform(attn)
-
-        # Equalize block energy (so ATTN is not drowned by 768D blocks)
-        def eq(A): return A * (1.0 / np.sqrt(A.shape[1]))
-        cls_eq, mean_eq, max_eq, attn_eq = map(eq, (cls_s, mean_s, max_s, attn_s))
-
-        # PCA with reasonable dimensions
-        p_cls, p_mean, p_max, p_attn = pca_dims
-        pca_cls  = PCA(n_components=min(p_cls,  cls_eq.shape[1]),  svd_solver='auto').fit(cls_eq)
-        pca_mean = PCA(n_components=min(p_mean, mean_eq.shape[1]), svd_solver='auto').fit(mean_eq)
-        pca_max  = PCA(n_components=min(p_max,  max_eq.shape[1]),  svd_solver='auto').fit(max_eq)
-        pca_attn = PCA(n_components=min(p_attn, attn_eq.shape[1]), svd_solver='auto').fit(attn_eq)
-
-        # Combine PCA features
-        Z_cls  = pca_cls.transform(cls_eq)
-        Z_mean = pca_mean.transform(mean_eq)
-        Z_max  = pca_max.transform(max_eq)
-        Z_attn = pca_attn.transform(attn_eq)
-        Xr = np.hstack([Z_cls, Z_mean, Z_max, Z_attn])  # reduced space
-
-        # Oversample per class with caps
+        # Class-aware SMOTE with adaptive parameters
         rng = np.random.default_rng(random_state)
         synth_Z, synth_Y = [], []
-
+        
         for c in range(L):
-            # Build one-vs-rest vector
-            y_bin = y[:, c].astype(int)
-
-            # Skip tiny classes
-            pos_idx = np.flatnonzero(y_bin == 1)
+            pos_idx = np.flatnonzero(y[:, c])
             if len(pos_idx) < min_pos:
                 continue
-
-            # Limit negatives to bound runtime
-            neg_idx = np.flatnonzero(y_bin == 0)
+                
+            neg_idx = np.flatnonzero(y[:, c] == 0)
             k_neg = min(len(neg_idx), max_neg_per_pos * len(pos_idx))
             if k_neg == 0:
                 continue
-            neg_keep = rng.choice(neg_idx, size=k_neg, replace=False)
+                
+            # Subset data
+            sub_idx = np.concatenate([pos_idx, rng.choice(neg_idx, k_neg, replace=False)])
+            X_sub, y_sub = Xr[sub_idx], y[sub_idx, c].astype(int)
+            
+            # Adaptive SMOTE parameters based on class size
+            if len(pos_idx) < 5:  # Micro classes
+                k_neighbors = 1
+                ratio = min(0.5, 50 / len(pos_idx))  # Aggressive oversampling
+                clusters = max(1, len(pos_idx) // 2)
+            elif len(pos_idx) < 50:  # Small classes  
+                k_neighbors = min(2, len(pos_idx) - 1)
+                ratio = min(0.3, 20 / len(pos_idx))
+                clusters = max(5, len(pos_idx) // 3)
+            else:  # Regular classes
+                k_neighbors = min(5, len(pos_idx) - 1)
+                ratio = target_ratio
+                clusters = 25
 
-            # Subset features and labels
-            sub_idx = np.concatenate([pos_idx, neg_keep])
-            X_sub = Xr[sub_idx]
-            y_sub = y_bin[sub_idx]
-
-            # Adjust k_neighbors based on positives
-            k_neighbors = max(2, min(5, len(pos_idx) - 1))
-
-            # Run KMeansSMOTE with target ratio (does not fully balance)
             try:
                 smote = KMeansSMOTE(
-                    sampling_strategy=target_ratio,
+                    sampling_strategy=ratio,
                     k_neighbors=k_neighbors,
                     random_state=random_state,
-                    cluster_balance_threshold=0.1,
-                    kmeans_estimator=25
+                    cluster_balance_threshold=0.05,
+                    kmeans_estimator=clusters
                 )
                 X_res, y_res = smote.fit_resample(X_sub, y_sub)
-
-                # Take only the newly created positives (appended at the end)
-                n_pos_before = int(y_sub.sum())
-                n_pos_after = int(y_res.sum())
-                n_new = n_pos_after - n_pos_before
+                
+                # Extract new synthetic samples
+                n_new = int(y_res.sum()) - int(y_sub.sum())
                 if n_new > 0:
-                    pos_rows = np.flatnonzero(y_res == 1)
-                    new_pos_rows = pos_rows[-n_new:]
-                    Z_new = X_res[new_pos_rows]
-
-                    # Reconstruct full target rows (one-hot for this class)
+                    new_idx = np.flatnonzero(y_res)[-n_new:]
+                    Z_new = X_res[new_idx]
                     Y_new = np.zeros((n_new, L), dtype=y.dtype)
                     Y_new[:, c] = 1
-
                     synth_Z.append(Z_new)
                     synth_Y.append(Y_new)
-            except Exception as e:
-                print(f"SMOTE failed for class {c}: {e}")
+            except Exception:
                 continue
 
-        # No augmentation case
         if not synth_Z:
-            msg = "SMOTE skipped (no eligible classes)"
             return train_loader
 
+        # Reconstruct original feature space
         Z_syn = np.vstack(synth_Z)
-        Y_syn = np.vstack(synth_Y)
-
-        # Split PCA features back
-        d1, d2, d3 = Z_cls.shape[1], Z_mean.shape[1], Z_max.shape[1]
-        zc  = Z_syn[:, :d1]
-        zm  = Z_syn[:, d1:d1+d2]
-        zmx = Z_syn[:, d1+d2:d1+d2+d3]
-        za  = Z_syn[:, d1+d2+d3:]
-
-        # Inverse PCA transform (synthetic only)
-        cls_rec  = pca_cls.inverse_transform(zc)
-        mean_rec = pca_mean.inverse_transform(zm)
-        max_rec  = pca_max.inverse_transform(zmx)
-        attn_rec = pca_attn.inverse_transform(za)
-
-        # Inverse scaling
-        cls_final  = scaler_cls.inverse_transform(cls_rec)
-        mean_final = scaler_mean.inverse_transform(mean_rec)
-        max_final  = scaler_max.inverse_transform(max_rec)
-        attn_final = scaler_attn.inverse_transform(attn_rec)
-
-        # Create augmented arrays
-        cls_aug  = np.vstack([cls,  cls_final])
-        mean_aug = np.vstack([mean, mean_final])
-        max_aug  = np.vstack([maxp, max_final])
-        attn_aug = np.vstack([attn, attn_final])
-        y_aug    = np.vstack([y,    Y_syn])
-
-        # Create dataset
-        batch_size = getattr(train_loader, 'batch_size', 128)
-        aug_dataset = TensorDataset(
-            torch.from_numpy(cls_aug).float(),
-            torch.from_numpy(mean_aug).float(),
-            torch.from_numpy(max_aug).float(),
-            torch.from_numpy(attn_aug).float(),
-            torch.from_numpy(y_aug).float()
-        )
-
-        # Print data distribution after SMOTE
-        print(f"\nData distribution after SMOTE: {len(aug_dataset)} samples")
-        y_aug_tensor = torch.from_numpy(y_aug)
-        normal_aug = (y_aug_tensor.sum(dim=1) == 0).sum().item()
-        print(f"  normal: {normal_aug} ({normal_aug/len(aug_dataset):.2%})")
+        splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
+        z_blocks = np.split(Z_syn, splits, axis=1)
+        
+        # Inverse transform
+        rec_blocks = [pca.inverse_transform(z) for pca, z in zip(pcas, z_blocks)]
+        final_blocks = [scaler.inverse_transform(rec) for scaler, rec in zip(scalers, rec_blocks)]
+        
+        # Create augmented dataset
+        aug_data = [np.vstack([orig, syn]) for orig, syn in zip([cls, mean, maxp, attn], final_blocks)]
+        y_aug = np.vstack([y, np.vstack(synth_Y)])
+        
+        dataset = TensorDataset(*[torch.from_numpy(data).float() for data in aug_data + [y_aug]])
+        
+        # Print distribution
+        print(f"\nSMOTE enhanced dataset: {len(dataset)} samples")
+        normal_count = (torch.from_numpy(y_aug).sum(dim=1) == 0).sum().item()
+        print(f"  normal: {normal_count} ({normal_count/len(dataset):.2%})")
+        
         node_names = []
         def collect_names(hier):
             for node, children in hier.items():
@@ -417,24 +358,21 @@ def smote_data(train_loader, val_loader):
                         node_names.append(child)
                         node_names.extend(leaves)
         collect_names(hierarchy)
+        
         for i, name in enumerate(node_names[:y_aug.shape[1]]):
             count = int(y_aug[:, i].sum())
             if count > 0:
-                print(f"  {name}: {count} ({count/len(aug_dataset):.2%})")
+                print(f"  {name}: {count} ({count/len(dataset):.2%})")
 
-
-        # Return new dataloader
-        return DataLoader(aug_dataset, batch_size=batch_size, shuffle=True)
+        return DataLoader(dataset, batch_size=getattr(train_loader, 'batch_size', 128), shuffle=True)
 
     except Exception as e:
-        msg = f"SMOTE failed"
-        print(f"[SMOTE] error: {e}")
+        print(f"SMOTE failed: {e}")
         return train_loader
     finally:
-        # Stop spinner
         try:
-            spinner.stop_and_persist(text=msg)
-        except Exception:
+            spinner.stop_and_persist(text="SMOTE completed")
+        except:
             pass
 
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
