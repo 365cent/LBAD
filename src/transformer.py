@@ -460,7 +460,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
             attn = attn.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
 
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
@@ -509,7 +509,10 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 max_pooling = max_pooling.to(device, non_blocking=True)
                 attn = attn.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                # Use CUDA autocast only when CUDA; avoid triton/inductor path on CPU/MPS
+                use_cuda_amp = (device.type=="cuda")
+                ctx = torch.cuda.amp.autocast(enabled=use_cuda_amp)
+                with ctx:
                     recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
                     recon_loss = mse_loss(recon, feats)
@@ -703,7 +706,11 @@ def main():
 
         model = HierarchicalTransformer(hierarchy).to(device)
         if device.type == "cuda":
-            model = torch.compile(model, mode="max-autotune")  # + add
+            try:
+                import triton  # type: ignore  # noqa: F401
+                model = torch.compile(model, mode="max-autotune")
+            except Exception:
+                print("Triton not available or compile failed; using eager mode.")
         model = train_model(model, train_loader, val_loader, epochs=10)
 
         evaluate_model(model, test_loader, log_type)
