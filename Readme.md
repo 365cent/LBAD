@@ -36,12 +36,10 @@ flowchart TD
 
     subgraph Transformer_Training
         H1 --> V1["Split data 80/20 (stratified)"]
-        V1 --> V2["Apply SMOTE on training split only"]
-        V2 --> V3["Train separate transformer per attack type"]
-        V3 --> V4["Train normal class model"]
-        V4 --> X1["Combine one-vs-rest predictions"]
-        X1 --> X2["Apply normal class suppression"]
-        X2 --> Y1["Generate multi-label predictions"]
+        V1 --> V2["SMOTE on train: StdScale → PCA (per block) → KMeansSMOTE + Tomek + RUS → inverse PCA/scale"]
+        V2 --> V3["Train Hierarchical Transformer"]
+        V3 --> V4["Hierarchy consistency loss + reconstruction loss + focal BCE"]
+        V4 --> Y1["Multi-label predictions with parent→child propagation"]
     end
 
     subgraph Baseline_ML_Evaluation
@@ -51,18 +49,9 @@ flowchart TD
         K1 --> L1["Evaluate & record metrics"]
     end
 
-    subgraph Optional_GAN_Augmentation
-        H1 --> M1["Identify minority classes"]
-        M1 --> N1["Train f-AnoGAN on selected embeddings"]
-        N1 --> O1["Generate synthetic embeddings"]
-        O1 --> P1["Create augmented dataset"]
-        P1 --> R1["Evaluate augmentation effectiveness"]
-    end
-
     subgraph Evaluation_and_Analysis
         Y1 --> S1["Comprehensive multi-label metrics"]
         L1 --> S1
-        R1 --> S1
         S1 --> T1["Per-class threshold optimization"]
         T1 --> U1["Clustering analysis & visualization"]
         U1 --> U2["Classification reports & confusion matrices"]
@@ -123,9 +112,7 @@ make word2vec-thesis[-<type>]  # Word2Vec embeddings → embeddings/word2vec/<ty
 make train[-<type>]            # transformer training
 make train-<type>-sample       # training with sample size (faster)
 make evaluate[-<type>]         # evaluation
-make compare[-<type>]          # compare transformer vs f-AnoGAN
 make ml-baseline[-<type>]      # traditional ML baselines
-make gan / gan-train / gan-eval
 make summarize                 # aggregate results
 make status                    # show available data/artifacts
 ```
@@ -191,29 +178,24 @@ python src/word2vec_embedding_thesis.py [--log-type <type>] [--output-subdir wor
 ```
 Outputs mirror LogBERT format under `embeddings/word2vec/<type>/`.
 
-## Transformer Training (One-vs-Rest, SMOTE)
+## Transformer Training (Hierarchical + SMOTE)
 
 Script: `src/transformer.py`
 - Auto-detects device (cuda/mps/cpu)
-- Splits data 80/20 (iterative stratification if available)
-- Applies SMOTE on training split only; saves detailed report
-- Trains a compact transformer per class plus a normal class model; combines predictions
-- Saves predictions for train and unseen test; supports normal-class suppression
+- Splits data 80/20 (stratified)
+- Applies SMOTE on the training split only (details below)
+- Trains a single Hierarchical Transformer with per-node heads and parent→child propagation
+- Uses focal BCE with bounded class weights, hierarchy consistency loss, and a light reconstruction loss
+- AMP mixed precision, OneCycleLR, gradient clipping, and stability clamping
 
 CLI:
 ```bash
-python src/transformer.py --log-type wp-error \
-  [--sample-size N] [--force-restart] [--cleanup] \
-  [--embedding-type fasttext|bert|logbert|enhanced] \
-  [--use-enhanced-features|--disable-enhanced-features] \
-  [--evaluate-with-clustering|--disable-clustering]
+python src/transformer.py
 ```
 
 Artifacts:
-- `results/<type>/smote_modifications.txt`
-- `results/<type>/predictions.pkl` (test probs/preds, classes, thresholds)
-- `results/<type>/train_predictions.pkl` (training reference)
-- `models/transformer_<type>_*.pth` (model + metadata)
+- `results/hierarchical_<type>_evaluation_<timestamp>.txt` (per-class + overall metrics)
+- `models/hierarchical_<type>.pth` (trained model)
 
 ## Evaluation
 
@@ -282,34 +264,30 @@ Generates reports and visualizations under `results/`.
 - Comprehensive artifact management
 - Full reproducibility with Makefile orchestration
 
-### Transformer Enhancements
+### Hierarchical Transformer: Architecture & Training
 
-#### Advanced Loss Functions
-- **Focal Loss**: α=0.25, γ=2.0 for class imbalance handling
-- **Label Smoothing**: Prevents overconfident predictions
-- **Contrastive Loss**: Self-supervised representation learning
+- Projections: CLS/Mean/Max (768→512), Attn (10→512); stack and encode with TransformerEncoder
+- Bottleneck + Decoder: latent reconstruction supports representation regularization
+- Heads: one linear head per hierarchy node; outputs logits (BCEWithLogits)
+- Label Propagation: parent activations propagate to children at inference
 
-#### Enhanced Architecture
-- **Enhanced Multi-Head Attention**: Label-aware attention with residual connections
-- **Pre-normalization**: Layer normalization before attention
-- **GELU Activations**: Replaced ReLU for better gradient flow
-- **Positional Encoding**: Proper sequence modeling
+Losses
+- Focal BCE with bounded class weights (per-label weights ∈ [1, 10])
+- Hierarchy consistency penalty: penalize child > parent probabilities
+- Reconstruction MSE on concatenated features (small weight)
 
-#### Multi-Label Improvements
-- **Label Correlation Module**: Models dependencies between attack labels
-- **Enhanced Classification Head**: Deeper networks with GELU
-- **Contrastive Learning Head**: Self-supervised feature learning
+Optimization & Stability
+- AdamW, OneCycleLR, AMP mixed precision (MPS/CUDA), gradient clipping
+- Logit and loss clamping to avoid numerical issues; Xavier init for Linear layers
 
-#### Evaluation Enhancements
-- **Multi-Label Evaluator**: Hamming Loss, Jaccard Score, F1 scores
-- **Clustering Analyzer**: KMeans, Agglomerative, DBSCAN
-- **Per-label Performance**: Precision, recall, accuracy breakdown
-- **Subset Accuracy**: Complete label set prediction accuracy
+### SMOTE Implementation (Train-only)
 
-#### Configuration Options
-- Enhanced features can be toggled on/off
-- Backward compatibility maintained
-- Comprehensive hyperparameter control
+Pipeline (per class, binary target):
+- Standardize each block separately (CLS, MEAN, MAX, ATTN)
+- PCA per block (dims up to 128; attn up to 10); concatenate reduced features
+- KMeansSMOTE with adaptive k_neighbors, followed by SMOTETomek cleaning and RandomUnderSampler (0.8)
+- Inverse PCA and inverse scaling to reconstruct original feature blocks
+- Build augmented DataLoader with synthetic samples; falls back to original loader if SMOTE fails
 
 ## License
 

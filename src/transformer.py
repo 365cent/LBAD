@@ -8,7 +8,7 @@ from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from imblearn.over_sampling import KMeansSMOTE
+from imblearn.over_sampling import KMeansSMOTE, BorderlineSMOTE, ADASYN
 from imblearn.combine import SMOTETomek
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline as ImbPipeline
@@ -24,6 +24,7 @@ elif device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high") 
     print("Enabled CUDA optimizations for NVIDIA GPU")
+    torch.backends.cudnn.benchmark = True  # + add
 
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
@@ -223,7 +224,7 @@ def load_datasets(embeddings, labels, batch_size=128):
             torch.from_numpy(targets).float()
         )
         
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
         datasets[log_type] = {'loader': loader, 'num_samples': log_vectors.shape[0]}
         
         total = log_vectors.shape[0]
@@ -260,7 +261,7 @@ def smote_data(train_loader, val_loader):
         scaled = [scaler.transform(data) for scaler, data in zip(scalers, [cls, mean, maxp, attn])]
         
         # Dimensionality reduction for efficiency
-        pca_dims = [min(64, data.shape[1]) for data in scaled]
+        pca_dims = [min(48, scaled[0].shape[1]), min(48, scaled[1].shape[1]), min(48, scaled[2].shape[1]), min(8,  scaled[3].shape[1])]  # replace
         pcas = [PCA(n_components=dim, svd_solver='auto').fit(data) 
                 for dim, data in zip(pca_dims, scaled)]
         X_reduced = np.hstack([pca.transform(data) for pca, data in zip(pcas, scaled)])
@@ -294,13 +295,13 @@ def smote_data(train_loader, val_loader):
                 if pos_count < target_per_class:
                     # Oversample minority class
                     k_neighbors = min(3, pos_count - 1) if pos_count > 1 else 1
-                    oversample_ratio = min(target_per_class / pos_count, 5.0)
+                    oversample_ratio = min(target_per_class / max(pos_count, 1), 1.5)  # replace
                     
-                    smote = KMeansSMOTE(
-                        sampling_strategy={1: int(pos_count * oversample_ratio)},
-                        k_neighbors=k_neighbors,
+                    smote = BorderlineSMOTE(
+                        sampling_strategy={1: min(int(pos_count * oversample_ratio), pos_count + 20000)},
+                        k_neighbors=max(2, k_neighbors),
                         random_state=42,
-                        cluster_balance_threshold=0.1
+                        kind='borderline-1'
                     )
                     X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
                 else:
@@ -331,26 +332,20 @@ def smote_data(train_loader, val_loader):
         if not X_final:
             return train_loader
 
-        # Combine all resampled classes
-        X_combined = np.vstack(X_final)
-        y_combined = np.vstack(y_final)
-        
-        # Aggregate overlapping samples
-        unique_samples = {}
-        for i in range(len(X_combined)):
-            key = tuple(X_combined[i])
-            if key not in unique_samples:
-                unique_samples[key] = np.zeros(y.shape[1])
-            unique_samples[key] = np.maximum(unique_samples[key], y_combined[i])
-        
-        X_final = np.array(list(unique_samples.keys()))
-        y_final = np.array(list(unique_samples.values()))
+        # Combine all resampled classes (skip dedup to save RAM)
+        X_final = np.vstack(X_final)
+        y_final = np.vstack(y_final)
         
         # Inverse transform to original feature space
         splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
         x_blocks = np.split(X_final, splits, axis=1)
-        reconstructed = [pca.inverse_transform(block) for pca, block in zip(pcas, x_blocks)]
-        final_features = [scaler.inverse_transform(block) for scaler, block in zip(scalers, reconstructed)]
+        # Batched inverse-transform to limit peak memory
+        def _inv(pca, scaler, block, bs=200000):
+            out = []
+            for i in range(0, len(block), bs):
+                out.append(scaler.inverse_transform(pca.inverse_transform(block[i:i+bs])))
+            return np.vstack(out)
+        final_features = [_inv(p, s, b) for (p, s, b) in zip(pcas, scalers, x_blocks)]
         
         # Create balanced dataset
         dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features + [y_final]])
@@ -360,7 +355,7 @@ def smote_data(train_loader, val_loader):
         print(f"  normal: {len(dataset) - anomaly_count} ({(len(dataset) - anomaly_count)/len(dataset):.2%})")
         print(f"  anomalies: {anomaly_count} ({anomaly_count/len(dataset):.2%})")
 
-        return DataLoader(dataset, batch_size=getattr(train_loader, 'batch_size', 128), shuffle=True)
+        return DataLoader(dataset, batch_size=getattr(train_loader, 'batch_size', 128), shuffle=True, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
 
     except Exception as e:
         print(f"Resampling failed: {e}")
@@ -373,7 +368,7 @@ def smote_data(train_loader, val_loader):
 
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
     train = smote_data(train_loader, val_loader)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)  # More stable learning rate
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
     mse_loss = nn.MSELoss()
     use_amp = device.type in ["cuda", "mps"]  # Enable for M2
@@ -677,13 +672,15 @@ def main():
         train_set = torch.utils.data.Subset(dataset, train_indices)
         val_set = torch.utils.data.Subset(dataset, val_indices)
         test_set = torch.utils.data.Subset(dataset, test_indices)
-        train_loader = DataLoader(train_set, batch_size=128, shuffle=True)
-        val_loader = DataLoader(val_set, batch_size=128, shuffle=False)
-        test_loader = DataLoader(test_set, batch_size=128, shuffle=False)
+        train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+        val_loader   = DataLoader(val_set,   batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+        test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
         
         print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
 
         model = HierarchicalTransformer(hierarchy).to(device)
+        if device.type == "cuda":
+            model = torch.compile(model, mode="max-autotune")  # + add
         model = train_model(model, train_loader, val_loader, epochs=10)
 
         evaluate_model(model, test_loader, log_type)
