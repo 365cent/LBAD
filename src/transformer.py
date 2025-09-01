@@ -25,7 +25,15 @@ elif device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high") 
     print("Enabled CUDA optimizations for NVIDIA GPU")
-    torch.backends.cudnn.benchmark = True  # + add
+    torch.backends.cudnn.benchmark = True
+
+def safe_load(path):
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except (EOFError, pickle.PickleError, Exception) as e:
+        print(f"✗ {Path(path).name}: {e}")
+        return None
 
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
