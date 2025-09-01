@@ -8,11 +8,12 @@ from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from imblearn.over_sampling import KMeansSMOTE, BorderlineSMOTE, ADASYN
+from imblearn.over_sampling import KMeansSMOTE, BorderlineSMOTE
 from imblearn.combine import SMOTETomek
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline as ImbPipeline
 import halo
+import argparse
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -155,6 +156,69 @@ def load_logbert_embeddings():
             
         print(f"Loading {log_type}...", end=" ")
         
+        log_data = safe_load(log_pkl)
+        label_data = safe_load(label_pkl)
+        
+        if log_data is not None and label_data is not None:
+            embeddings[log_type] = log_data
+            labels[log_type] = label_data
+            print("✓")
+        else:
+            skipped.append(log_type)
+    
+    if not embeddings:
+        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
+    
+    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
+    return embeddings, labels
+
+def load_fasttext_embeddings():
+    embeddings_dir = Path("embeddings/fasttext")
+    if not embeddings_dir.exists():
+        raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
+    
+    embeddings, labels, skipped = {}, {}, []
+    
+    for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
+        log_type = embed_dir.name
+        log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
+        
+        if not (log_pkl.exists() and label_pkl.exists()):
+            continue
+            
+        print(f"Loading {log_type}...", end=" ")
+        
+        log_data = safe_load(log_pkl)
+        label_data = safe_load(label_pkl)
+        
+        if log_data is not None and label_data is not None:
+            embeddings[log_type] = log_data
+            labels[log_type] = label_data
+            print("✓")
+        else:
+            skipped.append(log_type)
+    
+    if not embeddings:
+        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
+    
+    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
+    return embeddings, labels
+
+def load_word2vec_embeddings():
+    embeddings_dir = Path("embeddings/word2vec")
+    if not embeddings_dir.exists():
+        raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
+    
+    embeddings, labels, skipped = {}, {}, []
+    
+    for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
+        log_type = embed_dir.name
+        log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
+        
+        if not (log_pkl.exists() and label_pkl.exists()):
+            continue
+            
+        print(f"Loading {log_type}...", end=" ")
         log_data = safe_load(log_pkl)
         label_data = safe_load(label_pkl)
         
@@ -391,6 +455,8 @@ def smote_data(train_loader, val_loader):
 
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
     train = smote_data(train_loader, val_loader)
+    if len(train) == 0:
+        train = train_loader
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
     mse_loss = nn.MSELoss()
@@ -553,7 +619,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
     spinner.stop_and_persist(text="Training completed")
     return model
 
-def evaluate_model(model, test_loader, log_type):
+def evaluate_model(model, test_loader, log_type, embedding_type=""):
     model.eval()
     all_preds, all_targets = [], []
     node_names = list(model.node_to_index.keys())
@@ -623,11 +689,16 @@ def evaluate_model(model, test_loader, log_type):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    report_path = results_dir / f"hierarchical_{log_type}_evaluation_{timestamp}.txt"
+    
+    # Include embedding type in filename if specified
+    embedding_suffix = f"_{embedding_type}" if embedding_type else ""
+    report_path = results_dir / f"hierarchical_{log_type}{embedding_suffix}_evaluation_{timestamp}.txt"
     
     with open(report_path, 'w') as f:
         f.write(f"Hierarchical Transformer Evaluation Report\n")
         f.write(f"Log Type: {log_type}\n")
+        if embedding_type:
+            f.write(f"Embedding Type: {embedding_type}\n")
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Dataset: {len(all_targets)} test samples\n")
         f.write("="*50 + "\n\n")
@@ -658,66 +729,117 @@ def evaluate_model(model, test_loader, log_type):
     print(f"\nEvaluation report saved: {report_path}")
 
 def main():
-    embeddings, labels = load_logbert_embeddings()
-    datasets = load_datasets(embeddings, labels)
     
-    for log_type, data in datasets.items():
-        print(f"\n{'='*50}")
-        print(f"Processing {log_type}")
-        print('='*50)
+    parser = argparse.ArgumentParser(description='Train hierarchical transformer on log embeddings')
+    parser.add_argument('--embedding_type', type=str, default='all', 
+                       choices=['all', 'logbert', 'fasttext', 'word2vec'],
+                       help='Type of embeddings to use (default: all)')
+    parser.add_argument('--log_type', type=str, default=None,
+                       help='Specific log type to process (processes all if not specified)')
+    parser.add_argument('--sample_size', type=int, default=None,
+                       help='Subsample size for processing (processes full dataset if not specified)')
+    
+    args = parser.parse_args()
+    
+    # Define embedding loading order
+    embedding_types = ['fasttext', 'word2vec', 'logbert'] if args.embedding_type == 'all' else [args.embedding_type]
+    
+    for embedding_type in embedding_types:
+        print(f"\n{'='*60}")
+        print(f"Processing with {embedding_type} embeddings")
+        print('='*60)
         
-        dataset = data['loader'].dataset
-        all_targets = torch.stack([dataset[i][4] for i in range(len(dataset))])
-        anomaly_mask = (all_targets.sum(dim=1) > 0)
-
-        normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
-        anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
-
-        def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
-            n = len(indices)
-            if n == 0:
-                return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)
-
-            n_train = int(train_ratio * n)
-            n_val = int(val_ratio * n)
-
-            # Ensure we have at least 1 sample for each split if possible
-            n_train = max(1, min(n_train, n - 2)) if n > 2 else n_train
-            n_val = max(1, min(n_val, n - n_train - 1)) if n > n_train + 1 else n_val
-
-            perm = torch.randperm(n)
-            return indices[perm[:n_train]], indices[perm[n_train:n_train+n_val]], indices[perm[n_train+n_val:]]
+        # Load embeddings based on type
+        try:
+            if embedding_type == 'logbert':
+                embeddings, labels = load_logbert_embeddings()
+            elif embedding_type == 'fasttext':
+                embeddings, labels = load_fasttext_embeddings()
+            elif embedding_type == 'word2vec':
+                embeddings, labels = load_word2vec_embeddings()
+            else:
+                print(f"Unsupported embedding type: {embedding_type}, skipping...")
+                continue
+        except Exception as e:
+            print(f"Failed to load {embedding_type} embeddings: {e}")
+            continue
         
-        normal_train, normal_val, normal_test = stratified_split(normal_idx)
-        anomaly_train, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
+        # Filter to specific log type if requested
+        if args.log_type:
+            if args.log_type in embeddings:
+                embeddings = {args.log_type: embeddings[args.log_type]}
+                labels = {args.log_type: labels[args.log_type]}
+            else:
+                print(f"Log type '{args.log_type}' not found in {embedding_type} embeddings: {list(embeddings.keys())}")
+                continue
         
-        train_indices = torch.cat([normal_train, anomaly_train])
-        val_indices = torch.cat([normal_val, anomaly_val])
-        test_indices = torch.cat([normal_test, anomaly_test])
+        datasets = load_datasets(embeddings, labels)
         
-        train_set = torch.utils.data.Subset(dataset, train_indices)
-        val_set = torch.utils.data.Subset(dataset, val_indices)
-        test_set = torch.utils.data.Subset(dataset, test_indices)
-        train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-        val_loader   = DataLoader(val_set,   batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-        test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-        
-        print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
+        for log_type, data in datasets.items():
+            print(f"\n{'='*50}")
+            print(f"Processing {log_type} with {embedding_type} embeddings")
+            print('='*50)
+            
+            dataset = data['loader'].dataset
+            
+            # Apply subsampling if specified
+            if args.sample_size and args.sample_size < len(dataset):
+                print(f"Subsampling {args.sample_size} samples from {len(dataset)} total samples")
+                indices = torch.randperm(len(dataset))[:args.sample_size]
+                dataset = torch.utils.data.Subset(dataset, indices)
+            
+            all_targets = torch.stack([dataset[i][4] for i in range(len(dataset))])
+            anomaly_mask = (all_targets.sum(dim=1) > 0)
 
-        model = HierarchicalTransformer(hierarchy).to(device)
-        if device.type == "cuda":
-            try:
-                import triton  # type: ignore  # noqa: F401
-                model = torch.compile(model, mode="max-autotune")
-            except Exception:
-                print("Triton not available or compile failed; using eager mode.")
-        model = train_model(model, train_loader, val_loader, epochs=10)
+            normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
+            anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
 
-        evaluate_model(model, test_loader, log_type)
+            def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
+                n = len(indices)
+                if n == 0:
+                    return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)
 
-        Path("models").mkdir(exist_ok=True)
-        torch.save(model.state_dict(), f"models/hierarchical_{log_type}.pth")
-        print(f"\nModel saved to models/hierarchical_{log_type}.pth")
+                n_train = int(train_ratio * n)
+                n_val = int(val_ratio * n)
+
+                # Ensure we have at least 1 sample for each split if possible
+                n_train = max(1, min(n_train, n - 2)) if n > 2 else n_train
+                n_val = max(1, min(n_val, n - n_train - 1)) if n > n_train + 1 else n_val
+
+                perm = torch.randperm(n)
+                return indices[perm[:n_train]], indices[perm[n_train:n_train+n_val]], indices[perm[n_train+n_val:]]
+            
+            normal_train, normal_val, normal_test = stratified_split(normal_idx)
+            anomaly_train, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
+            
+            train_indices = torch.cat([normal_train, anomaly_train])
+            val_indices = torch.cat([normal_val, anomaly_val])
+            test_indices = torch.cat([normal_test, anomaly_test])
+            
+            train_set = torch.utils.data.Subset(dataset, train_indices)
+            val_set = torch.utils.data.Subset(dataset, val_indices)
+            test_set = torch.utils.data.Subset(dataset, test_indices)
+            train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            val_loader   = DataLoader(val_set,   batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            
+            print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
+
+            model = HierarchicalTransformer(hierarchy).to(device)
+            if device.type == "cuda":
+                try:
+                    import triton  # type: ignore  # noqa: F401
+                    model = torch.compile(model, mode="max-autotune")
+                except Exception:
+                    print("Triton not available or compile failed; using eager mode.")
+            model = train_model(model, train_loader, val_loader, epochs=10)
+
+            evaluate_model(model, test_loader, log_type)
+
+            Path("models").mkdir(exist_ok=True)
+            model_path = f"models/hierarchical_{log_type}_{embedding_type}.pth"
+            torch.save(model.state_dict(), model_path)
+            print(f"\nModel saved to {model_path}")
 
 if __name__ == "__main__":
     main()
