@@ -148,7 +148,7 @@ def save_predictions_and_metrics(log_type, model_name, predictions, metrics, emb
     except Exception as e:
         print(f"⚠️  Could not save baseline report: {e}")
 
-def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False, fast=False):
+def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, skip_rf=False, skip_xgb=False, has_xgb=False, fast=False):
     """Create multi-label ML models.
     If fast=True, return only a lightweight Logistic Regression baseline and simplify hyperparameters.
     """
@@ -163,14 +163,15 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
         return models
 
     # Random Forest (defaults, but parallelized and slightly lighter for safety)
-    models['rf'] = MultiOutputClassifier(
-        RandomForestClassifier(
-            n_estimators=100,
-            random_state=random_state,
+    if not skip_rf:
+        models['rf'] = MultiOutputClassifier(
+            RandomForestClassifier(
+                n_estimators=100,
+                random_state=random_state,
+                n_jobs=N_JOBS
+            ),
             n_jobs=N_JOBS
-        ),
-        n_jobs=N_JOBS
-    )
+        )
 
     # Logistic Regression (defaults)
     if not skip_lr:
@@ -184,7 +185,7 @@ def create_multilabel_models(n_labels, random_state=42, large_dataset=False, ski
         models['knn'] = MultiOutputClassifier(KNeighborsClassifier(n_neighbors=3), n_jobs=N_JOBS)
 
     # XGBoost (defaults if available)
-    if has_xgb and HAS_XGBOOST:
+    if has_xgb and HAS_XGBOOST and not skip_xgb:
         models['xgb'] = MultiOutputClassifier(XGBClassifier(n_estimators=100, tree_method='hist', n_jobs=N_JOBS), n_jobs=N_JOBS)
 
     return models
@@ -520,11 +521,37 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
             }
     
     print(f"Training {model_name.upper()} model...")
+    print(f"Dataset: {len(X_train)} samples × {X_train.shape[1]} features × {y_train.shape[1]} classes")
+
+    # Add memory usage info if available
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+        print(f"Memory before training: {mem_before:.1f} MB")
+    except ImportError:
+        print("(Install psutil for memory monitoring)")
+
     start_time = time.time()
-    
-    # Train the model
-    model.fit(X_train, y_train)
-    training_time = time.time() - start_time
+
+    # Train the model with timeout protection
+    try:
+        model.fit(X_train, y_train)
+        training_time = time.time() - start_time
+        print(f"Training completed in {training_time:.1f} seconds")
+
+        # Memory usage after training
+        try:
+            mem_after = process.memory_info().rss / 1024 / 1024  # MB
+            mem_used = mem_after - mem_before
+            print(f"Memory after training: {mem_after:.1f} MB (used: {mem_used:.1f} MB)")
+        except:
+            pass
+
+    except Exception as e:
+        training_time = time.time() - start_time
+        print(f"Training failed after {training_time:.1f} seconds: {e}")
+        raise
     
     # Save the trained model
     model_path = MODELS_DIR / f'multilabel_{model_name}.joblib'
@@ -915,6 +942,8 @@ def main():
                         help='Optional subsample size BEFORE splitting (processes full dataset by default)')
     parser.add_argument('--fast', action='store_true',
                         help='Fast pass baseline (LR only, minimal visuals)')
+    parser.add_argument('--skip_large_models', action='store_true',
+                        help='Skip RF and XGBoost on datasets > 500K samples')
     args = parser.parse_args()
 
     # Determine which embedding types to process
@@ -924,6 +953,9 @@ def main():
     test_size = 0.2
     KNN_TRAIN_CAP = 80000
     KNN_TEST_CAP = 30000
+    RF_TRAIN_CAP = 200000  # Cap RF to avoid excessive memory/time
+    LR_TRAIN_CAP = 500000  # Cap LR for very large datasets
+    XGB_TRAIN_CAP = 300000  # Cap XGBoost for memory efficiency
 
     for embedding_type in embedding_types:
         log_types = find_available_log_types(embedding_type)
@@ -988,13 +1020,28 @@ def main():
                 # Save scaler
                 joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
 
-                # Create models (skip KNN on very large datasets)
+                # Create models with intelligent skipping for large datasets
                 large_dataset = len(X_train) > 300000
+                very_large_dataset = len(X_train) > 500000
+
+                # Skip heavy models on very large datasets
+                skip_rf = very_large_dataset and args.skip_large_models
+                skip_xgb = very_large_dataset and args.skip_large_models
+
+                if very_large_dataset:
+                    print(f"⚠️  Large dataset detected ({len(X_train)} samples)")
+                    if args.skip_large_models:
+                        print("⏭️  Skipping RF and XGBoost (--skip_large_models enabled)")
+                    else:
+                        print("⚡ Training heavy models - this may take a long time")
+
                 models = create_multilabel_models(
                     len(class_names),
                     large_dataset=large_dataset,
                     skip_knn=large_dataset,
                     skip_lr=False,
+                    skip_rf=skip_rf,
+                    skip_xgb=skip_xgb,
                     has_xgb=HAS_XGBOOST,
                     fast=args.fast
                 )
@@ -1009,41 +1056,56 @@ def main():
                     print(f"{'-'*40}")
 
                     try:
+                        # Apply dataset size caps based on model type
                         if model_name == 'knn':
                             # Cap KNN to avoid extremely long runs
-                            if len(X_train_scaled) > KNN_TRAIN_CAP:
-                                sel = np.random.choice(len(X_train_scaled), KNN_TRAIN_CAP, replace=False)
-                                X_train_local = X_train_scaled[sel]
-                                y_train_local = y_train[sel]
-                                print(f"KNN train capped to {len(X_train_local)} samples")
-                            else:
-                                X_train_local = X_train_scaled
-                                y_train_local = y_train
-                            if len(X_test_scaled) > KNN_TEST_CAP:
-                                sel = np.random.choice(len(X_test_scaled), KNN_TEST_CAP, replace=False)
-                                X_test_local = X_test_scaled[sel]
-                                y_test_local = y_test[sel]
-                                print(f"KNN test capped to {len(X_test_local)} samples")
-                            else:
-                                X_test_local = X_test_scaled
-                                y_test_local = y_test
-                            result = train_evaluate_multilabel_model(
-                                f"{model_name}_{log_type}",
-                                models[model_name],
-                                X_train_local, y_train_local,
-                                X_test_local, y_test_local,
-                                class_names, results_dir,
-                                log_type, embedding_type, False
-                            )
+                            train_cap = KNN_TRAIN_CAP
+                            test_cap = KNN_TEST_CAP
+                        elif model_name == 'rf':
+                            # Cap RF to avoid excessive memory/time
+                            train_cap = RF_TRAIN_CAP
+                            test_cap = len(X_test_scaled)  # Don't cap test for RF
+                        elif model_name == 'lr':
+                            # Cap LR for very large datasets
+                            train_cap = LR_TRAIN_CAP
+                            test_cap = len(X_test_scaled)  # Don't cap test for LR
+                        elif model_name == 'xgb':
+                            # Cap XGBoost for memory efficiency
+                            train_cap = XGB_TRAIN_CAP
+                            test_cap = len(X_test_scaled)  # Don't cap test for XGBoost
                         else:
-                            result = train_evaluate_multilabel_model(
-                                f"{model_name}_{log_type}",
-                                models[model_name],
-                                X_train_scaled, y_train,
-                                X_test_scaled, y_test,
-                                class_names, results_dir,
-                                log_type, embedding_type, False
-                            )
+                            train_cap = len(X_train_scaled)  # No cap for other models
+                            test_cap = len(X_test_scaled)
+
+                        # Apply training set cap
+                        if len(X_train_scaled) > train_cap:
+                            sel = np.random.choice(len(X_train_scaled), train_cap, replace=False)
+                            X_train_local = X_train_scaled[sel]
+                            y_train_local = y_train[sel]
+                            print(f"{model_name.upper()} train capped to {len(X_train_local)} samples")
+                        else:
+                            X_train_local = X_train_scaled
+                            y_train_local = y_train
+
+                        # Apply test set cap (usually only for KNN)
+                        if len(X_test_scaled) > test_cap:
+                            sel = np.random.choice(len(X_test_scaled), test_cap, replace=False)
+                            X_test_local = X_test_scaled[sel]
+                            y_test_local = y_test[sel]
+                            print(f"{model_name.upper()} test capped to {len(X_test_local)} samples")
+                        else:
+                            X_test_local = X_test_scaled
+                            y_test_local = y_test
+
+                        result = train_evaluate_multilabel_model(
+                            f"{model_name}_{log_type}",
+                            models[model_name],
+                            X_train_local, y_train_local,
+                            X_test_local, y_test_local,
+                            class_names, results_dir,
+                            log_type, embedding_type, False
+                        )
+
                         results.append(result)
                     except Exception as e:
                         print(f"Error training {model_name}: {e}")
