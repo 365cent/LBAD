@@ -68,6 +68,18 @@ if CPU_COUNT:
 else:
     N_JOBS = -1
 
+def _json_default(obj):
+    """JSON serializer for non-standard types (e.g., numpy types/arrays)."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
 def check_existing_predictions(log_type, model_name, embedding_type=None, force_restart=False):
     """Check if predictions already exist for a specific model and log type."""
     if force_restart:
@@ -417,7 +429,16 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
                 f.write(f"{model_name.upper()} Multi-Label Classification Report (FROM CACHE)\n")
                 f.write("=" * 60 + "\n")
                 f.write(f"Using cached predictions from: {existing_data.get('timestamp', 'unknown')}\n")
-                f.write(f"Test samples: {len(existing_data['predictions'])}\n")
+                # Be tolerant to different cache keys
+                cached_len = None
+                for key in ['predictions', 'y_pred']:
+                    if key in existing_data:
+                        try:
+                            cached_len = len(existing_data[key])
+                            break
+                        except Exception:
+                            pass
+                f.write(f"Test samples: {cached_len if cached_len is not None else 'unknown'}\n")
                 f.write(f"Number of classes: {len(class_names)}\n\n")
                 
                 f.write("OVERALL METRICS:\n")
@@ -702,8 +723,7 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
             tree_method='hist',
             use_label_encoder=False,
             verbosity=0,
-            eval_metric='logloss',
-            base_score=0.5  # Fix: Ensure base_score is within (0,1) for logistic loss
+            eval_metric='logloss'
         )
     )
     
