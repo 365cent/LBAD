@@ -105,113 +105,57 @@ def check_existing_predictions(log_type, model_name, embedding_type=None, force_
     return None, None
 
 def save_predictions_and_metrics(log_type, model_name, predictions, metrics, embedding_type=None):
-    """Save predictions and metrics for future reuse."""
+    """Save predictions and metrics in the same style as transformer outputs."""
     try:
-        # Create results directory
-        results_dir = RESULTS_DIR / f"multilabel_{log_type}"
+        # Match transformer-style directory
+        results_dir = RESULTS_DIR
         results_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save predictions
-        prediction_data = {
-            'log_type': log_type,
-            'model_name': model_name,
-            'embedding_type': embedding_type,
-            'predictions': predictions['y_pred'],
-            'probabilities': predictions.get('y_prob'),
-            'timestamp': time.time()
-        }
-        
-        prediction_file = results_dir / f"{model_name}_predictions.pkl"
-        with open(prediction_file, 'wb') as f:
-            pickle.dump(prediction_data, f)
-        
-        # Save metrics
-        metrics_file = results_dir / f"{model_name}_metrics.pkl"
-        with open(metrics_file, 'wb') as f:
-            pickle.dump(metrics, f)
-        
-        print(f"💾 Saved predictions and metrics for {model_name} to: {results_dir}")
-        
+
+        # Timestamped file like transformer evaluation
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        report_path = results_dir / f"hierarchical_{log_type}_evaluation_{timestamp}.txt"
+
+        # Write concise report to align with transformer
+        with open(report_path, 'w') as f:
+            f.write(f"Hierarchical Transformer Evaluation Report (Baselines)\n")
+            f.write(f"Log Type: {log_type}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Dataset: {len(predictions['y_pred'])} test samples\n")
+            f.write("="*50 + "\n\n")
+
+            f.write("Overall Metrics:\n")
+            f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
+            f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
+            f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
+            f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
+            f.write(f"Weighted F1: {metrics['weighted_f1']:.4f}\n")
+            f.write(f"Jaccard (Micro): {metrics['jaccard_micro']:.4f}\n")
+            f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n")
+
+        print(f"Saved baseline report: {report_path}")
     except Exception as e:
-        print(f"⚠️  Could not save predictions for {model_name}: {e}")
+        print(f"⚠️  Could not save baseline report: {e}")
 
 def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False):
-    """Create multi-label ML models."""
+    """Create multi-label ML models with system defaults for fair comparison."""
     models = {}
-    
-    # Random Forest - naturally handles multi-output
-    models['rf'] = MultiOutputClassifier(
-        RandomForestClassifier(
-            n_estimators=100,
-            max_depth=15,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            max_features='sqrt',
-            bootstrap=True,
-            random_state=random_state,
-            n_jobs=N_JOBS,
-            class_weight='balanced'
-        )
-    )
-    
-    # Logistic baseline: use SGD (logistic) for large datasets, else saga LR
+
+    # Random Forest (defaults)
+    models['rf'] = MultiOutputClassifier(RandomForestClassifier())
+
+    # Logistic Regression (defaults)
     if not skip_lr:
-        if large_dataset:
-            models['lr'] = MultiOutputClassifier(
-                SGDClassifier(
-                    loss='log_loss',
-                    penalty='l2',
-                    alpha=1e-4,
-                    max_iter=20,
-                    tol=1e-3,
-                    random_state=random_state,
-                    n_jobs=N_JOBS
-                )
-            )
-        else:
-            models['lr'] = MultiOutputClassifier(
-                LogisticRegression(
-                    penalty='l2',
-                    C=1.0,
-                    solver='saga',  # scales better
-                    max_iter=500,
-                    tol=1e-3,
-                    random_state=random_state,
-                    class_weight='balanced'
-                )
-            )
-    
-    # K-Nearest Neighbors - heavy for very large data; allow skipping
-    if not skip_knn and not large_dataset:
-        models['knn'] = MultiOutputClassifier(
-            KNeighborsClassifier(
-                n_neighbors=3,
-                weights='distance',
-                algorithm='brute',
-                metric='cosine',
-                n_jobs=N_JOBS
-            )
-        )
-    
-    # XGBoost if available - optimized for imbalanced multi-label data
+        models['lr'] = MultiOutputClassifier(LogisticRegression())
+
+    # K-Nearest Neighbors (defaults)
+    if not skip_knn:
+        models['knn'] = MultiOutputClassifier(KNeighborsClassifier())
+
+    # XGBoost (defaults if available)
     if has_xgb and HAS_XGBOOST:
-        models['xgb'] = MultiOutputClassifier(
-            XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,              # Helps with overfitting
-                colsample_bytree=0.8,       # Feature sampling 
-                min_child_weight=3,         # Conservative to avoid overfitting on rare classes
-                random_state=random_state,
-                n_jobs=N_JOBS,
-                tree_method='hist',         # Efficient for large datasets
-                verbosity=0,
-                use_label_encoder=False,
-                eval_metric='logloss'
-            )
-        )
-    
+        models['xgb'] = MultiOutputClassifier(XGBClassifier())
+
     return models
 
 def find_available_log_types(embedding_type: str = None):
@@ -538,61 +482,26 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
     # Calculate metrics
     metrics = calculate_multilabel_metrics(y_test, y_pred, y_prob)
     
-    # Create detailed report
-    report_path = results_dir / f'{model_name}_multilabel_report.txt'
+    # Write transformer-style simple report
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    report_path = results_dir / f"hierarchical_{log_type or 'unknown'}_evaluation_{timestamp}.txt"
     with open(report_path, 'w') as f:
-        f.write(f"{model_name.upper()} Multi-Label Classification Report\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"Training time: {training_time:.2f} seconds\n")
-        f.write(f"Test samples: {len(y_test)}\n")
-        f.write(f"Number of classes: {len(class_names)}\n\n")
-        
-        f.write("OVERALL METRICS:\n")
-        f.write("-" * 40 + "\n")
+        f.write(f"Hierarchical Transformer Evaluation Report (Baseline: {model_name})\n")
+        f.write(f"Log Type: {log_type or 'unknown'}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Dataset: {len(y_test)} test samples\n")
+        f.write("="*50 + "\n\n")
+        f.write("Overall Metrics:\n")
         f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
         f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
         f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
         f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
-        f.write(f"Weighted F1: {metrics['weighted_f1']:.4f}\n")
         f.write(f"Samples F1: {metrics['samples_f1']:.4f}\n")
         f.write(f"Jaccard (Micro): {metrics['jaccard_micro']:.4f}\n")
-        f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n\n")
-        
-        f.write("PER-CLASS METRICS:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
-        f.write("-" * 90 + "\n")
-        
-        # Calculate support for each class
-        support = y_test.sum(axis=0)
-        
-        for i, cls_name in enumerate(class_names):
-            f1 = metrics['per_class']['f1'][i]
-            precision = metrics['per_class']['precision'][i]
-            recall = metrics['per_class']['recall'][i]
-            accuracy = metrics['per_class']['accuracy'][i]
-            specificity = metrics['per_class']['specificity'][i]
-            fpr = metrics['per_class']['false_positive_rate'][i]
-            sup = int(support[i])
-            
-            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
-        
-        # Add detailed confusion matrix information
-        f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
-        f.write("-" * 60 + "\n")
-        
-        for i, cls_name in enumerate(class_names):
-            tp = metrics['per_class']['true_positives'][i]
-            fp = metrics['per_class']['false_positives'][i]
-            tn = metrics['per_class']['true_negatives'][i]
-            fn = metrics['per_class']['false_negatives'][i]
-            npv = metrics['per_class']['negative_predictive_value'][i]
-            
-            f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
+        f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n")
     
-    # Create visualization
+    # Optional visualizations kept the same
     create_multilabel_visualization(y_test, y_pred, class_names, model_name, results_dir)
     
     # Save predictions and metrics for future reuse
