@@ -255,6 +255,14 @@ def smote_data(train_loader, val_loader):
             for i, tensor in enumerate(batch):
                 all_data[i].append(tensor.detach().cpu().numpy())
         cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
+
+        # Safety cap: limit rows used for resampling to avoid OOM/very long runs
+        n_total = y.shape[0]
+        max_rows = 400_000 if device.type == "cuda" else 200_000
+        if n_total > max_rows:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(n_total, size=max_rows, replace=False)
+            cls, mean, maxp, attn, y = cls[idx], mean[idx], maxp[idx], attn[idx], y[idx]
         
         # Preprocessing
         scalers = [StandardScaler().fit(data) for data in [cls, mean, maxp, attn]]
@@ -271,13 +279,13 @@ def smote_data(train_loader, val_loader):
         
         for c in range(y.shape[1]):
             pos_mask = y[:, c] == 1
-            pos_count = pos_mask.sum()
+            pos_count = int(pos_mask.sum())
             
             if pos_count == 0:
                 continue
                 
             neg_mask = y[:, c] == 0
-            neg_count = neg_mask.sum()
+            neg_count = int(neg_mask.sum())
             
             # Determine target counts for balance
             total_samples = pos_count + neg_count
@@ -285,7 +293,16 @@ def smote_data(train_loader, val_loader):
             target_per_class = max(target_per_class, pos_count)  # Never undersample minority
             
             # Prepare class-specific data
-            class_idx = np.where(pos_mask | neg_mask)[0]
+            # Subsample negatives to keep class-specific processing bounded
+            rng = np.random.default_rng(42 + c)
+            pos_idx = np.where(pos_mask)[0]
+            neg_idx = np.where(neg_mask)[0]
+            neg_keep = min(len(neg_idx), max(3 * len(pos_idx), 10000))
+            if neg_keep > 0:
+                neg_idx_sampled = rng.choice(neg_idx, size=neg_keep, replace=False)
+                class_idx = np.concatenate([pos_idx, neg_idx_sampled])
+            else:
+                class_idx = pos_idx
             X_class = X_reduced[class_idx]
             y_class = y[class_idx, c].astype(int)
             
@@ -332,9 +349,15 @@ def smote_data(train_loader, val_loader):
         if not X_final:
             return train_loader
 
-        # Combine all resampled classes (skip dedup to save RAM)
+        # Combine all resampled classes (skip dedup to save RAM) and optionally cap size
         X_final = np.vstack(X_final)
         y_final = np.vstack(y_final)
+        max_out = 1_000_000 if device.type == "cuda" else 500_000
+        if len(X_final) > max_out:
+            rng = np.random.default_rng(123)
+            keep = rng.choice(len(X_final), size=max_out, replace=False)
+            X_final = X_final[keep]
+            y_final = y_final[keep]
         
         # Inverse transform to original feature space
         splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
@@ -345,7 +368,7 @@ def smote_data(train_loader, val_loader):
             for i in range(0, len(block), bs):
                 out.append(scaler.inverse_transform(pca.inverse_transform(block[i:i+bs])))
             return np.vstack(out)
-        final_features = [_inv(p, s, b) for (p, s, b) in zip(pcas, scalers, x_blocks)]
+        final_features = [_inv(p, s, b, bs=100_000 if device.type=="cuda" else 50_000) for (p, s, b) in zip(pcas, scalers, x_blocks)]
         
         # Create balanced dataset
         dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features + [y_final]])
