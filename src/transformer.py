@@ -243,139 +243,131 @@ def load_datasets(embeddings, labels, batch_size=128):
     return datasets
 
 def smote_data(train_loader, val_loader):
-    # Apply SMOTE with special handling for extremely imbalanced classes
-    target_ratio = 0.1
-    max_neg_per_pos = 15
-    min_pos = 1  # Allow even single-sample classes
-    pca_dims = (64, 64, 64, 8)  # Reduced for efficiency
-    random_state = 42
-
-    spinner = halo.Halo(text="Applying SMOTE", spinner="dots")
+    """Apply balanced resampling to address class imbalance"""
+    spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
     spinner.start()
 
     try:
-        # Extract and stack training data
+        # Extract training data
         all_data = [[], [], [], [], []]
         for batch in train_loader:
             for i, tensor in enumerate(batch):
                 all_data[i].append(tensor.detach().cpu().numpy())
         cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
-        N, L = y.shape
-
-        # Preprocessing pipeline
+        
+        # Preprocessing
         scalers = [StandardScaler().fit(data) for data in [cls, mean, maxp, attn]]
         scaled = [scaler.transform(data) for scaler, data in zip(scalers, [cls, mean, maxp, attn])]
         
-        # Energy equalization and PCA
-        eq_data = [data * (1.0 / np.sqrt(data.shape[1])) for data in scaled]
-        pcas = [PCA(n_components=min(dim, data.shape[1]), svd_solver='auto').fit(data) 
-                for dim, data in zip(pca_dims, eq_data)]
-        Xr = np.hstack([pca.transform(data) for pca, data in zip(pcas, eq_data)])
+        # Dimensionality reduction for efficiency
+        pca_dims = [min(64, data.shape[1]) for data in scaled]
+        pcas = [PCA(n_components=dim, svd_solver='auto').fit(data) 
+                for dim, data in zip(pca_dims, scaled)]
+        X_reduced = np.hstack([pca.transform(data) for pca, data in zip(pcas, scaled)])
 
-        # Class-aware SMOTE with adaptive parameters
-        rng = np.random.default_rng(random_state)
-        synth_Z, synth_Y = [], []
+        # Process each class
+        X_final, y_final = [], []
         
-        for c in range(L):
-            pos_idx = np.flatnonzero(y[:, c])
-            if len(pos_idx) < min_pos:
-                continue
-                
-            neg_idx = np.flatnonzero(y[:, c] == 0)
-            k_neg = min(len(neg_idx), max_neg_per_pos * len(pos_idx))
-            if k_neg == 0:
-                continue
-                
-            # Subset data
-            sub_idx = np.concatenate([pos_idx, rng.choice(neg_idx, k_neg, replace=False)])
-            X_sub, y_sub = Xr[sub_idx], y[sub_idx, c].astype(int)
+        for c in range(y.shape[1]):
+            pos_mask = y[:, c] == 1
+            pos_count = pos_mask.sum()
             
-            # Adaptive SMOTE parameters based on class size
-            if len(pos_idx) < 5:  # Micro classes
-                k_neighbors = 1
-                ratio = min(0.5, 50 / len(pos_idx))  # Aggressive oversampling
-                clusters = max(1, len(pos_idx) // 2)
-            elif len(pos_idx) < 50:  # Small classes  
-                k_neighbors = min(2, len(pos_idx) - 1)
-                ratio = min(0.3, 20 / len(pos_idx))
-                clusters = max(5, len(pos_idx) // 3)
-            else:  # Regular classes
-                k_neighbors = min(5, len(pos_idx) - 1)
-                ratio = target_ratio
-                clusters = 25
-
-            try:
-                # Only apply SMOTE to small classes - skip if already high count
-                if len(pos_idx) > 1000:  # Skip classes that are already well-represented
-                    continue
-                    
-                smote = KMeansSMOTE(
-                    sampling_strategy=ratio,
-                    k_neighbors=k_neighbors,
-                    random_state=random_state,
-                    cluster_balance_threshold=0.05,
-                    kmeans_estimator=clusters
-                )
-                X_res, y_res = smote.fit_resample(X_sub, y_sub)
-                
-                # Extract new synthetic samples
-                n_new = int(y_res.sum()) - int(y_sub.sum())
-                if n_new > 0:
-                    new_idx = np.flatnonzero(y_res)[-n_new:]
-                    Z_new = X_res[new_idx]
-                    Y_new = np.zeros((n_new, L), dtype=y.dtype)
-                    Y_new[:, c] = 1
-                    synth_Z.append(Z_new)
-                    synth_Y.append(Y_new)
-            except Exception:
+            if pos_count == 0:
                 continue
+                
+            neg_mask = y[:, c] == 0
+            neg_count = neg_mask.sum()
+            
+            # Determine target counts for balance
+            total_samples = pos_count + neg_count
+            target_per_class = int(np.sqrt(total_samples * pos_count))
+            target_per_class = max(target_per_class, pos_count)  # Never undersample minority
+            
+            # Prepare class-specific data
+            class_idx = np.where(pos_mask | neg_mask)[0]
+            X_class = X_reduced[class_idx]
+            y_class = y[class_idx, c].astype(int)
+            
+            # Apply resampling pipeline
+            try:
+                # Determine strategy based on class balance
+                if pos_count < target_per_class:
+                    # Oversample minority class
+                    k_neighbors = min(3, pos_count - 1) if pos_count > 1 else 1
+                    oversample_ratio = min(target_per_class / pos_count, 5.0)
+                    
+                    smote = KMeansSMOTE(
+                        sampling_strategy={1: int(pos_count * oversample_ratio)},
+                        k_neighbors=k_neighbors,
+                        random_state=42,
+                        cluster_balance_threshold=0.1
+                    )
+                    X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
+                else:
+                    X_resampled, y_resampled = X_class, y_class
+                
+                # Undersample majority class if needed
+                if (y_resampled == 0).sum() > target_per_class:
+                    undersampler = RandomUnderSampler(
+                        sampling_strategy={0: target_per_class},
+                        random_state=42
+                    )
+                    X_resampled, y_resampled = undersampler.fit_resample(X_resampled, y_resampled)
+                
+                # Store resampled data for this class
+                y_class_matrix = np.zeros((len(y_resampled), y.shape[1]))
+                y_class_matrix[:, c] = y_resampled
+                
+                X_final.append(X_resampled)
+                y_final.append(y_class_matrix)
+                
+            except Exception:
+                # Fallback: use original data
+                y_class_matrix = np.zeros((len(y_class), y.shape[1]))
+                y_class_matrix[:, c] = y_class
+                X_final.append(X_class)
+                y_final.append(y_class_matrix)
 
-        if not synth_Z:
+        if not X_final:
             return train_loader
 
-        # Reconstruct original feature space
-        Z_syn = np.vstack(synth_Z)
+        # Combine all resampled classes
+        X_combined = np.vstack(X_final)
+        y_combined = np.vstack(y_final)
+        
+        # Aggregate overlapping samples
+        unique_samples = {}
+        for i in range(len(X_combined)):
+            key = tuple(X_combined[i])
+            if key not in unique_samples:
+                unique_samples[key] = np.zeros(y.shape[1])
+            unique_samples[key] = np.maximum(unique_samples[key], y_combined[i])
+        
+        X_final = np.array(list(unique_samples.keys()))
+        y_final = np.array(list(unique_samples.values()))
+        
+        # Inverse transform to original feature space
         splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
-        z_blocks = np.split(Z_syn, splits, axis=1)
+        x_blocks = np.split(X_final, splits, axis=1)
+        reconstructed = [pca.inverse_transform(block) for pca, block in zip(pcas, x_blocks)]
+        final_features = [scaler.inverse_transform(block) for scaler, block in zip(scalers, reconstructed)]
         
-        # Inverse transform
-        rec_blocks = [pca.inverse_transform(z) for pca, z in zip(pcas, z_blocks)]
-        final_blocks = [scaler.inverse_transform(rec) for scaler, rec in zip(scalers, rec_blocks)]
+        # Create balanced dataset
+        dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features + [y_final]])
         
-        # Create augmented dataset
-        aug_data = [np.vstack([orig, syn]) for orig, syn in zip([cls, mean, maxp, attn], final_blocks)]
-        y_aug = np.vstack([y, np.vstack(synth_Y)])
-        
-        dataset = TensorDataset(*[torch.from_numpy(data).float() for data in aug_data + [y_aug]])
-        
-        # Print distribution
-        print(f"\nSMOTE enhanced dataset: {len(dataset)} samples")
-        normal_count = (torch.from_numpy(y_aug).sum(dim=1) == 0).sum().item()
-        print(f"  normal: {normal_count} ({normal_count/len(dataset):.2%})")
-        
-        node_names = []
-        def collect_names(hier):
-            for node, children in hier.items():
-                node_names.append(node)
-                if isinstance(children, dict):
-                    for child, leaves in children.items():
-                        node_names.append(child)
-                        node_names.extend(leaves)
-        collect_names(hierarchy)
-        
-        for i, name in enumerate(node_names[:y_aug.shape[1]]):
-            count = int(y_aug[:, i].sum())
-            if count > 0:
-                print(f"  {name}: {count} ({count/len(dataset):.2%})")
+        print(f"\nBalanced dataset: {len(dataset)} samples")
+        anomaly_count = (torch.from_numpy(y_final).sum(dim=1) > 0).sum().item()
+        print(f"  normal: {len(dataset) - anomaly_count} ({(len(dataset) - anomaly_count)/len(dataset):.2%})")
+        print(f"  anomalies: {anomaly_count} ({anomaly_count/len(dataset):.2%})")
 
         return DataLoader(dataset, batch_size=getattr(train_loader, 'batch_size', 128), shuffle=True)
 
     except Exception as e:
-        print(f"SMOTE failed: {e}")
+        print(f"Resampling failed: {e}")
         return train_loader
     finally:
         try:
-            spinner.stop_and_persist(text="SMOTE completed")
+            spinner.stop_and_persist(text="Resampling completed")
         except:
             pass
 
