@@ -43,18 +43,25 @@ hierarchy = {
 }
 
 class HierarchicalTransformer(nn.Module):
-    def __init__(self, hierarchy, hidden_dim=512, num_heads=4, num_layers=2):
+    def __init__(self, hierarchy, hidden_dim=512, num_heads=4, num_layers=2,
+                 cls_in=768, mean_in=768, max_in=768, attn_in=10):
         super().__init__()
         self.hierarchy = hierarchy
-        self.cls_proj, self.mean_proj = nn.Linear(768, hidden_dim), nn.Linear(768, hidden_dim)
-        self.max_proj, self.attn_proj = nn.Linear(768, hidden_dim), nn.Linear(10, hidden_dim)
+        self.cls_proj = nn.Linear(cls_in, hidden_dim)
+        self.mean_proj = nn.Linear(mean_in, hidden_dim)
+        self.max_proj = nn.Linear(max_in, hidden_dim)
+        self.attn_proj = nn.Linear(attn_in, hidden_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        self.input_recon_dim = cls_in + mean_in + max_in + attn_in
         self.bottleneck = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.decoder = nn.Sequential(nn.Linear(hidden_dim // 2, hidden_dim), nn.ReLU(),
-                                     nn.Linear(hidden_dim, 2314))
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.input_recon_dim)
+        )
 
         self.heads = nn.ModuleDict()
         self.parent_child_map = {}
@@ -299,8 +306,20 @@ def create_multilabel_targets(labels_dict, hierarchy):
 def load_datasets(embeddings, labels, batch_size=128):
     datasets = {}
     for log_type, log_vectors in embeddings.items():
-        cls_tokens, mean_pooling = log_vectors[:, :768], log_vectors[:, 768:1536]
-        max_pooling, attn = log_vectors[:, 1536:2304], log_vectors[:, 2304:]
+        dim = log_vectors.shape[1]
+        if dim == 2314:
+            # LogBERT enhanced
+            cls_tokens, mean_pooling = log_vectors[:, :768], log_vectors[:, 768:1536]
+            max_pooling, attn = log_vectors[:, 1536:2304], log_vectors[:, 2304:]
+            in_dims = (768, 768, 768, 10)
+        else:
+            # FastText / Word2Vec etc. Treat as single vector; route via cls, others zeros
+            cls_tokens = log_vectors
+            feat_dim = dim
+            zero = np.zeros((log_vectors.shape[0], feat_dim), dtype=log_vectors.dtype)
+            mean_pooling, max_pooling = zero, zero
+            attn = np.zeros((log_vectors.shape[0], 10), dtype=log_vectors.dtype)
+            in_dims = (feat_dim, feat_dim, feat_dim, 10)
         
         if log_type in labels:
             targets = create_multilabel_targets(labels[log_type], hierarchy)
@@ -319,7 +338,7 @@ def load_datasets(embeddings, labels, batch_size=128):
         )
         
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-        datasets[log_type] = {'loader': loader, 'num_samples': log_vectors.shape[0]}
+        datasets[log_type] = {'loader': loader, 'num_samples': log_vectors.shape[0], 'in_dims': in_dims}
         
         total = log_vectors.shape[0]
         anomalies = (targets.sum(axis=1) > 0).sum()
@@ -358,15 +377,28 @@ def smote_data(train_loader, val_loader):
             idx = rng.choice(n_total, size=max_rows, replace=False)
             cls, mean, maxp, attn, y = cls[idx], mean[idx], maxp[idx], attn[idx], y[idx]
         
-        # Preprocessing
-        scalers = [StandardScaler().fit(data) for data in [cls, mean, maxp, attn]]
-        scaled = [scaler.transform(data) for scaler, data in zip(scalers, [cls, mean, maxp, attn])]
+        # Preprocessing (skip zero-width blocks)
+        blocks = [cls, mean, maxp, attn]
+        scalers, scaled = [], []
+        for b in blocks:
+            if b.shape[1] > 0:
+                sc = StandardScaler().fit(b)
+                scalers.append(sc)
+                scaled.append(sc.transform(b))
+            else:
+                scalers.append(None)
+                scaled.append(b)
         
         # Dimensionality reduction for efficiency
-        pca_dims = [min(48, scaled[0].shape[1]), min(48, scaled[1].shape[1]), min(48, scaled[2].shape[1]), min(8,  scaled[3].shape[1])]  # replace
-        pcas = [PCA(n_components=dim, svd_solver='auto').fit(data) 
-                for dim, data in zip(pca_dims, scaled)]
-        X_reduced = np.hstack([pca.transform(data) for pca, data in zip(pcas, scaled)])
+        pca_dims = [min(48, s.shape[1]) if s.shape[1] > 0 else 0 for s in scaled]
+        pcas = [PCA(n_components=dim, svd_solver='auto').fit(s) if dim > 0 else None for dim, s in zip(pca_dims, scaled)]
+        reduced_parts = []
+        for p, s in zip(pcas, scaled):
+            if p is None:
+                reduced_parts.append(np.zeros((s.shape[0], 0), dtype=s.dtype))
+            else:
+                reduced_parts.append(p.transform(s))
+        X_reduced = np.hstack(reduced_parts)
 
         # Process each class
         X_final, y_final = [], []
@@ -454,13 +486,17 @@ def smote_data(train_loader, val_loader):
             y_final = y_final[keep]
         
         # Inverse transform to original feature space
-        splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
+        splits = np.cumsum([p.n_components_ if p is not None else 0 for p in pcas[:-1]])
         x_blocks = np.split(X_final, splits, axis=1)
         # Batched inverse-transform to limit peak memory
         def _inv(pca, scaler, block, bs=200000):
             out = []
             for i in range(0, len(block), bs):
-                out.append(scaler.inverse_transform(pca.inverse_transform(block[i:i+bs])))
+                chunk = block[i:i+bs]
+                if pca is None or scaler is None or chunk.shape[1] == 0:
+                    out.append(np.zeros((len(chunk), 0), dtype=chunk.dtype))
+                else:
+                    out.append(scaler.inverse_transform(pca.inverse_transform(chunk)))
             return np.vstack(out)
         final_features = [_inv(p, s, b, bs=100_000 if device.type=="cuda" else 50_000) for (p, s, b) in zip(pcas, scalers, x_blocks)]
         
@@ -851,7 +887,8 @@ def main():
             
             print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
 
-            model = HierarchicalTransformer(hierarchy).to(device)
+            in_dims = data.get('in_dims', (768, 768, 768, 10))
+            model = HierarchicalTransformer(hierarchy, cls_in=in_dims[0], mean_in=in_dims[1], max_in=in_dims[2], attn_in=in_dims[3]).to(device)
             if device.type == "cuda":
                 try:
                     import triton  # type: ignore  # noqa: F401
