@@ -423,6 +423,29 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
         if existing_data is not None and existing_metrics is not None:
             print(f"⏩ Skipping training for {model_name} - using existing predictions")
             
+            # Display concise per-class classification report in console (from cache)
+            print(f"\n{model_name.upper()} - Per-Class Classification Report (FROM CACHE):")
+            print("=" * 80)
+            print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+            print("-" * 54)
+
+            # Calculate support for each class from y_test
+            support = y_test.sum(axis=0)
+
+            for i, cls_name in enumerate(class_names):
+                f1 = existing_metrics['per_class']['f1'][i]
+                precision = existing_metrics['per_class']['precision'][i]
+                recall = existing_metrics['per_class']['recall'][i]
+                sup = int(support[i])
+
+                # Only show classes with support > 0 to keep it concise
+                if sup > 0:
+                    print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
+
+            # Show summary stats
+            print("-" * 54)
+            print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
+
             # Create report from existing data
             report_path = results_dir / f'{model_name}_multilabel_report.txt'
             with open(report_path, 'w') as f:
@@ -521,7 +544,30 @@ def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test,
     
     # Calculate metrics
     metrics = calculate_multilabel_metrics(y_test, y_pred, y_prob)
-    
+
+    # Display concise per-class classification report in console
+    print(f"\n{model_name.upper()} - Per-Class Classification Report:")
+    print("=" * 80)
+    print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+    print("-" * 54)
+
+    # Calculate support for each class
+    support = y_test.sum(axis=0)
+
+    for i, cls_name in enumerate(class_names):
+        f1 = metrics['per_class']['f1'][i]
+        precision = metrics['per_class']['precision'][i]
+        recall = metrics['per_class']['recall'][i]
+        sup = int(support[i])
+
+        # Only show classes with support > 0 to keep it concise
+        if sup > 0:
+            print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
+
+    # Show summary stats
+    print("-" * 54)
+    print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
+
     # Write transformer-style simple report
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -645,6 +691,29 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
         if existing_data is not None and existing_metrics is not None:
             print(f"⏩ Skipping training for xgboost_traditional - using existing predictions")
             
+            # Display concise per-class classification report in console (from cache)
+            print(f"\nXGBOOST_TRADITIONAL - Per-Class Classification Report (FROM CACHE):")
+            print("=" * 80)
+            print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+            print("-" * 54)
+
+            # Calculate support for each class from y_test
+            support = y_test.sum(axis=0)
+
+            for i, cls_name in enumerate(class_names):
+                f1 = existing_metrics['per_class']['f1'][i]
+                precision = existing_metrics['per_class']['precision'][i]
+                recall = existing_metrics['per_class']['recall'][i]
+                sup = int(support[i])
+
+                # Only show classes with support > 0 to keep it concise
+                if sup > 0:
+                    print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
+
+            # Show summary stats
+            print("-" * 54)
+            print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
+
             # Create report from existing data
             report_path = results_dir / 'xgboost_traditional_report.txt'
             with open(report_path, 'w') as f:
@@ -737,7 +806,30 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
     
     # Calculate metrics
     metrics = calculate_multilabel_metrics(y_test, y_pred)
-    
+
+    # Display concise per-class classification report in console
+    print(f"\nXGBOOST_TRADITIONAL - Per-Class Classification Report:")
+    print("=" * 80)
+    print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
+    print("-" * 54)
+
+    # Calculate support for each class
+    support = y_test.sum(axis=0)
+
+    for i, cls_name in enumerate(class_names):
+        f1 = metrics['per_class']['f1'][i]
+        precision = metrics['per_class']['precision'][i]
+        recall = metrics['per_class']['recall'][i]
+        sup = int(support[i])
+
+        # Only show classes with support > 0 to keep it concise
+        if sup > 0:
+            print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
+
+    # Show summary stats
+    print("-" * 54)
+    print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
+
     # Save detailed results
     report_path = results_dir / 'xgboost_traditional_report.txt'
     with open(report_path, 'w') as f:
