@@ -28,13 +28,7 @@ from sklearn.metrics import (
     hamming_loss, jaccard_score, accuracy_score, multilabel_confusion_matrix
 )
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
-
-# Ensure Matplotlib can write cache/config on HPC
+# Ensure Matplotlib can write cache/config on HPC BEFORE importing matplotlib
 try:
     if "MPLCONFIGDIR" not in os.environ:
         _mpl_dir = Path.cwd() / ".mplconfig"
@@ -42,6 +36,11 @@ try:
         os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
 except Exception:
     pass
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
 
 # Try XGBoost with fallback
 try:
@@ -773,224 +772,183 @@ def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, res
 
 
 def main():
-    """Main function for multi-label ML baseline."""
+    """Main function for multi-label ML baseline with a simple CLI (like transformer.py)."""
     parser = argparse.ArgumentParser(description='Multi-Label ML Baseline for Log Analysis')
-    parser.add_argument('--log-type', type=str, help='Specific log type to process')
-    parser.add_argument('--embedding-type', type=str, help='Embedding subfolder (fasttext|logbert|word2vec)')
-    parser.add_argument('--model', choices=['rf', 'lr', 'knn', 'xgb', 'all'], 
-                        default='all', help='Model to train (default: all)')
-    parser.add_argument('--test-size', type=float, default=0.2, 
-                        help='Test set proportion (default: 0.2)')
-    parser.add_argument('--max-train-samples', type=int, default=200000, help='Cap training samples for scalability')
-    parser.add_argument('--max-test-samples', type=int, default=50000, help='Cap test samples for scalability')
-    parser.add_argument('--disable-downsample', action='store_true', help='Use full dataset (may be slow)')
-    parser.add_argument('--skip-knn', action='store_true', help='Skip KNN model')
-    parser.add_argument('--skip-lr', action='store_true', help='Skip Logistic baseline')
-    parser.add_argument('--with-xgb', action='store_true', help='Enable XGBoost baseline if available')
-    parser.add_argument('--knn-train-cap', type=int, default=80000, help='Max samples for KNN training')
-    parser.add_argument('--knn-test-cap', type=int, default=30000, help='Max samples for KNN prediction')
-    parser.add_argument('--force-restart', action='store_true', help='Force restart training (ignore existing predictions)')
+    parser.add_argument('--embedding_type', '--embedding-type', dest='embedding_type', type=str, default='all',
+                        choices=['all', 'logbert', 'fasttext', 'word2vec'],
+                        help='Type of embeddings to use (default: all)')
+    parser.add_argument('--log_type', '--log-type', dest='log_type', type=str, default=None,
+                        help='Specific log type to process (processes all if not specified)')
+    parser.add_argument('--sample_size', '--sample-size', dest='sample_size', type=int, default=None,
+                        help='Optional subsample size BEFORE splitting (processes full dataset by default)')
     args = parser.parse_args()
-    
-    # Find available log types
-    available_log_types = find_available_log_types(args.embedding_type)
-    
-    if not available_log_types:
-        print("No processed log types found. Please run embeddings generation first.")
-        return
-    
-    print(f"Available log types: {available_log_types}")
-    
-    # Select log types to process
-    if args.log_type:
-        if args.log_type in available_log_types:
-            log_types_to_process = [args.log_type]
-        else:
-            print(f"Log type '{args.log_type}' not found.")
-            return
-    else:
-        log_types_to_process = available_log_types
-    
-    # Process each log type
-    for log_type in log_types_to_process:
-        print(f"\n{'='*60}")
-        print(f"Processing log type: {log_type}")
-        print(f"{'='*60}")
-        
-        # Create results directory
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        results_dir = RESULTS_DIR / f"multilabel_{log_type}_{timestamp}"
-        results_dir.mkdir(exist_ok=True)
-        
-        try:
-            # Load data
-            X, y, class_names = load_multilabel_data(log_type, args.embedding_type)
-            
-            # Skip if no positive labels
-            if y.sum() == 0:
-                print(f"No positive labels found for {log_type}, skipping...")
-                continue
-            
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=args.test_size, random_state=42, stratify=None
-            )
 
-            # Downsample for scalability unless disabled
-            large_dataset = len(X_train) > 300000
-            if not args.disable_downsample:
-                if len(X_train) > args.max_train_samples:
-                    sel = np.random.choice(len(X_train), args.max_train_samples, replace=False)
-                    X_train = X_train[sel]
-                    y_train = y_train[sel]
-                    print(f"Downsampled train to {len(X_train)} samples for speed")
-                if len(X_test) > args.max_test_samples:
-                    sel = np.random.choice(len(X_test), args.max_test_samples, replace=False)
-                    X_test = X_test[sel]
-                    y_test = y_test[sel]
-                    print(f"Downsampled test to {len(X_test)} samples for speed")
-            
-            print(f"Train set: {len(X_train)} samples")
-            print(f"Test set: {len(X_test)} samples")
-            
-            # Standardize features
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
-            
-            # Save scaler
-            joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
-            
-            # Create models
-            models = create_multilabel_models(
-                len(class_names),
-                large_dataset=large_dataset,
-                skip_knn=(args.skip_knn or large_dataset),
-                skip_lr=args.skip_lr,
-                has_xgb=args.with_xgb
-            )
-            
-            # Select models to train
-            if args.model == 'all':
-                model_names = list(models.keys())
-            else:
-                model_names = [args.model] if args.model in models else []
-            
-            results = []
-            
-            # Train and evaluate each model
-            for model_name in model_names:
-                if model_name not in models:
-                    print(f"Model {model_name} not available, skipping...")
-                    continue
-                
-                print(f"\n{'-'*40}")
-                print(f"Training {model_name.upper()} for {log_type}")
-                print(f"{'-'*40}")
-                
-                try:
-                    # Apply additional capping specifically for KNN to avoid hangs
-                    if model_name == 'knn':
-                        if len(X_train_scaled) > args.knn_train_cap:
-                            sel = np.random.choice(len(X_train_scaled), args.knn_train_cap, replace=False)
-                            X_train_local = X_train_scaled[sel]
-                            y_train_local = y_train[sel]
-                            print(f"KNN train capped to {len(X_train_local)} samples")
-                        else:
-                            X_train_local = X_train_scaled
-                            y_train_local = y_train
-                        if len(X_test_scaled) > args.knn_test_cap:
-                            sel = np.random.choice(len(X_test_scaled), args.knn_test_cap, replace=False)
-                            X_test_local = X_test_scaled[sel]
-                            y_test_local = y_test[sel]
-                            print(f"KNN test capped to {len(X_test_local)} samples")
-                        else:
-                            X_test_local = X_test_scaled
-                            y_test_local = y_test
-                        result = train_evaluate_multilabel_model(
-                            f"{model_name}_{log_type}",
-                            models[model_name],
-                            X_train_local, y_train_local,
-                            X_test_local, y_test_local,
-                            class_names, results_dir,
-                            log_type, args.embedding_type, args.force_restart
-                        )
-                    else:
-                        result = train_evaluate_multilabel_model(
-                            f"{model_name}_{log_type}",
-                            models[model_name],
-                            X_train_scaled, y_train,
-                            X_test_scaled, y_test,
-                            class_names, results_dir,
-                            log_type, args.embedding_type, args.force_restart
-                        )
-                    results.append(result)
-                    
-                except Exception as e:
-                    print(f"Error training {model_name}: {e}")
-                    continue
-            
-            # Run XGBoost traditional approach if requested
-            if args.with_xgb and HAS_XGBOOST:
-                print(f"\n{'-'*40}")
-                print(f"Training XGBoost Traditional for {log_type}")
-                print(f"{'-'*40}")
-                try:
-                    result = train_traditional_xgboost(
-                        X_train_scaled, y_train,
-                        X_test_scaled, y_test,
-                        class_names, results_dir,
-                        log_type, args.embedding_type, args.force_restart
-                    )
-                    results.append(result)
-                except Exception as e:
-                    print(f"Error training XGBoost Traditional: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Create summary
-            if results:
-                print(f"\n{'='*60}")
-                print(f"SUMMARY FOR {log_type.upper()}")
-                print(f"{'='*60}")
-                
-                # Count cached vs trained models
-                cached_count = sum(1 for r in results if r.get('cached', False))
-                trained_count = len(results) - cached_count
-                
-                print(f"📊 Models trained: {trained_count}, Predictions loaded from cache: {cached_count}")
-                print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming Loss':<15} {'Time (s)':<10} {'Status':<8}")
-                print("-" * 78)
-                
-                for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
-                    model_name = result['model_name']
-                    metrics = result['metrics']
-                    time_taken = result['training_time']
-                    status = "CACHED" if result.get('cached', False) else "TRAINED"
-                    
-                    print(f"{model_name:<20} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} "
-                          f"{metrics['hamming_loss']:<15.4f} {time_taken:<10.2f} {status:<8}")
-                
-                # Save summary
-                summary_path = results_dir / 'summary.json'
-                with open(summary_path, 'w') as f:
-                    json.dump({
-                        'log_type': log_type,
-                        'results': results,
-                        'class_names': class_names,
-                        'test_size': args.test_size,
-                        'timestamp': timestamp
-                    }, f, indent=2)
-                
-                print(f"\nResults saved to: {results_dir}")
-            
-        except Exception as e:
-            print(f"Error processing {log_type}: {e}")
-            import traceback
-            traceback.print_exc()
+    # Determine which embedding types to process
+    embedding_types = ['fasttext', 'word2vec', 'logbert'] if args.embedding_type == 'all' else [args.embedding_type]
+
+    # Fixed settings for simplicity
+    test_size = 0.2
+    KNN_TRAIN_CAP = 80000
+    KNN_TEST_CAP = 30000
+
+    for embedding_type in embedding_types:
+        log_types = find_available_log_types(embedding_type)
+        if not log_types:
+            print(f"No processed log types found for {embedding_type}. Skipping...")
             continue
-    
-    print(f"\nMulti-label baseline evaluation completed!")
+
+        # Filter log types if a specific one is requested
+        if args.log_type:
+            if args.log_type in log_types:
+                log_types_to_process = [args.log_type]
+            else:
+                print(f"Log type '{args.log_type}' not found in {embedding_type}. Available: {log_types}")
+                continue
+        else:
+            log_types_to_process = log_types
+
+        print(f"\n{'='*60}")
+        print(f"Processing with {embedding_type} embeddings")
+        print(f"Available log types: {log_types}")
+        print('='*60)
+
+        for log_type in log_types_to_process:
+            print(f"\n{'='*50}")
+            print(f"Processing {log_type} ({embedding_type})")
+            print('='*50)
+
+            # Create results directory
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            results_dir = RESULTS_DIR / f"multilabel_{log_type}_{timestamp}"
+            results_dir.mkdir(exist_ok=True)
+
+            try:
+                # Load data
+                X, y, class_names = load_multilabel_data(log_type, embedding_type)
+
+                # Optional subsampling BEFORE split (full dataset by default) [[memory:4887039]]
+                if args.sample_size and args.sample_size < len(X):
+                    rng = np.random.default_rng(42)
+                    idx = rng.choice(len(X), size=args.sample_size, replace=False)
+                    X = X[idx]
+                    y = y[idx]
+                    print(f"Subsampled to {len(X)} examples for speed")
+
+                # Skip if no positive labels
+                if y.sum() == 0:
+                    print(f"No positive labels found for {log_type}, skipping...")
+                    continue
+
+                # Split data
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=42, stratify=None
+                )
+
+                print(f"Train set: {len(X_train)} | Test set: {len(X_test)}")
+
+                # Standardize features
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_test_scaled = scaler.transform(X_test)
+
+                # Save scaler
+                joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
+
+                # Create models (skip KNN on very large datasets)
+                large_dataset = len(X_train) > 300000
+                models = create_multilabel_models(
+                    len(class_names),
+                    large_dataset=large_dataset,
+                    skip_knn=large_dataset,
+                    skip_lr=False,
+                    has_xgb=HAS_XGBOOST
+                )
+
+                model_names = list(models.keys())
+                results = []
+
+                # Train and evaluate each model
+                for model_name in model_names:
+                    print(f"\n{'-'*40}")
+                    print(f"Training {model_name.upper()} for {log_type}")
+                    print(f"{'-'*40}")
+
+                    try:
+                        if model_name == 'knn':
+                            # Cap KNN to avoid extremely long runs
+                            if len(X_train_scaled) > KNN_TRAIN_CAP:
+                                sel = np.random.choice(len(X_train_scaled), KNN_TRAIN_CAP, replace=False)
+                                X_train_local = X_train_scaled[sel]
+                                y_train_local = y_train[sel]
+                                print(f"KNN train capped to {len(X_train_local)} samples")
+                            else:
+                                X_train_local = X_train_scaled
+                                y_train_local = y_train
+                            if len(X_test_scaled) > KNN_TEST_CAP:
+                                sel = np.random.choice(len(X_test_scaled), KNN_TEST_CAP, replace=False)
+                                X_test_local = X_test_scaled[sel]
+                                y_test_local = y_test[sel]
+                                print(f"KNN test capped to {len(X_test_local)} samples")
+                            else:
+                                X_test_local = X_test_scaled
+                                y_test_local = y_test
+                            result = train_evaluate_multilabel_model(
+                                f"{model_name}_{log_type}",
+                                models[model_name],
+                                X_train_local, y_train_local,
+                                X_test_local, y_test_local,
+                                class_names, results_dir,
+                                log_type, embedding_type, False
+                            )
+                        else:
+                            result = train_evaluate_multilabel_model(
+                                f"{model_name}_{log_type}",
+                                models[model_name],
+                                X_train_scaled, y_train,
+                                X_test_scaled, y_test,
+                                class_names, results_dir,
+                                log_type, embedding_type, False
+                            )
+                        results.append(result)
+                    except Exception as e:
+                        print(f"Error training {model_name}: {e}")
+                        continue
+
+                # Create concise summary [[memory:4887036]]
+                if results:
+                    print(f"\n{'='*60}")
+                    print(f"SUMMARY FOR {log_type.upper()} ({embedding_type})")
+                    print(f"{'='*60}")
+                    cached_count = sum(1 for r in results if r.get('cached', False))
+                    trained_count = len(results) - cached_count
+                    print(f"Models trained: {trained_count}, from cache: {cached_count}")
+                    print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming':<10} {'Time (s)':<10}")
+                    print("-" * 66)
+                    for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
+                        model_name = result['model_name']
+                        metrics = result['metrics']
+                        time_taken = result['training_time']
+                        print(f"{model_name:<20} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} {metrics['hamming_loss']:<10.4f} {time_taken:<10.2f}")
+
+                    summary_path = results_dir / 'summary.json'
+                    with open(summary_path, 'w') as f:
+                        json.dump({
+                            'embedding_type': embedding_type,
+                            'log_type': log_type,
+                            'results': results,
+                            'class_names': class_names,
+                            'test_size': test_size,
+                            'timestamp': timestamp
+                        }, f, indent=2)
+                    print(f"Results saved to: {results_dir}")
+
+            except Exception as e:
+                print(f"Error processing {log_type} ({embedding_type}): {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+    print("\nMulti-label baseline evaluation completed!")
 
 if __name__ == '__main__':
     main()
