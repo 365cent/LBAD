@@ -519,8 +519,8 @@ def smote_data(train_loader, val_loader):
         except:
             pass
 
-def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
-    train = smote_data(train_loader, val_loader)
+def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5, resample=True):
+    train = smote_data(train_loader, val_loader) if resample else train_loader
     if len(train) == 0:
         train = train_loader
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
@@ -895,7 +895,8 @@ def main():
                     model = torch.compile(model, mode="max-autotune")
                 except Exception:
                     print("Triton not available or compile failed; using eager mode.")
-            model = train_model(model, train_loader, val_loader, epochs=10)
+            use_resample = (embedding_type == 'logbert')
+            model = train_model(model, train_loader, val_loader, epochs=10, resample=use_resample)
 
             evaluate_model(model, test_loader, log_type)
 

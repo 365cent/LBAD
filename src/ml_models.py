@@ -136,24 +136,44 @@ def save_predictions_and_metrics(log_type, model_name, predictions, metrics, emb
     except Exception as e:
         print(f"⚠️  Could not save baseline report: {e}")
 
-def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False):
-    """Create multi-label ML models with system defaults for fair comparison."""
+def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, has_xgb=False, fast=False):
+    """Create multi-label ML models.
+    If fast=True, return only a lightweight Logistic Regression baseline and simplify hyperparameters.
+    """
     models = {}
 
-    # Random Forest (defaults)
-    models['rf'] = MultiOutputClassifier(RandomForestClassifier())
+    # Fast path: LR only
+    if fast:
+        models['lr'] = MultiOutputClassifier(
+            LogisticRegression(solver='saga', max_iter=50, tol=1e-2),
+            n_jobs=N_JOBS
+        )
+        return models
+
+    # Random Forest (defaults, but parallelized and slightly lighter for safety)
+    models['rf'] = MultiOutputClassifier(
+        RandomForestClassifier(
+            n_estimators=100,
+            random_state=random_state,
+            n_jobs=N_JOBS
+        ),
+        n_jobs=N_JOBS
+    )
 
     # Logistic Regression (defaults)
     if not skip_lr:
-        models['lr'] = MultiOutputClassifier(LogisticRegression())
+        models['lr'] = MultiOutputClassifier(
+            LogisticRegression(solver='saga', max_iter=200, tol=1e-3),
+            n_jobs=N_JOBS
+        )
 
     # K-Nearest Neighbors (defaults)
     if not skip_knn:
-        models['knn'] = MultiOutputClassifier(KNeighborsClassifier())
+        models['knn'] = MultiOutputClassifier(KNeighborsClassifier(n_neighbors=3), n_jobs=N_JOBS)
 
     # XGBoost (defaults if available)
     if has_xgb and HAS_XGBOOST:
-        models['xgb'] = MultiOutputClassifier(XGBClassifier())
+        models['xgb'] = MultiOutputClassifier(XGBClassifier(n_estimators=100, tree_method='hist', n_jobs=N_JOBS), n_jobs=N_JOBS)
 
     return models
 
@@ -781,6 +801,8 @@ def main():
                         help='Specific log type to process (processes all if not specified)')
     parser.add_argument('--sample_size', '--sample-size', dest='sample_size', type=int, default=None,
                         help='Optional subsample size BEFORE splitting (processes full dataset by default)')
+    parser.add_argument('--fast', action='store_true',
+                        help='Fast pass baseline (LR only, minimal visuals)')
     args = parser.parse_args()
 
     # Determine which embedding types to process
@@ -861,7 +883,8 @@ def main():
                     large_dataset=large_dataset,
                     skip_knn=large_dataset,
                     skip_lr=False,
-                    has_xgb=HAS_XGBOOST
+                    has_xgb=HAS_XGBOOST,
+                    fast=args.fast
                 )
 
                 model_names = list(models.keys())
@@ -922,13 +945,13 @@ def main():
                     cached_count = sum(1 for r in results if r.get('cached', False))
                     trained_count = len(results) - cached_count
                     print(f"Models trained: {trained_count}, from cache: {cached_count}")
-                    print(f"{'Model':<20} {'Macro F1':<10} {'Micro F1':<10} {'Hamming':<10} {'Time (s)':<10}")
-                    print("-" * 66)
+                    print(f"{'Model':<28} {'Macro F1':<10} {'Micro F1':<10} {'Hamming':<10} {'Time (s)':<10}")
+                    print("-" * 74)
                     for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
                         model_name = result['model_name']
                         metrics = result['metrics']
                         time_taken = result['training_time']
-                        print(f"{model_name:<20} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} {metrics['hamming_loss']:<10.4f} {time_taken:<10.2f}")
+                        print(f"{model_name:<28} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} {metrics['hamming_loss']:<10.4f} {time_taken:<10.2f}")
 
                     summary_path = results_dir / 'summary.json'
                     with open(summary_path, 'w') as f:
