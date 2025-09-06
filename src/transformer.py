@@ -1338,7 +1338,13 @@ def evaluate_model(model, test_loader, log_type, embedding_type="", window_to_ev
             for name, preds in hierarchical_preds.items():
                 if name in node_names:
                     idx = node_names.index(name)
-                    batch_window_preds[:, idx] = preds.cpu().numpy().squeeze()
+                    # Ensure proper shape by flattening and taking first element if needed
+                    pred_array = preds.cpu().numpy()
+                    if pred_array.ndim > 1:
+                        pred_array = pred_array.flatten()
+                    if len(pred_array) > batch_size:
+                        pred_array = pred_array[:batch_size]  # Take only what we need
+                    batch_window_preds[:, idx] = pred_array
             
             # Top-level predictions
             top_probs = torch.sigmoid(top_logits)
