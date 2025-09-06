@@ -1238,10 +1238,13 @@ class RewardBasedLoss(nn.Module):
         # Standard BCE loss
         bce_loss = F.binary_cross_entropy_with_logits(input, target, reduction='none')
         
-        # Calculate rewards for rare class detection
+        # Calculate rewards for rare class detection (avoid in-place operations)
         rewards = torch.ones_like(bce_loss)
         
         if class_names is not None:
+            # Create a list to store reward tensors for each class
+            reward_tensors = []
+            
             for i, class_name in enumerate(class_names):
                 if i < probs.shape[1] and class_name in self.rare_classes:
                     # High reward for correctly predicting rare classes
@@ -1251,7 +1254,6 @@ class RewardBasedLoss(nn.Module):
                         torch.full_like(probs[:, i], self.reward_multiplier),
                         torch.ones_like(probs[:, i])
                     )
-                    rewards[:, i] = rare_reward
                     
                     # Additional reward for high confidence on rare positive samples
                     rare_positive = target[:, i] > 0.5
@@ -1261,7 +1263,19 @@ class RewardBasedLoss(nn.Module):
                             1.0 + (probs[:, i] - self.confidence_threshold) * 5.0,
                             torch.ones_like(probs[:, i])
                         )
-                        rewards[:, i] = rewards[:, i] * confidence_reward
+                        # Combine rewards without in-place operations
+                        combined_reward = rare_reward * confidence_reward
+                    else:
+                        combined_reward = rare_reward
+                    
+                    reward_tensors.append(combined_reward)
+                else:
+                    # Standard reward for non-rare classes
+                    reward_tensors.append(torch.ones_like(probs[:, i]))
+            
+            # Stack all reward tensors
+            if reward_tensors:
+                rewards = torch.stack(reward_tensors, dim=1)
         
         # Apply rewards to loss
         reward_loss = bce_loss * rewards
@@ -1430,7 +1444,6 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
         node_names = list(flatten_hierarchy(hierarchy))
         reward_loss = RewardBasedLoss(rare_classes={'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'})
         curriculum = CurriculumLearner(rare_classes={'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'})
-        threshold_learner = AdaptiveThresholdLearner(len(node_names))
         print("✓ Reinforcement learning components initialized")
 
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
