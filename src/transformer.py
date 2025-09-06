@@ -306,11 +306,12 @@ class HierarchicalTransformer(nn.Module):
                         
                         # Process grandchildren
                         if child in self.parent_child_map:
+                            child_pred_for_gc = all_preds[child]  # Get the child prediction we just set
                             for grandchild in self.parent_child_map[child]:
                                 if grandchild in sub_outputs:
                                     gc_logits = torch.clamp(sub_outputs[grandchild], -10.0, 10.0)
                                     gc_prob = torch.sigmoid(gc_logits)
-                                    gc_pred = (gc_prob > threshold).float() * child_pred
+                                    gc_pred = (gc_prob > threshold).float() * child_pred_for_gc
                                     all_preds[grandchild] = gc_pred.squeeze(-1) if gc_pred.dim() > 1 else gc_pred
         
         return all_preds
