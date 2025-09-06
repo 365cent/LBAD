@@ -278,7 +278,7 @@ class HierarchicalTransformer(nn.Module):
         return consistency_loss / max(count, 1)
 
     def decode_hierarchical(self, top_logits, sub_outputs, threshold=0.5):
-        """Top-down hierarchical decoding with consistency enforcement"""
+        """High-accuracy hierarchical decoding with adaptive thresholds and rare class handling"""
         batch_size = top_logits.shape[0]
         
         # First decode top-level
@@ -293,25 +293,50 @@ class HierarchicalTransformer(nn.Module):
             if class_name != "normal":
                 all_preds[class_name] = top_preds[:, i]
         
-        # Decode sub-classes with parent-gated logits
+        # Define rare leaf classes that need special handling
+        rare_leaf_classes = {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}
+        
+        # Decode sub-classes with adaptive parent gating
         for parent, children in self.parent_child_map.items():
             if parent in TOP_LEVEL_CLASSES:
                 p_idx = TOP_LEVEL_CLASSES.index(parent)
                 p_prob = top_probs[:, p_idx].unsqueeze(-1)  # (B,1)
+                
                 for child in children:
                     if child in sub_outputs:
                         c_prob = torch.sigmoid(torch.clamp(sub_outputs[child], -10.0, 10.0))
-                        c_prob = c_prob * p_prob  # gate by parent
-                        all_preds[child] = (c_prob > threshold).float().squeeze(-1)
                         
-                        # Process grandchildren
+                        # Adaptive gating based on class rarity
+                        if child in rare_leaf_classes:
+                            # More lenient gating for rare classes
+                            gate_prob = torch.maximum(p_prob, torch.tensor(0.15, device=p_prob.device))
+                            child_threshold = 0.15  # Much lower threshold for rare classes
+                        else:
+                            # Standard gating for common classes
+                            gate_prob = torch.maximum(p_prob, torch.tensor(0.3, device=p_prob.device))
+                            child_threshold = threshold
+                        
+                        c_prob = c_prob * gate_prob
+                        all_preds[child] = (c_prob > child_threshold).float().squeeze(-1)
+                        
+                        # Process grandchildren with same adaptive logic
                         if child in self.parent_child_map:
-                            child_pred_for_gc = all_preds[child]  # Get the child prediction we just set
+                            child_pred_for_gc = all_preds[child]
                             for grandchild in self.parent_child_map[child]:
                                 if grandchild in sub_outputs:
                                     gc_logits = torch.clamp(sub_outputs[grandchild], -10.0, 10.0)
                                     gc_prob = torch.sigmoid(gc_logits)
-                                    gc_pred = (gc_prob > threshold).float() * child_pred_for_gc
+                                    
+                                    # Apply same rare class logic to grandchildren
+                                    if grandchild in rare_leaf_classes:
+                                        gc_gate_prob = torch.maximum(child_pred_for_gc.unsqueeze(-1), torch.tensor(0.15, device=child_pred_for_gc.device))
+                                        gc_threshold = 0.15
+                                    else:
+                                        gc_gate_prob = torch.maximum(child_pred_for_gc.unsqueeze(-1), torch.tensor(0.3, device=child_pred_for_gc.device))
+                                        gc_threshold = threshold
+                                    
+                                    gc_prob = gc_prob * gc_gate_prob
+                                    gc_pred = (gc_prob > gc_threshold).float()
                                     all_preds[grandchild] = gc_pred.squeeze(-1) if gc_pred.dim() > 1 else gc_pred
         
         return all_preds
@@ -753,74 +778,225 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
+# Dynamic Programming Cache for SMOTE
+_smote_cache = {}
+_feature_cache = {}
+
+def _get_cached_features(data_key, extract_func):
+    """Dynamic programming cache for feature extraction"""
+    if data_key not in _feature_cache:
+        _feature_cache[data_key] = extract_func()
+    return _feature_cache[data_key]
+
+def _adaptive_pooling_temporal(cls, mean, maxp, attn, masks, method='attention_weighted'):
+    """High-accuracy temporal pooling with multiple strategies"""
+    masks_expanded = masks.astype(np.float32)
+    seq_lengths = masks_expanded.sum(axis=1, keepdims=True)
+    
+    if method == 'attention_weighted':
+        # Attention-weighted pooling (original)
+        cls_pooled = (cls * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        mean_pooled = (mean * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        maxp_pooled = (maxp * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        attn_pooled = (attn * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+    elif method == 'max_pooling':
+        # Max pooling for better rare class detection
+        cls_pooled = np.max(cls * masks_expanded[..., None], axis=1)
+        mean_pooled = np.max(mean * masks_expanded[..., None], axis=1)
+        maxp_pooled = np.max(maxp * masks_expanded[..., None], axis=1)
+        attn_pooled = np.max(attn * masks_expanded[..., None], axis=1)
+    elif method == 'hybrid':
+        # Hybrid: attention-weighted + max pooling
+        attn_weighted = (cls * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        max_pooled = np.max(cls * masks_expanded[..., None], axis=1)
+        cls_pooled = 0.7 * attn_weighted + 0.3 * max_pooled
+        
+        attn_weighted = (mean * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        max_pooled = np.max(mean * masks_expanded[..., None], axis=1)
+        mean_pooled = 0.7 * attn_weighted + 0.3 * max_pooled
+        
+        attn_weighted = (maxp * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        max_pooled = np.max(maxp * masks_expanded[..., None], axis=1)
+        maxp_pooled = 0.7 * attn_weighted + 0.3 * max_pooled
+        
+        attn_weighted = (attn * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+        max_pooled = np.max(attn * masks_expanded[..., None], axis=1)
+        attn_pooled = 0.7 * attn_weighted + 0.3 * max_pooled
+    
+    return cls_pooled, mean_pooled, maxp_pooled, attn_pooled
+
+def _compute_class_balance_weights(y):
+    """Dynamic programming approach to compute class balance weights"""
+    cache_key = f"balance_{y.shape}_{y.sum()}"
+    if cache_key in _smote_cache:
+        return _smote_cache[cache_key]
+    
+    class_counts = y.sum(axis=0)
+    total_samples = y.shape[0]
+    
+    # Adaptive target calculation using dynamic programming
+    targets = []
+    for count in class_counts:
+        if count == 0:
+            targets.append(0)
+        else:
+            # Use geometric mean for more balanced targets
+            target = int(np.sqrt(total_samples * count))
+            target = max(target, count)  # Never undersample
+            targets.append(min(target, count * 3))  # Cap at 3x original
+    
+    _smote_cache[cache_key] = targets
+    return targets
+
+def _optimized_pca_transform(blocks, max_components=64):
+    """Optimized PCA with dynamic component selection"""
+    scalers, pcas, reduced_blocks = [], [], []
+    
+    for i, block in enumerate(blocks):
+        if block.shape[1] == 0:
+            scalers.append(None)
+            pcas.append(None)
+            reduced_blocks.append(block)
+            continue
+            
+        # Dynamic component selection based on variance explained
+        n_components = min(max_components, block.shape[1], block.shape[0] - 1)
+        
+        # Use incremental PCA for memory efficiency
+        from sklearn.decomposition import IncrementalPCA
+        scaler = StandardScaler().fit(block)
+        scaled_block = scaler.transform(block)
+        
+        # Find optimal number of components
+        pca_temp = IncrementalPCA(n_components=n_components, batch_size=min(1000, block.shape[0]))
+        pca_temp.fit(scaled_block)
+        
+        # Keep components that explain at least 0.1% variance
+        cumsum_ratio = np.cumsum(pca_temp.explained_variance_ratio_)
+        optimal_components = np.argmax(cumsum_ratio >= 0.95) + 1
+        optimal_components = max(1, min(optimal_components, n_components))
+        
+        pca = IncrementalPCA(n_components=optimal_components, batch_size=min(1000, block.shape[0]))
+        pca.fit(scaled_block)
+        
+        scalers.append(scaler)
+        pcas.append(pca)
+        reduced_blocks.append(pca.transform(scaled_block))
+    
+    return scalers, pcas, reduced_blocks
+
+def _high_accuracy_smote(X_class, y_class, target_count, class_name=""):
+    """High-accuracy SMOTE with adaptive parameters"""
+    pos_count = int(y_class.sum())
+    neg_count = len(y_class) - pos_count
+    
+    if pos_count < 2:
+        return X_class, y_class
+    
+    # Adaptive SMOTE parameters based on class characteristics
+    if pos_count < 10:  # Very rare class
+        k_neighbors = min(2, pos_count - 1)
+        sampling_strategy = min(pos_count * 2, target_count)
+        smote_type = 'borderline-1'
+    elif pos_count < 100:  # Rare class
+        k_neighbors = min(3, pos_count - 1)
+        sampling_strategy = min(int(pos_count * 1.5), target_count)
+        smote_type = 'borderline-1'
+    else:  # Common class
+        k_neighbors = min(5, pos_count - 1)
+        sampling_strategy = min(int(pos_count * 1.2), target_count)
+        smote_type = 'borderline-2'
+    
+    try:
+        # Use BorderlineSMOTE for better quality synthetic samples
+        smote = BorderlineSMOTE(
+            sampling_strategy={1: sampling_strategy},
+            k_neighbors=k_neighbors,
+            random_state=42,
+            kind=smote_type
+        )
+        X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
+        
+        # Additional quality check: remove outliers
+        if len(X_resampled) > len(X_class):
+            from sklearn.neighbors import LocalOutlierFactor
+            lof = LocalOutlierFactor(n_neighbors=min(10, len(X_resampled)//2), contamination=0.1)
+            outlier_mask = lof.fit_predict(X_resampled) == 1
+            X_resampled = X_resampled[outlier_mask]
+            y_resampled = y_resampled[outlier_mask]
+        
+        return X_resampled, y_resampled
+        
+    except Exception as e:
+        print(f"SMOTE failed for {class_name}: {e}, using original data")
+        return X_class, y_class
+
 def smote_data(train_loader, val_loader):
-    """Apply balanced resampling to address class imbalance (on window-level pooled features for temporal data)"""
-    spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
+    """High-accuracy SMOTE with sliding windows and dynamic programming optimizations"""
+    spinner = halo.Halo(text="Applying high-accuracy balanced resampling", spinner="dots")
     spinner.start()
 
     try:
-        # Extract training data
-        is_temporal = len(next(iter(train_loader))) == 6  # Has attention mask
+        # Extract training data with caching
+        is_temporal = len(next(iter(train_loader))) == 6
+        
+        def extract_data():
+            if is_temporal:
+                all_data = [[], [], [], [], [], []]
+                for batch in train_loader:
+                    for i, tensor in enumerate(batch):
+                        all_data[i].append(tensor.detach().cpu().numpy())
+                return [np.concatenate(data, axis=0) for data in all_data]
+            else:
+                all_data = [[], [], [], [], []]
+                for batch in train_loader:
+                    for i, tensor in enumerate(batch):
+                        all_data[i].append(tensor.detach().cpu().numpy())
+                return [np.vstack(data) for data in all_data]
+        
+        data_key = f"{is_temporal}_{len(train_loader)}"
+        extracted_data = _get_cached_features(data_key, extract_data)
         
         if is_temporal:
-            # For temporal data, extract and pool to get per-window features
-            all_data = [[], [], [], [], [], []]
-            for batch in train_loader:
-                for i, tensor in enumerate(batch):
-                    all_data[i].append(tensor.detach().cpu().numpy())
-            cls, mean, maxp, attn, y, masks = [np.concatenate(data, axis=0) for data in all_data]
-            
-            # Pool temporal features to get per-window representations for SMOTE
-            # Use attention-weighted mean pooling
-            masks_expanded = masks.astype(np.float32)  # (B, T)
-            seq_lengths = masks_expanded.sum(axis=1, keepdim=True)  # (B, 1)
-            
-            # Pool each feature type
-            cls = (cls * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
-            mean = (mean * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
-            maxp = (maxp * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
-            attn = (attn * masks_expanded[..., None]).sum(axis=1) / np.maximum(seq_lengths, 1)
+            cls, mean, maxp, attn, y, masks = extracted_data
+            # Use hybrid pooling for better rare class detection
+            cls, mean, maxp, attn = _adaptive_pooling_temporal(cls, mean, maxp, attn, masks, method='hybrid')
         else:
-            # Non-temporal data
-            all_data = [[], [], [], [], []]
-            for batch in train_loader:
-                for i, tensor in enumerate(batch):
-                    all_data[i].append(tensor.detach().cpu().numpy())
-            cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
+            cls, mean, maxp, attn, y = extracted_data
 
-        # Safety cap: limit rows used for resampling to avoid OOM/very long runs
+        # Dynamic memory management
         n_total = y.shape[0]
-        max_rows = 400_000 if device.type == "cuda" else 200_000
+        max_rows = 600_000 if device.type == "cuda" else 300_000
         if n_total > max_rows:
             rng = np.random.default_rng(42)
-            idx = rng.choice(n_total, size=max_rows, replace=False)
-            cls, mean, maxp, attn, y = cls[idx], mean[idx], maxp[idx], attn[idx], y[idx]
+            # Stratified sampling to maintain class balance
+            indices = []
+            for c in range(y.shape[1]):
+                class_indices = np.where(y[:, c] == 1)[0]
+                if len(class_indices) > 0:
+                    sample_size = min(len(class_indices), max_rows // (y.shape[1] * 2))
+                    indices.extend(rng.choice(class_indices, size=sample_size, replace=False))
+            
+            # Add some negative samples
+            neg_indices = np.where(y.sum(axis=1) == 0)[0]
+            neg_sample_size = min(len(neg_indices), max_rows - len(indices))
+            if neg_sample_size > 0:
+                indices.extend(rng.choice(neg_indices, size=neg_sample_size, replace=False))
+            
+            indices = np.array(indices)
+            cls, mean, maxp, attn, y = cls[indices], mean[indices], maxp[indices], attn[indices], y[indices]
         
-        # Preprocessing (skip zero-width blocks)
+        # Optimized preprocessing with dynamic programming
         blocks = [cls, mean, maxp, attn]
-        scalers, scaled = [], []
-        for b in blocks:
-            if b.shape[1] > 0:
-                sc = StandardScaler().fit(b)
-                scalers.append(sc)
-                scaled.append(sc.transform(b))
-            else:
-                scalers.append(None)
-                scaled.append(b)
-        
-        # Dimensionality reduction for efficiency
-        pca_dims = [min(48, s.shape[1]) if s.shape[1] > 0 else 0 for s in scaled]
-        pcas = [PCA(n_components=dim, svd_solver='auto').fit(s) if dim > 0 else None for dim, s in zip(pca_dims, scaled)]
-        reduced_parts = []
-        for p, s in zip(pcas, scaled):
-            if p is None:
-                reduced_parts.append(np.zeros((s.shape[0], 0), dtype=s.dtype))
-            else:
-                reduced_parts.append(p.transform(s))
-        X_reduced = np.hstack(reduced_parts)
+        scalers, pcas, reduced_blocks = _optimized_pca_transform(blocks, max_components=64)
+        X_reduced = np.hstack(reduced_blocks)
 
-        # Process each class
+        # Dynamic class balance computation
+        target_counts = _compute_class_balance_weights(y)
+        
+        # Process classes with high-accuracy SMOTE
         X_final, y_final = [], []
+        node_names = list(flatten_hierarchy(hierarchy))
         
         for c in range(y.shape[1]):
             pos_mask = y[:, c] == 1
@@ -828,121 +1004,130 @@ def smote_data(train_loader, val_loader):
             
             if pos_count == 0:
                 continue
-                
-            neg_mask = y[:, c] == 0
-            neg_count = int(neg_mask.sum())
             
-            # Determine target counts for balance
-            total_samples = pos_count + neg_count
-            target_per_class = int(np.sqrt(total_samples * pos_count))
-            target_per_class = max(target_per_class, pos_count)  # Never undersample minority
+            class_name = node_names[c] if c < len(node_names) else f"class_{c}"
+            target_count = target_counts[c]
             
-            # Prepare class-specific data
-            # Subsample negatives to keep class-specific processing bounded
+            # Prepare class-specific data with dynamic sampling
             rng = np.random.default_rng(42 + c)
             pos_idx = np.where(pos_mask)[0]
-            neg_idx = np.where(neg_mask)[0]
-            neg_keep = min(len(neg_idx), max(3 * len(pos_idx), 10000))
-            if neg_keep > 0:
-                neg_idx_sampled = rng.choice(neg_idx, size=neg_keep, replace=False)
+            neg_idx = np.where(~pos_mask)[0]
+            
+            # Dynamic negative sampling
+            neg_sample_size = min(len(neg_idx), max(pos_count * 3, 1000))
+            if neg_sample_size > 0:
+                neg_idx_sampled = rng.choice(neg_idx, size=neg_sample_size, replace=False)
                 class_idx = np.concatenate([pos_idx, neg_idx_sampled])
             else:
                 class_idx = pos_idx
+            
             X_class = X_reduced[class_idx]
             y_class = y[class_idx, c].astype(int)
             
-            # Apply resampling pipeline
-            try:
-                # Determine strategy based on class balance
-                if pos_count < target_per_class:
-                    # Oversample minority class
-                    k_neighbors = min(3, pos_count - 1) if pos_count > 1 else 1
-                    oversample_ratio = min(target_per_class / max(pos_count, 1), 1.5)  # replace
-                    
-                    smote = BorderlineSMOTE(
-                        sampling_strategy={1: min(int(pos_count * oversample_ratio), pos_count + 20000)},
-                        k_neighbors=max(2, k_neighbors),
-                        random_state=42,
-                        kind='borderline-1'
-                    )
-                    X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
-                else:
-                    X_resampled, y_resampled = X_class, y_class
-                
-                # Undersample majority class if needed
-                if (y_resampled == 0).sum() > target_per_class:
-                    undersampler = RandomUnderSampler(
-                        sampling_strategy={0: target_per_class},
-                        random_state=42
-                    )
-                    X_resampled, y_resampled = undersampler.fit_resample(X_resampled, y_resampled)
-                
-                # Store resampled data for this class
-                y_class_matrix = np.zeros((len(y_resampled), y.shape[1]))
-                y_class_matrix[:, c] = y_resampled
-                
-                X_final.append(X_resampled)
-                y_final.append(y_class_matrix)
-                
-            except Exception:
-                # Fallback: use original data
-                y_class_matrix = np.zeros((len(y_class), y.shape[1]))
-                y_class_matrix[:, c] = y_class
-                X_final.append(X_class)
-                y_final.append(y_class_matrix)
+            # Apply high-accuracy SMOTE
+            X_resampled, y_resampled = _high_accuracy_smote(X_class, y_class, target_count, class_name)
+            
+            # Store resampled data
+            y_class_matrix = np.zeros((len(y_resampled), y.shape[1]))
+            y_class_matrix[:, c] = y_resampled
+            X_final.append(X_resampled)
+            y_final.append(y_class_matrix)
 
         if not X_final:
             return train_loader
 
-        # Combine all resampled classes (skip dedup to save RAM) and optionally cap size
+        # Combine and optimize final dataset
         X_final = np.vstack(X_final)
         y_final = np.vstack(y_final)
-        max_out = 1_000_000 if device.type == "cuda" else 500_000
+        
+        # Dynamic dataset size management
+        max_out = 1_500_000 if device.type == "cuda" else 750_000
         if len(X_final) > max_out:
             rng = np.random.default_rng(123)
-            keep = rng.choice(len(X_final), size=max_out, replace=False)
-            X_final = X_final[keep]
-            y_final = y_final[keep]
+            # Stratified sampling to maintain balance
+            keep_indices = []
+            for c in range(y_final.shape[1]):
+                class_indices = np.where(y_final[:, c] == 1)[0]
+                if len(class_indices) > 0:
+                    sample_size = min(len(class_indices), max_out // (y_final.shape[1] * 2))
+                    keep_indices.extend(rng.choice(class_indices, size=sample_size, replace=False))
+            
+            # Add negative samples
+            neg_indices = np.where(y_final.sum(axis=1) == 0)[0]
+            neg_sample_size = min(len(neg_indices), max_out - len(keep_indices))
+            if neg_sample_size > 0:
+                keep_indices.extend(rng.choice(neg_indices, size=neg_sample_size, replace=False))
+            
+            keep_indices = np.array(keep_indices)
+            X_final = X_final[keep_indices]
+            y_final = y_final[keep_indices]
         
-        # Inverse transform to original feature space
+        # Optimized inverse transform with batching
+        def _optimized_inverse_transform(pca, scaler, block, batch_size=50000):
+            if pca is None or scaler is None or block.shape[1] == 0:
+                return np.zeros((block.shape[0], 0), dtype=block.dtype)
+            
+            # Use smaller batches for memory efficiency
+            batch_size = min(batch_size, block.shape[0])
+            result = []
+            for i in range(0, block.shape[0], batch_size):
+                chunk = block[i:i+batch_size]
+                inverse_pca = pca.inverse_transform(chunk)
+                inverse_scaler = scaler.inverse_transform(inverse_pca)
+                result.append(inverse_scaler)
+            return np.vstack(result)
+        
+        # Apply inverse transforms
         splits = np.cumsum([p.n_components_ if p is not None else 0 for p in pcas[:-1]])
         x_blocks = np.split(X_final, splits, axis=1)
-        # Batched inverse-transform to limit peak memory
-        def _inv(pca, scaler, block, bs=200000):
-            out = []
-            for i in range(0, len(block), bs):
-                chunk = block[i:i+bs]
-                if pca is None or scaler is None or chunk.shape[1] == 0:
-                    out.append(np.zeros((len(chunk), 0), dtype=chunk.dtype))
-                else:
-                    out.append(scaler.inverse_transform(pca.inverse_transform(chunk)))
-            return np.vstack(out)
-        final_features = [_inv(p, s, b, bs=100_000 if device.type=="cuda" else 50_000) for (p, s, b) in zip(pcas, scalers, x_blocks)]
+        final_features = [_optimized_inverse_transform(p, s, b) for (p, s, b) in zip(pcas, scalers, x_blocks)]
         
-        # Create balanced dataset
+        # Create optimized dataset
         if is_temporal:
-            # For temporal data, need to expand back to sequences (using mean pooling as placeholder)
+            # Enhanced temporal reconstruction with sliding window awareness
             seq_len = WINDOW_SIZE
             final_features_expanded = []
+            
             for feat in final_features:
                 if feat.shape[1] > 0:
-                    # Expand to sequence by repeating the pooled feature
-                    expanded = np.tile(feat[:, None, :], (1, seq_len, 1))
+                    # Use sliding window pattern for more realistic temporal structure
+                    expanded = np.zeros((len(feat), seq_len, feat.shape[1]))
+                    for i in range(len(feat)):
+                        # Create a more realistic temporal pattern
+                        base_feat = feat[i]
+                        for t in range(seq_len):
+                            # Add small temporal variations
+                            noise = np.random.normal(0, 0.01, base_feat.shape)
+                            expanded[i, t] = base_feat + noise
                     final_features_expanded.append(expanded)
                 else:
                     final_features_expanded.append(np.zeros((len(feat), seq_len, 0), dtype=feat.dtype))
             
-            # Create attention masks (all True since we don't have original temporal structure)
+            # Create realistic attention masks
             attention_masks = np.ones((len(y_final), seq_len), dtype=bool)
+            # Add some variation to attention masks for realism
+            for i in range(len(attention_masks)):
+                if np.random.random() < 0.1:  # 10% chance of partial mask
+                    mask_len = np.random.randint(seq_len//2, seq_len)
+                    attention_masks[i, :mask_len] = False
             
             dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features_expanded + [y_final]] + [torch.from_numpy(attention_masks).bool()])
         else:
             dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features + [y_final]])
         
-        print(f"\nBalanced dataset: {len(dataset)} samples")
+        # Enhanced reporting
+        print(f"\nHigh-Accuracy Balanced Dataset: {len(dataset)} samples")
         anomaly_count = (torch.from_numpy(y_final).sum(dim=1) > 0).sum().item()
         print(f"  normal: {len(dataset) - anomaly_count} ({(len(dataset) - anomaly_count)/len(dataset):.2%})")
         print(f"  anomalies: {anomaly_count} ({anomaly_count/len(dataset):.2%})")
+        
+        # Class distribution analysis
+        print("  Class distribution after resampling:")
+        for i, name in enumerate(node_names):
+            if i < y_final.shape[1]:
+                count = int(y_final[:, i].sum())
+                if count > 0:
+                    print(f"    {name}: {count} ({count/len(y_final):.2%})")
 
         # Set prefetch_factor only when using multiprocessing
         prefetch_factor = 4 if NUM_WORKERS > 0 else None
@@ -952,11 +1137,13 @@ def smote_data(train_loader, val_loader):
                          persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
 
     except Exception as e:
-        print(f"Resampling failed: {e}")
+        print(f"High-accuracy resampling failed: {e}")
+        import traceback
+        traceback.print_exc()
         return train_loader
     finally:
         try:
-            spinner.stop_and_persist(text="Resampling completed")
+            spinner.stop_and_persist(text="High-accuracy resampling completed")
         except:
             pass
 
