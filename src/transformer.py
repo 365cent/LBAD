@@ -1333,8 +1333,9 @@ def evaluate_model(model, test_loader, log_type, embedding_type="", window_to_ev
             
             # Convert to arrays for window-level evaluation
             node_names = list(flatten_hierarchy(hierarchy))
-            batch_window_preds = np.zeros((cls_tokens.shape[0], len(node_names)))
-            
+            batch_size = cls_tokens.shape[0]  # Define batch_size here
+            batch_window_preds = np.zeros((batch_size, len(node_names)))
+
             for name, preds in hierarchical_preds.items():
                 if name in node_names:
                     idx = node_names.index(name)
@@ -1351,7 +1352,6 @@ def evaluate_model(model, test_loader, log_type, embedding_type="", window_to_ev
             batch_top_preds = (top_probs > 0.5).cpu().numpy()
             
             # Create top-level targets from propagated hierarchy targets
-            batch_size = targets.shape[0]
             node_names, name_to_idx, *_ = build_maps(hierarchy)
             batch_top_targets = np.zeros((batch_size, len(TOP_LEVEL_CLASSES)))
             
