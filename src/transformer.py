@@ -277,8 +277,8 @@ class HierarchicalTransformer(nn.Module):
 
         return consistency_loss / max(count, 1)
 
-    def decode_hierarchical(self, top_logits, sub_outputs, threshold=0.5):
-        """High-accuracy hierarchical decoding with adaptive thresholds and rare class handling"""
+    def decode_hierarchical(self, top_logits, sub_outputs, threshold=0.5, use_rl=True):
+        """Reinforcement learning-inspired hierarchical decoding with reward-based thresholds"""
         batch_size = top_logits.shape[0]
         
         # First decode top-level
@@ -296,7 +296,19 @@ class HierarchicalTransformer(nn.Module):
         # Define rare leaf classes that need special handling
         rare_leaf_classes = {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}
         
-        # Decode sub-classes with adaptive parent gating
+        if use_rl:
+            # Reinforcement learning approach: use very low thresholds for rare classes
+            rare_thresholds = {
+                'dirb': 0.05,
+                'webshell_cmd': 0.05, 
+                'webshell_upload': 0.05,
+                'escalated_sudo_session': 0.05
+            }
+        else:
+            # Standard approach
+            rare_thresholds = {cls: 0.15 for cls in rare_leaf_classes}
+        
+        # Decode sub-classes with RL-inspired parent gating
         for parent, children in self.parent_child_map.items():
             if parent in TOP_LEVEL_CLASSES:
                 p_idx = TOP_LEVEL_CLASSES.index(parent)
@@ -306,11 +318,12 @@ class HierarchicalTransformer(nn.Module):
                     if child in sub_outputs:
                         c_prob = torch.sigmoid(torch.clamp(sub_outputs[child], -10.0, 10.0))
                         
-                        # Adaptive gating based on class rarity
+                        # RL-inspired gating: be very lenient for rare classes
                         if child in rare_leaf_classes:
-                            # More lenient gating for rare classes
-                            gate_prob = torch.maximum(p_prob, torch.tensor(0.15, device=p_prob.device))
-                            child_threshold = 0.15  # Much lower threshold for rare classes
+                            # Use learned threshold or very low default
+                            child_threshold = rare_thresholds.get(child, 0.05)
+                            # Minimal parent gating for rare classes
+                            gate_prob = torch.maximum(p_prob, torch.tensor(0.05, device=p_prob.device))
                         else:
                             # Standard gating for common classes
                             gate_prob = torch.maximum(p_prob, torch.tensor(0.3, device=p_prob.device))
@@ -319,7 +332,7 @@ class HierarchicalTransformer(nn.Module):
                         c_prob = c_prob * gate_prob
                         all_preds[child] = (c_prob > child_threshold).float().squeeze(-1)
                         
-                        # Process grandchildren with same adaptive logic
+                        # Process grandchildren with same RL logic
                         if child in self.parent_child_map:
                             child_pred_for_gc = all_preds[child]
                             for grandchild in self.parent_child_map[child]:
@@ -327,10 +340,10 @@ class HierarchicalTransformer(nn.Module):
                                     gc_logits = torch.clamp(sub_outputs[grandchild], -10.0, 10.0)
                                     gc_prob = torch.sigmoid(gc_logits)
                                     
-                                    # Apply same rare class logic to grandchildren
+                                    # Apply same RL logic to grandchildren
                                     if grandchild in rare_leaf_classes:
-                                        gc_gate_prob = torch.maximum(child_pred_for_gc.unsqueeze(-1), torch.tensor(0.15, device=child_pred_for_gc.device))
-                                        gc_threshold = 0.15
+                                        gc_threshold = rare_thresholds.get(grandchild, 0.05)
+                                        gc_gate_prob = torch.maximum(child_pred_for_gc.unsqueeze(-1), torch.tensor(0.05, device=child_pred_for_gc.device))
                                     else:
                                         gc_gate_prob = torch.maximum(child_pred_for_gc.unsqueeze(-1), torch.tensor(0.3, device=child_pred_for_gc.device))
                                         gc_threshold = threshold
@@ -639,6 +652,36 @@ def make_weighted_sampler(dataset):
     # weight normals small, anomalies large
     w = torch.where(has_pos > 0, torch.full_like(has_pos, 50.0), torch.full_like(has_pos, 1.0))
     return torch.utils.data.WeightedRandomSampler(weights=w.double(), num_samples=len(dataset), replacement=True)
+
+def make_rare_class_sampler(dataset, rare_classes=None):
+    """Create sampler that heavily favors rare class samples"""
+    if rare_classes is None:
+        rare_classes = {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}
+    
+    # targets at index 4
+    Y = torch.stack([dataset[i][4] for i in range(len(dataset))])
+    
+    # Get class names
+    node_names = list(flatten_hierarchy(hierarchy))
+    
+    # Calculate weights: very high for rare classes, normal for others
+    weights = torch.ones(len(dataset))
+    
+    for i, class_name in enumerate(node_names):
+        if i < Y.shape[1] and class_name in rare_classes:
+            # Very high weight for rare classes
+            class_mask = Y[:, i] > 0
+            weights[class_mask] = 100.0  # Much higher weight
+        elif i < Y.shape[1]:
+            # Normal weight for common classes
+            class_mask = Y[:, i] > 0
+            weights[class_mask] = 10.0
+    
+    # Ensure we have some normal samples too
+    normal_mask = Y.sum(dim=1) == 0
+    weights[normal_mask] = 1.0
+    
+    return torch.utils.data.WeightedRandomSampler(weights=weights.double(), num_samples=len(dataset), replacement=True)
 
 def find_best_thresholds(y_true, y_prob):
     """Find optimal thresholds per class for rare labels"""
@@ -1180,6 +1223,164 @@ def compute_severity_weights(top_targets, top_preds_probs):
     
     return weights
 
+class RewardBasedLoss(nn.Module):
+    """Reinforcement learning-inspired loss with reward signals for rare classes"""
+    def __init__(self, rare_classes=None, reward_multiplier=10.0, confidence_threshold=0.3):
+        super().__init__()
+        self.rare_classes = rare_classes or {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}
+        self.reward_multiplier = reward_multiplier
+        self.confidence_threshold = confidence_threshold
+        
+    def forward(self, input, target, class_names=None):
+        # Convert logits to probabilities
+        probs = torch.sigmoid(input)
+        
+        # Standard BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(input, target, reduction='none')
+        
+        # Calculate rewards for rare class detection
+        rewards = torch.ones_like(bce_loss)
+        
+        if class_names is not None:
+            for i, class_name in enumerate(class_names):
+                if i < probs.shape[1] and class_name in self.rare_classes:
+                    # High reward for correctly predicting rare classes
+                    correct_pred = (probs[:, i] > self.confidence_threshold) == (target[:, i] > 0.5)
+                    rare_reward = torch.where(
+                        correct_pred,
+                        torch.full_like(probs[:, i], self.reward_multiplier),
+                        torch.ones_like(probs[:, i])
+                    )
+                    rewards[:, i] = rare_reward
+                    
+                    # Additional reward for high confidence on rare positive samples
+                    rare_positive = target[:, i] > 0.5
+                    if rare_positive.any():
+                        confidence_reward = torch.where(
+                            rare_positive,
+                            1.0 + (probs[:, i] - self.confidence_threshold) * 5.0,
+                            torch.ones_like(probs[:, i])
+                        )
+                        rewards[:, i] = rewards[:, i] * confidence_reward
+        
+        # Apply rewards to loss
+        reward_loss = bce_loss * rewards
+        
+        return reward_loss.mean()
+
+class AdaptiveThresholdLearner(nn.Module):
+    """Learn optimal thresholds for each class using reward signals"""
+    def __init__(self, num_classes, initial_threshold=0.5, learning_rate=0.01):
+        super().__init__()
+        self.thresholds = nn.Parameter(torch.full((num_classes,), initial_threshold))
+        self.learning_rate = learning_rate
+        self.reward_history = []
+        
+    def forward(self, probs, targets, class_names=None):
+        # Use learned thresholds for prediction
+        predictions = (probs > self.thresholds.unsqueeze(0)).float()
+        
+        # Calculate rewards for threshold updates
+        rewards = self._calculate_rewards(predictions, targets, class_names)
+        
+        # Update thresholds based on rewards (simple gradient-free update)
+        with torch.no_grad():
+            for i, reward in enumerate(rewards):
+                if i < len(self.thresholds):
+                    # Increase threshold if too many false positives
+                    # Decrease threshold if too many false negatives
+                    if reward < 0.5:  # Poor performance
+                        self.thresholds[i] = torch.clamp(
+                            self.thresholds[i] - self.learning_rate * (0.5 - reward),
+                            0.01, 0.99
+                        )
+                    else:  # Good performance
+                        self.thresholds[i] = torch.clamp(
+                            self.thresholds[i] + self.learning_rate * (reward - 0.5),
+                            0.01, 0.99
+                        )
+        
+        return predictions, rewards
+    
+    def _calculate_rewards(self, predictions, targets, class_names=None):
+        """Calculate reward signals for each class"""
+        rewards = []
+        for i in range(predictions.shape[1]):
+            if i < targets.shape[1]:
+                y_pred = predictions[:, i]
+                y_true = targets[:, i]
+                
+                # Calculate F1-based reward
+                tp = (y_pred * y_true).sum()
+                fp = (y_pred * (1 - y_true)).sum()
+                fn = ((1 - y_pred) * y_true).sum()
+                
+                if tp + fp > 0:
+                    precision = tp / (tp + fp)
+                else:
+                    precision = 0.0
+                    
+                if tp + fn > 0:
+                    recall = tp / (tp + fn)
+                else:
+                    recall = 0.0
+                    
+                if precision + recall > 0:
+                    f1 = 2 * precision * recall / (precision + recall)
+                else:
+                    f1 = 0.0
+                
+                # Higher reward for rare classes
+                base_reward = f1
+                if class_names and i < len(class_names):
+                    class_name = class_names[i]
+                    if class_name in {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}:
+                        base_reward = base_reward * 2.0  # Double reward for rare classes
+                
+                rewards.append(base_reward)
+            else:
+                rewards.append(0.0)
+        
+        return torch.tensor(rewards, device=predictions.device)
+
+class CurriculumLearner:
+    """Curriculum learning for rare classes - start easy, get harder"""
+    def __init__(self, rare_classes=None, easy_threshold=0.1, hard_threshold=0.5):
+        self.rare_classes = rare_classes or {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}
+        self.easy_threshold = easy_threshold
+        self.hard_threshold = hard_threshold
+        self.current_epoch = 0
+        
+    def get_adaptive_thresholds(self, class_names, epoch):
+        """Get adaptive thresholds based on curriculum learning"""
+        thresholds = {}
+        
+        for i, class_name in enumerate(class_names):
+            if class_name in self.rare_classes:
+                # Start with easy threshold, gradually increase
+                progress = min(epoch / 10.0, 1.0)  # Full curriculum over 10 epochs
+                threshold = self.easy_threshold + progress * (self.hard_threshold - self.easy_threshold)
+                thresholds[class_name] = threshold
+            else:
+                thresholds[class_name] = 0.5
+        
+        return thresholds
+    
+    def get_class_weights(self, class_names, epoch):
+        """Get adaptive class weights based on curriculum learning"""
+        weights = {}
+        
+        for i, class_name in enumerate(class_names):
+            if class_name in self.rare_classes:
+                # Start with high weight, gradually decrease
+                progress = min(epoch / 10.0, 1.0)
+                weight = 10.0 - progress * 8.0  # Start at 10, end at 2
+                weights[class_name] = weight
+            else:
+                weights[class_name] = 1.0
+        
+        return weights
+
 class CostSensitiveFocalLoss(nn.Module):
     """Focal loss with cost-sensitive weighting"""
     def __init__(self, alpha=1.0, gamma=2.0, pos_weight=None):
@@ -1207,7 +1408,7 @@ class CostSensitiveFocalLoss(nn.Module):
             
         return focal_loss.mean()
 
-def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA_RECON, lambda_hier=LAMBDA_HIER, resample=True):
+def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA_RECON, lambda_hier=LAMBDA_HIER, resample=True, use_rl=True):
     if epochs is None:
         epochs = EPOCHS
         
@@ -1223,6 +1424,14 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
     mse_loss = nn.MSELoss()
     use_amp = (device.type == "cuda")  # Only use GradScaler on CUDA
     scaler = torch.amp.GradScaler(enabled=use_amp)
+    
+    # Initialize RL components
+    if use_rl:
+        node_names = list(flatten_hierarchy(hierarchy))
+        reward_loss = RewardBasedLoss(rare_classes={'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'})
+        curriculum = CurriculumLearner(rare_classes={'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'})
+        threshold_learner = AdaptiveThresholdLearner(len(node_names))
+        print("✓ Reinforcement learning components initialized")
 
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
@@ -1339,34 +1548,54 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
                 top_loss = top_level_loss(top_logits, top_targets, severity_weights)
                 top_loss = torch.clamp(top_loss, 0, 100.0)
 
-                # Sub-level loss (masked by parent activity)
+                # Sub-level loss with RL approach
                 sub_loss = torch.tensor(0.0, device=device)
                 if sub_outputs:
-                    # Create masks for sub-classes based on parent activity
-                    for parent, children in model.parent_child_map.items():
-                        if parent in TOP_LEVEL_CLASSES:
-                            parent_idx = TOP_LEVEL_CLASSES.index(parent)
-                            parent_active = top_targets[:, parent_idx] > 0.5
-                            
-                            for child in children:
-                                if child in sub_outputs and child in node_names:
-                                    child_idx = node_names.index(child)
-                                    if child_idx < targets.shape[1]:
-                                        child_targets = targets[:, child_idx]
-                                        child_logits = sub_outputs[child]
-                                        
-                                        # Only compute loss for samples where parent is active
-                                        if parent_active.any():
-                                            masked_logits = child_logits[parent_active]
-                                            masked_targets = child_targets[parent_active]
-                                            if len(masked_targets) > 0:
-                                                # Use simple BCE for individual child classes
-                                                child_loss = F.binary_cross_entropy_with_logits(
-                                                    masked_logits.squeeze(-1), 
-                                                    masked_targets, 
-                                                    reduction='mean'
-                                                )
-                                                sub_loss += LAMBDA_INTRA * child_loss
+                    if use_rl:
+                        # Use reward-based loss for rare classes
+                        for child in sub_outputs:
+                            if child in node_names:
+                                child_idx = node_names.index(child)
+                                if child_idx < targets.shape[1]:
+                                    child_targets = targets[:, child_idx]
+                                    child_logits = sub_outputs[child]
+                                    
+                                    # Use reward-based loss for rare classes
+                                    if child in {'dirb', 'webshell_cmd', 'webshell_upload', 'escalated_sudo_session'}:
+                                        child_loss = reward_loss(child_logits, child_targets.unsqueeze(-1), [child])
+                                    else:
+                                        child_loss = F.binary_cross_entropy_with_logits(
+                                            child_logits.squeeze(-1), 
+                                            child_targets, 
+                                            reduction='mean'
+                                        )
+                                    sub_loss += LAMBDA_INTRA * child_loss
+                    else:
+                        # Standard approach: masked by parent activity
+                        for parent, children in model.parent_child_map.items():
+                            if parent in TOP_LEVEL_CLASSES:
+                                parent_idx = TOP_LEVEL_CLASSES.index(parent)
+                                parent_active = top_targets[:, parent_idx] > 0.5
+                                
+                                for child in children:
+                                    if child in sub_outputs and child in node_names:
+                                        child_idx = node_names.index(child)
+                                        if child_idx < targets.shape[1]:
+                                            child_targets = targets[:, child_idx]
+                                            child_logits = sub_outputs[child]
+                                            
+                                            # Only compute loss for samples where parent is active
+                                            if parent_active.any():
+                                                masked_logits = child_logits[parent_active]
+                                                masked_targets = child_targets[parent_active]
+                                                if len(masked_targets) > 0:
+                                                    # Use simple BCE for individual child classes
+                                                    child_loss = F.binary_cross_entropy_with_logits(
+                                                        masked_logits.squeeze(-1), 
+                                                        masked_targets, 
+                                                        reduction='mean'
+                                                    )
+                                                    sub_loss += LAMBDA_INTRA * child_loss
 
                 # Hierarchy consistency loss
                 hier_loss = model.hierarchy_consistency_loss(sub_outputs)
@@ -1515,8 +1744,8 @@ def evaluate_model(model, test_loader, log_type, embedding_type="", window_to_ev
             
             _, _, top_logits, sub_outputs, _ = model(cls_tokens, mean_pooling, max_pooling, attn, attention_mask)
             
-            # Hierarchical decoding
-            hierarchical_preds = model.decode_hierarchical(top_logits, sub_outputs)
+            # Hierarchical decoding with RL approach
+            hierarchical_preds = model.decode_hierarchical(top_logits, sub_outputs, use_rl=True)
             
             # Convert to arrays for window-level evaluation
             node_names = list(flatten_hierarchy(hierarchy))
@@ -1837,9 +2066,9 @@ def main():
             # Set prefetch_factor only when using multiprocessing
             prefetch_factor = 4 if NUM_WORKERS > 0 else None
             
-            # Use weighted sampler for non-temporal datasets to avoid all-normal batches
+            # Use rare class sampler for better rare class learning
             if not data.get('is_temporal', False):
-                sampler = make_weighted_sampler(train_set)
+                sampler = make_rare_class_sampler(train_set)
                 train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler,
                                         num_workers=NUM_WORKERS, pin_memory=(device.type=="cuda"), 
                                         persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
