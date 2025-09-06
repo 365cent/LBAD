@@ -293,24 +293,16 @@ class HierarchicalTransformer(nn.Module):
             if class_name != "normal":
                 all_preds[class_name] = top_preds[:, i]
         
-        # Decode sub-classes only if parent is active
+        # Decode sub-classes with parent-gated logits
         for parent, children in self.parent_child_map.items():
-            if parent in all_preds and parent in sub_outputs:
-                parent_active = all_preds[parent]
-                # Get parent index for top-level classes
-                parent_idx = TOP_LEVEL_CLASSES.index(parent) if parent in TOP_LEVEL_CLASSES else None
-                
+            if parent in TOP_LEVEL_CLASSES:
+                p_idx = TOP_LEVEL_CLASSES.index(parent)
+                p_prob = top_probs[:, p_idx].unsqueeze(-1)  # (B,1)
                 for child in children:
                     if child in sub_outputs:
-                        child_logits = torch.clamp(sub_outputs[child], -10.0, 10.0)
-                        child_prob = torch.sigmoid(child_logits)
-                        # Parent-gated child logits: multiply by parent probability
-                        if parent_idx is not None:
-                            parent_prob = top_probs[:, parent_idx].unsqueeze(-1)
-                            child_prob = child_prob * parent_prob
-                        # Child can only be active if parent is active
-                        child_pred = (child_prob > threshold).float() * parent_active.unsqueeze(-1)
-                        all_preds[child] = child_pred.squeeze(-1)
+                        c_prob = torch.sigmoid(torch.clamp(sub_outputs[child], -10.0, 10.0))
+                        c_prob = c_prob * p_prob  # gate by parent
+                        all_preds[child] = (c_prob > threshold).float().squeeze(-1)
                         
                         # Process grandchildren
                         if child in self.parent_child_map:
@@ -550,6 +542,48 @@ def flatten_hierarchy(h, parent=None):
                 for leaf in leaves:
                     yield leaf
 
+def build_maps(h):
+    """Return node_list, name->idx, parent_map, children_map, descendants_map"""
+    node_list = list(flatten_hierarchy(h))
+    name_to_idx = {n:i for i,n in enumerate(node_list)}
+    parent = {}
+    children = {}
+
+    for top, sub in h.items():
+        children.setdefault(top, [])
+        if isinstance(sub, dict):
+            for child, leaves in sub.items():
+                children[top].append(child)
+                parent[child] = top
+                children.setdefault(child, [])
+                for leaf in leaves:
+                    children[child].append(leaf)
+                    parent[leaf] = child
+
+    # compute descendants for each top-level (all levels below)
+    descendants = {n:set() for n in node_list}
+    def dfs(n):
+        for c in children.get(n, []):
+            descendants[n].add(c)
+            descendants[n] |= dfs(c)
+        return descendants[n]
+    for n in node_list:
+        dfs(n)
+
+    return node_list, name_to_idx, parent, children, descendants
+
+def propagate_targets_up_np(targets, hierarchy):
+    """In-place propagate positives from leaves to ancestors."""
+    node_list, name_to_idx, parent, children, _ = build_maps(hierarchy)
+    # 2 passes are enough on this 3-level tree
+    for _ in range(2):
+        for child, p in parent.items():
+            if child in name_to_idx and p in name_to_idx:
+                ci = name_to_idx[child]
+                pi = name_to_idx[p]
+                targets[:, pi] = np.maximum(targets[:, pi], targets[:, ci])
+    return targets
+
 def create_multilabel_targets(labels_dict, hierarchy):
     """Convert label vectors to multi-label targets aligned with hierarchy"""
     if 'vectors' not in labels_dict:
@@ -571,6 +605,27 @@ def create_multilabel_targets(labels_dict, hierarchy):
     
     return targets
 
+def make_weighted_sampler(dataset):
+    """Create weighted sampler to avoid all-normal batches on FastText/Word2Vec"""
+    # targets at index 4
+    Y = torch.stack([dataset[i][4] for i in range(len(dataset))])
+    has_pos = (Y.sum(dim=1) > 0).float()
+    # weight normals small, anomalies large
+    w = torch.where(has_pos > 0, torch.full_like(has_pos, 50.0), torch.full_like(has_pos, 1.0))
+    return torch.utils.data.WeightedRandomSampler(weights=w.double(), num_samples=len(dataset), replacement=True)
+
+def find_best_thresholds(y_true, y_prob):
+    """Find optimal thresholds per class for rare labels"""
+    taus = np.linspace(0.05, 0.5, 10)  # focus on low thresholds for rare classes
+    best = []
+    for j in range(y_true.shape[1]):
+        yt, yp = y_true[:, j], y_prob[:, j]
+        if yt.sum() == 0:
+            best.append(0.5); continue
+        f1s = [precision_recall_fscore_support(yt, (yp>=t).astype(int), average='binary', zero_division=0)[2] for t in taus]
+        best.append(float(taus[int(np.argmax(f1s))]))
+    return np.array(best, dtype=np.float32)
+
 def load_datasets(embeddings, labels, batch_size=128):
     datasets = {}
     for log_type, log_vectors in embeddings.items():
@@ -591,6 +646,9 @@ def load_datasets(embeddings, labels, batch_size=128):
             
             if targets is None:
                 targets = np.zeros((log_vectors.shape[0], len(list(flatten_hierarchy(hierarchy)))))
+            
+            # 🔧 NEW: propagate labels upward so parents are positive when any descendant is positive
+            targets = propagate_targets_up_np(targets, hierarchy)
             
             # Create sliding windows for LogBERT data
             print(f"Creating temporal windows for {log_type} (LogBERT)...")
@@ -644,6 +702,9 @@ def load_datasets(embeddings, labels, batch_size=128):
             
             if targets is None:
                 targets = np.zeros((log_vectors.shape[0], len(list(flatten_hierarchy(hierarchy)))))
+            
+            # 🔧 NEW: propagate labels upward so parents are positive when any descendant is positive
+            targets = propagate_targets_up_np(targets, hierarchy)
             
             dataset = TensorDataset(
                 torch.from_numpy(cls_tokens).float(),
@@ -1008,7 +1069,7 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
                 cnt = int(Y[:, j].sum().item())
                 if cnt > 0:
                     weight = (Y.shape[0] - cnt) / max(cnt, 1)
-                    weight = min(max(weight, 1.0), 10.0)
+                    weight = min(max(weight, 5.0), 50.0)  # Higher floor for rare labels
                 else:
                     weight = 1.0
                 sub_pos_weights.append(weight)
@@ -1067,28 +1128,20 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
                 recon_loss = mse_loss(recon, recon_target)
                 recon_loss = torch.clamp(recon_loss, 0, 100.0)
 
-                # Create top-level targets from hierarchy targets
+                # Create top-level targets from propagated hierarchy targets
                 batch_size = targets.shape[0]
+                node_names, name_to_idx, *_ = build_maps(hierarchy)
                 top_targets = torch.zeros(batch_size, len(TOP_LEVEL_CLASSES), device=device)
-                
-                # Map hierarchy labels to top-level classes
-                node_names = list(flatten_hierarchy(hierarchy))
-                for i, class_name in enumerate(TOP_LEVEL_CLASSES):
-                    if class_name == "normal":
-                        # Normal is true when no other class is active
-                        top_targets[:, i] = (targets.sum(dim=1) == 0).float()
-                    elif class_name in node_names:
-                        idx = node_names.index(class_name)
-                        if idx < targets.shape[1]:
-                            top_targets[:, i] = targets[:, idx]
-                    else:
-                        # Check if any sub-class of this top-level class is active
-                        if class_name in hierarchy:
-                            for child_name in hierarchy[class_name]:
-                                if child_name in node_names:
-                                    child_idx = node_names.index(child_name)
-                                    if child_idx < targets.shape[1]:
-                                        top_targets[:, i] = torch.maximum(top_targets[:, i], targets[:, child_idx])
+
+                # normal = no positives anywhere
+                top_targets[:, TOP_LEVEL_CLASSES.index("normal")] = (targets.sum(dim=1) == 0).float()
+
+                # all other top-level classes read their (now propagated) column directly
+                for k, cls_name in enumerate(TOP_LEVEL_CLASSES):
+                    if cls_name == "normal": 
+                        continue
+                    if cls_name in name_to_idx and name_to_idx[cls_name] < targets.shape[1]:
+                        top_targets[:, k] = targets[:, name_to_idx[cls_name]]
 
                 # Compute severity-based weights
                 top_probs = torch.sigmoid(top_logits)
@@ -1182,25 +1235,20 @@ def train_model(model, train_loader, val_loader, epochs=None, lambda_recon=ALPHA
                     recon_loss = mse_loss(recon, recon_target)
                     recon_loss = torch.clamp(recon_loss, 0, 100.0)
 
-                    # Create top-level targets from hierarchy targets (same as training)
+                    # Create top-level targets from propagated hierarchy targets (same as training)
                     batch_size = targets.shape[0]
+                    node_names, name_to_idx, *_ = build_maps(hierarchy)
                     top_targets = torch.zeros(batch_size, len(TOP_LEVEL_CLASSES), device=device)
-                    
-                    node_names = list(flatten_hierarchy(hierarchy))
-                    for i, class_name in enumerate(TOP_LEVEL_CLASSES):
-                        if class_name == "normal":
-                            top_targets[:, i] = (targets.sum(dim=1) == 0).float()
-                        elif class_name in node_names:
-                            idx = node_names.index(class_name)
-                            if idx < targets.shape[1]:
-                                top_targets[:, i] = targets[:, idx]
-                        else:
-                            if class_name in hierarchy:
-                                for child_name in hierarchy[class_name]:
-                                    if child_name in node_names:
-                                        child_idx = node_names.index(child_name)
-                                        if child_idx < targets.shape[1]:
-                                            top_targets[:, i] = torch.maximum(top_targets[:, i], targets[:, child_idx])
+
+                    # normal = no positives anywhere
+                    top_targets[:, TOP_LEVEL_CLASSES.index("normal")] = (targets.sum(dim=1) == 0).float()
+
+                    # all other top-level classes read their (now propagated) column directly
+                    for k, cls_name in enumerate(TOP_LEVEL_CLASSES):
+                        if cls_name == "normal": 
+                            continue
+                        if cls_name in name_to_idx and name_to_idx[cls_name] < targets.shape[1]:
+                            top_targets[:, k] = targets[:, name_to_idx[cls_name]]
 
                     # Compute losses (without gradients)
                     top_probs = torch.sigmoid(top_logits)
@@ -1295,23 +1343,20 @@ def evaluate_model(model, test_loader, log_type, embedding_type="", window_to_ev
             top_probs = torch.sigmoid(top_logits)
             batch_top_preds = (top_probs > 0.5).cpu().numpy()
             
-            # Create top-level targets
+            # Create top-level targets from propagated hierarchy targets
             batch_size = targets.shape[0]
+            node_names, name_to_idx, *_ = build_maps(hierarchy)
             batch_top_targets = np.zeros((batch_size, len(TOP_LEVEL_CLASSES)))
-            for i, class_name in enumerate(TOP_LEVEL_CLASSES):
-                if class_name == "normal":
-                    batch_top_targets[:, i] = (targets.sum(dim=1) == 0).cpu().numpy()
-                elif class_name in node_names:
-                    idx = node_names.index(class_name)
-                    if idx < targets.shape[1]:
-                        batch_top_targets[:, i] = targets[:, idx].cpu().numpy()
-                else:
-                    if class_name in hierarchy:
-                        for child_name in hierarchy[class_name]:
-                            if child_name in node_names:
-                                child_idx = node_names.index(child_name)
-                                if child_idx < targets.shape[1]:
-                                    batch_top_targets[:, i] = np.maximum(batch_top_targets[:, i], targets[:, child_idx].cpu().numpy())
+            
+            # normal = no positives anywhere
+            batch_top_targets[:, TOP_LEVEL_CLASSES.index("normal")] = (targets.sum(dim=1) == 0).cpu().numpy()
+            
+            # all other top-level classes read their (now propagated) column directly
+            for k, cls_name in enumerate(TOP_LEVEL_CLASSES):
+                if cls_name == "normal": 
+                    continue
+                if cls_name in name_to_idx and name_to_idx[cls_name] < targets.shape[1]:
+                    batch_top_targets[:, k] = targets[:, name_to_idx[cls_name]].cpu().numpy()
             
             all_window_preds.append(batch_window_preds)
             all_window_targets.append(targets.cpu().numpy())
@@ -1598,9 +1643,17 @@ def main():
             # Set prefetch_factor only when using multiprocessing
             prefetch_factor = 4 if NUM_WORKERS > 0 else None
             
-            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  
-                                    num_workers=NUM_WORKERS, pin_memory=(device.type=="cuda"), 
-                                    persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
+            # Use weighted sampler for non-temporal datasets to avoid all-normal batches
+            if not data.get('is_temporal', False):
+                sampler = make_weighted_sampler(train_set)
+                train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler,
+                                        num_workers=NUM_WORKERS, pin_memory=(device.type=="cuda"), 
+                                        persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
+            else:
+                train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  
+                                        num_workers=NUM_WORKERS, pin_memory=(device.type=="cuda"), 
+                                        persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
+                                        
             val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False, 
                                     num_workers=NUM_WORKERS, pin_memory=(device.type=="cuda"), 
                                     persistent_workers=PERSISTENT_WORKERS, prefetch_factor=prefetch_factor)
