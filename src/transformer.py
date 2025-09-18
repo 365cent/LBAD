@@ -4,17 +4,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import math
+
 import halo
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.decomposition import PCA
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
-from sklearn.preprocessing import StandardScaler
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from imblearn.over_sampling import BorderlineSMOTE, KMeansSMOTE
-from imblearn.under_sampling import RandomUnderSampler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -42,6 +41,9 @@ hierarchy = {
     "attacker_vpn": {},
     "dnsteal": {"dnsteal-received": [], "dnsteal-dropped": [], "exfiltration-service": []}
 }
+
+TARGET_CONTAMINATION = 0.2  # Desired attack proportion in the balanced training set
+MIN_TRAIN_ANOMALIES = 512   # Ensure sufficient anomaly diversity during SMOTE
 
 
 @dataclass(frozen=True)
@@ -457,169 +459,229 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
-def smote_data(train_loader, val_loader):
-    """Performs lightweight SMOTE/undersampling to mitigate class imbalance."""
+def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
+    """Generates a balanced training loader with controllable contamination ratio."""
+
     spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
     spinner.start()
 
     try:
-        # Extract training data
-        all_data = [[], [], [], [], []]
+        # Collate tensors from the original loader
+        collected = [[], [], [], [], []]
         for batch in train_loader:
-            for i, tensor in enumerate(batch):
-                all_data[i].append(tensor.detach().cpu().numpy())
-        cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
+            for idx, tensor in enumerate(batch):
+                collected[idx].append(tensor.detach().cpu().numpy())
 
+        cls, mean, maxp, attn, y = [np.vstack(items).astype(np.float32) for items in collected]
         if int(y.sum()) == 0:
             spinner.stop_and_persist(text="Skipping resampling (only normal samples detected)")
             return train_loader
 
-        # Safety cap: limit rows used for resampling to avoid OOM/very long runs
-        n_total = y.shape[0]
-        max_rows = 400_000 if device.type == "cuda" else 200_000
-        if n_total > max_rows:
-            rng = np.random.default_rng(42)
-            idx = rng.choice(n_total, size=max_rows, replace=False)
-            cls, mean, maxp, attn, y = cls[idx], mean[idx], maxp[idx], attn[idx], y[idx]
-        
-        # Preprocessing
-        scalers = [StandardScaler().fit(data) for data in [cls, mean, maxp, attn]]
-        scaled = [scaler.transform(data) for scaler, data in zip(scalers, [cls, mean, maxp, attn])]
-        
-        # Dimensionality reduction for efficiency
-        pca_dims = [min(48, scaled[0].shape[1]), min(48, scaled[1].shape[1]), min(48, scaled[2].shape[1]), min(8,  scaled[3].shape[1])]  # replace
-        pcas = [PCA(n_components=dim, svd_solver='auto').fit(data) 
-                for dim, data in zip(pca_dims, scaled)]
-        X_reduced = np.hstack([pca.transform(data) for pca, data in zip(pcas, scaled)])
+        X = np.hstack([cls, mean, maxp, attn]).astype(np.float32)
+        node_names = list(flatten_hierarchy(hierarchy))
+        if len(node_names) < y.shape[1]:
+            node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
 
-        # Process each class
-        X_final, y_final = [], []
-        
+        rng = np.random.default_rng(42)
+
+        def replicate_with_noise(base: np.ndarray, count: int, noise_scale: float = 0.01) -> np.ndarray:
+            if count <= 0 or base.size == 0:
+                return np.empty((0, base.shape[1]), dtype=np.float32)
+            idx = rng.choice(len(base), size=count, replace=True)
+            samples = base[idx].copy()
+            std = np.std(base, axis=0, keepdims=True)
+            std[std < 1e-6] = 1.0
+            noise = rng.normal(0.0, noise_scale, size=samples.shape).astype(np.float32)
+            return samples + noise * std.astype(np.float32)
+
+        def split_features(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            c1 = cls.shape[1]
+            c2 = c1 + mean.shape[1]
+            c3 = c2 + maxp.shape[1]
+            return (
+                matrix[:, :c1],
+                matrix[:, c1:c2],
+                matrix[:, c2:c3],
+                matrix[:, c3:],
+            )
+
+        def class_counts(labels: np.ndarray) -> np.ndarray:
+            return labels.sum(axis=0)
+
+        original_normal = int((y.sum(axis=1) == 0).sum())
+        original_anomaly = int(len(y) - original_normal)
+        original_class_counts = class_counts(y)
+
+        # Targeted synthetic samples per class for rare attacks
+        synthetic_features: List[np.ndarray] = []
+        synthetic_targets: List[np.ndarray] = []
+        rare_threshold = max(1000, int(0.05 * len(y)))
+
         for c in range(y.shape[1]):
-            pos_mask = y[:, c] == 1
-            pos_count = int(pos_mask.sum())
-            
-            if pos_count == 0:
+            pos_idx = np.where(y[:, c] == 1)[0]
+            pos_count = pos_idx.size
+            if pos_count == 0 or pos_count > rare_threshold:
                 continue
-                
-            neg_mask = y[:, c] == 0
-            neg_count = int(neg_mask.sum())
-            
-            # Determine target counts for balance
-            total_samples = pos_count + neg_count
-            target_per_class = int(np.sqrt(total_samples * pos_count))
-            target_per_class = max(target_per_class, pos_count)  # Never undersample minority
-            
-            # Prepare class-specific data
-            # Subsample negatives to keep class-specific processing bounded
-            rng = np.random.default_rng(42 + c)
-            pos_idx = np.where(pos_mask)[0]
-            neg_idx = np.where(neg_mask)[0]
-            neg_keep = min(len(neg_idx), max(3 * len(pos_idx), 10000))
-            if neg_keep > 0:
-                neg_idx_sampled = rng.choice(neg_idx, size=neg_keep, replace=False)
-                class_idx = np.concatenate([pos_idx, neg_idx_sampled])
+
+            neg_idx = np.where(y[:, c] == 0)[0]
+            if neg_idx.size == 0:
+                continue
+
+            neg_keep = min(neg_idx.size, max(pos_count * 3, 256))
+            neg_sample = rng.choice(neg_idx, size=neg_keep, replace=False)
+            select_idx = np.concatenate([pos_idx, neg_sample])
+            X_c = X[select_idx]
+            y_c = y[select_idx, c].astype(int)
+
+            if y_c.sum() <= 1:
+                continue
+
+            if pos_count < 10:
+                sampler = KMeansSMOTE(
+                    sampling_strategy="minority",
+                    random_state=42,
+                    k_neighbors=max(1, min(pos_count - 1, 3)),
+                    cluster_balance_threshold=0.1,
+                )
             else:
-                class_idx = pos_idx
-            X_class = X_reduced[class_idx]
-            y_class = y[class_idx, c].astype(int)
-            
-            # Apply resampling pipeline
+                sampler = BorderlineSMOTE(
+                    sampling_strategy="minority",
+                    random_state=42,
+                    kind="borderline-1",
+                )
+
             try:
-                # Determine strategy based on class balance
-                if pos_count <= 1:
-                    X_resampled, y_resampled = X_class, y_class
-                elif pos_count < target_per_class:
-                    k_neighbors = min(3, pos_count - 1)
-                    if pos_count < 5:
-                        smote = KMeansSMOTE(
-                            sampling_strategy="auto",
-                            random_state=42,
-                            k_neighbors=max(1, k_neighbors),
-                            cluster_balance_threshold=0.1,
-                        )
-                    else:
-                        oversample_ratio = min(target_per_class / max(pos_count, 1), 1.5)
-                        smote = BorderlineSMOTE(
-                            sampling_strategy={
-                                1: min(int(pos_count * oversample_ratio), pos_count + 20000)
-                            },
-                            k_neighbors=max(2, k_neighbors),
-                            random_state=42,
-                            kind="borderline-1",
-                        )
-                    X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
-                else:
-                    X_resampled, y_resampled = X_class, y_class
-                
-                # Undersample majority class if needed
-                if (y_resampled == 0).sum() > target_per_class:
-                    undersampler = RandomUnderSampler(
-                        sampling_strategy={0: target_per_class},
-                        random_state=42
-                    )
-                    X_resampled, y_resampled = undersampler.fit_resample(X_resampled, y_resampled)
-                
-                # Store resampled data for this class
-                y_class_matrix = np.zeros((len(y_resampled), y.shape[1]))
-                y_class_matrix[:, c] = y_resampled
-                
-                X_final.append(X_resampled)
-                y_final.append(y_class_matrix)
-                
+                X_res, y_res = sampler.fit_resample(X_c, y_c)
             except Exception:
-                # Fallback: use original data
-                y_class_matrix = np.zeros((len(y_class), y.shape[1]))
-                y_class_matrix[:, c] = y_class
-                X_final.append(X_class)
-                y_final.append(y_class_matrix)
+                continue
 
-        if not X_final:
-            return train_loader
+            new_mask = np.arange(len(X_res)) >= len(X_c)
+            new_pos = new_mask & (y_res == 1)
+            if not np.any(new_pos):
+                continue
 
-        # Combine all resampled classes (skip dedup to save RAM) and optionally cap size
-        X_final = np.vstack(X_final)
-        y_final = np.vstack(y_final)
-        max_out = 1_000_000 if device.type == "cuda" else 500_000
-        if len(X_final) > max_out:
-            rng = np.random.default_rng(123)
-            keep = rng.choice(len(X_final), size=max_out, replace=False)
-            X_final = X_final[keep]
-            y_final = y_final[keep]
-        
-        # Inverse transform to original feature space
-        splits = np.cumsum([pca.n_components_ for pca in pcas[:-1]])
-        x_blocks = np.split(X_final, splits, axis=1)
-        # Batched inverse-transform to limit peak memory
-        def _inv(pca, scaler, block, bs=200000):
-            out = []
-            for i in range(0, len(block), bs):
-                out.append(scaler.inverse_transform(pca.inverse_transform(block[i:i+bs])))
-            return np.vstack(out)
-        final_features = [_inv(p, s, b, bs=100_000 if device.type=="cuda" else 50_000) for (p, s, b) in zip(pcas, scalers, x_blocks)]
-        
-        # Create balanced dataset
-        dataset = TensorDataset(*[torch.from_numpy(data).float() for data in final_features + [y_final]])
-        
-        print(f"\nBalanced dataset: {len(dataset)} samples")
-        anomaly_count = (torch.from_numpy(y_final).sum(dim=1) > 0).sum().item()
-        print(f"  normal: {len(dataset) - anomaly_count} ({(len(dataset) - anomaly_count)/len(dataset):.2%})")
-        print(f"  anomalies: {anomaly_count} ({anomaly_count/len(dataset):.2%})")
+            X_new = X_res[new_pos].astype(np.float32)
+            Y_new = np.zeros((X_new.shape[0], y.shape[1]), dtype=np.float32)
+            Y_new[:, c] = 1.0
+            synthetic_features.append(X_new)
+            synthetic_targets.append(Y_new)
 
-        return DataLoader(dataset, batch_size=getattr(train_loader, 'batch_size', 128), shuffle=True, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+        if synthetic_features:
+            X_aug = np.vstack([X] + synthetic_features)
+            y_aug = np.vstack([y] + synthetic_targets)
+        else:
+            X_aug, y_aug = X.copy(), y.copy()
 
-    except Exception as e:
-        print(f"Resampling failed: {e}")
+        normal_mask = y_aug.sum(axis=1) == 0
+        anomaly_mask = ~normal_mask
+        X_normals = X_aug[normal_mask]
+        Y_normals = y_aug[normal_mask]
+        X_anomalies = X_aug[anomaly_mask]
+        Y_anomalies = y_aug[anomaly_mask]
+
+        # Compute desired normal/anomaly counts based on contamination rate and dataset size
+        desired_total = max(len(X_aug), 2000)
+        desired_anomaly = max(1, int(round(desired_total * target_contamination)))
+        desired_normal = max(1, desired_total - desired_anomaly)
+
+        def downsample_anomalies(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
+            if len(X_group) <= target_count:
+                return X_group, Y_group
+            selected = set()
+            current_total = len(X_group)
+            for c in range(Y_group.shape[1]):
+                class_idx = np.where(Y_group[:, c] == 1)[0]
+                if class_idx.size == 0:
+                    continue
+                quota = max(1, int(target_count * (class_idx.size / current_total)))
+                chosen = rng.choice(class_idx, size=min(quota, class_idx.size), replace=False)
+                selected.update(chosen.tolist())
+            if len(selected) > target_count:
+                selected = set(rng.choice(list(selected), size=target_count, replace=False))
+            remaining = target_count - len(selected)
+            if remaining > 0:
+                pool = np.setdiff1d(np.arange(current_total), np.array(list(selected)))
+                if pool.size > 0:
+                    extra = rng.choice(pool, size=min(remaining, pool.size), replace=False)
+                    selected.update(extra.tolist())
+            chosen_idx = np.array(list(selected))
+            if chosen_idx.size < target_count:
+                deficit = target_count - chosen_idx.size
+                replenish = rng.choice(np.arange(current_total), size=deficit, replace=True)
+                chosen_idx = np.concatenate([chosen_idx, replenish])
+            return X_group[chosen_idx], Y_group[chosen_idx]
+
+        def adjust_normals(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
+            if len(X_group) >= target_count:
+                idx = rng.choice(len(X_group), size=target_count, replace=False)
+                return X_group[idx], Y_group[idx]
+            shortfall = target_count - len(X_group)
+            augment = replicate_with_noise(X_group, shortfall)
+            Y_augmented = np.zeros((augment.shape[0], Y_group.shape[1]), dtype=np.float32)
+            return np.vstack([X_group, augment]), np.vstack([Y_group, Y_augmented])
+
+        X_normals_bal, Y_normals_bal = adjust_normals(X_normals, Y_normals, desired_normal)
+        X_anomalies_bal, Y_anomalies_bal = downsample_anomalies(X_anomalies, Y_anomalies, desired_anomaly)
+
+        X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
+        y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
+
+        balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
+        balanced_anomaly = int(len(y_balanced) - balanced_normal)
+        balanced_class_counts = class_counts(y_balanced)
+
+        # Present distribution deltas to assist debugging/tuning
+        print("\nBalanced dataset distribution (after SMOTE & contamination control):")
+        print(f"  total samples: {len(y_balanced)}")
+        print(f"  normal:  {balanced_normal} (target {desired_normal})")
+        print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
+
+        print("\nPer-class adjustments:")
+        display_limit = 25
+        shown = 0
+        for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
+            before = int(original_class_counts[idx])
+            after = int(balanced_class_counts[idx])
+            if before == 0 and after == 0:
+                continue
+            delta = after - before
+            trend = "++" if delta > 0 else "--" if delta < 0 else "=="
+            print(f"  {name:<25} {after:>7} ({trend} {delta:+d})")
+            shown += 1
+            if shown >= display_limit:
+                if y_balanced.shape[1] - (idx + 1) > 0:
+                    print("  ...")
+                break
+
+        cls_bal, mean_bal, maxp_bal, attn_bal = split_features(X_balanced)
+        dataset = TensorDataset(
+            torch.from_numpy(cls_bal).float(),
+            torch.from_numpy(mean_bal).float(),
+            torch.from_numpy(maxp_bal).float(),
+            torch.from_numpy(attn_bal).float(),
+            torch.from_numpy(y_balanced).float(),
+        )
+
+        spin_msg = "Resampling completed"
+        spinner.stop_and_persist(text=spin_msg)
+        return DataLoader(
+            dataset,
+            batch_size=getattr(train_loader, "batch_size", 128),
+            shuffle=True,
+            num_workers=8,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=True,
+            prefetch_factor=4,
+        )
+
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Resampling failed: {exc}")
+        spinner.stop_and_persist(text="Resampling failed (fallback to original loader)")
         return train_loader
-    finally:
-        try:
-            spinner.stop_and_persist(text="Resampling completed")
-        except:
-            pass
 
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
     """Trains the transformer with reconstruction and hierarchy regularizers."""
-    train = smote_data(train_loader, val_loader)
+    train = smote_data(train_loader, val_loader, target_contamination=TARGET_CONTAMINATION)
     if len(train) == 0:
         train = train_loader
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
@@ -988,13 +1050,38 @@ def main():
                 return torch.cat(filtered)
 
             normal_train, normal_val, normal_test = stratified_split(normal_idx)
-            _, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
 
             if len(normal_train) == 0:
                 print("Insufficient normal samples for training; defaulting to all normal logs.")
                 normal_train = normal_idx
 
-            train_indices = normal_train
+            if len(anomaly_idx) > 0:
+                permuted_anomalies = anomaly_idx[torch.randperm(len(anomaly_idx))]
+                base_normals = max(len(normal_train), 1)
+                ratio_denominator = max(1.0 - TARGET_CONTAMINATION, 1e-6)
+                contamination_target = int(math.ceil(base_normals * TARGET_CONTAMINATION / ratio_denominator))
+                desired_anomaly_train = max(
+                    min(len(permuted_anomalies), MIN_TRAIN_ANOMALIES),
+                    contamination_target,
+                )
+                desired_anomaly_train = min(desired_anomaly_train, len(permuted_anomalies))
+
+                anomaly_train = permuted_anomalies[:desired_anomaly_train]
+                remaining_anomalies = permuted_anomalies[desired_anomaly_train:]
+
+                if len(remaining_anomalies) > 0:
+                    split_point = len(remaining_anomalies) // 2
+                    anomaly_val = remaining_anomalies[:split_point]
+                    anomaly_test = remaining_anomalies[split_point:]
+                else:
+                    anomaly_val = torch.tensor([], dtype=torch.long)
+                    anomaly_test = torch.tensor([], dtype=torch.long)
+            else:
+                anomaly_train = torch.tensor([], dtype=torch.long)
+                anomaly_val = torch.tensor([], dtype=torch.long)
+                anomaly_test = torch.tensor([], dtype=torch.long)
+
+            train_indices = concat_indices([normal_train, anomaly_train])
             val_indices = concat_indices([normal_val, anomaly_val])
             test_indices = concat_indices([normal_test, anomaly_test])
 
