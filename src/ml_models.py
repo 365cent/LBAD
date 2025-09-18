@@ -1,1151 +1,832 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Classical multi-label baselines for log analysis.
 
-"""
-Multi-Label ML Baseline for Log Analysis
-----------------------------------------
-Traditional ML methods adapted for multi-label classification 
-to provide baseline comparison with transformer models.
+This module provides lightweight, high-performance baselines that mirror the
+data handling used by the transformer pipeline. It supports training and
+evaluating multiple traditional ML models on pre-computed embeddings with
+hierarchy-aware SMOTE-style augmentation to improve rare-class recall and
+precision.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import argparse
 import json
 import pickle
-import argparse
-import time
-import hashlib
-import numpy as np
-import pandas as pd
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.multioutput import MultiOutputClassifier
-from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    classification_report, f1_score, precision_score, recall_score,
-    hamming_loss, jaccard_score, accuracy_score, multilabel_confusion_matrix
+    accuracy_score,
+    classification_report,
+    f1_score,
+    hamming_loss,
+    jaccard_score,
+    precision_score,
+    recall_score,
 )
 from sklearn.model_selection import train_test_split
-# Ensure Matplotlib can write cache/config on HPC BEFORE importing matplotlib
-try:
-    if "MPLCONFIGDIR" not in os.environ:
-        _mpl_dir = Path.cwd() / ".mplconfig"
-        _mpl_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
-except Exception:
-    pass
-import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-# Try XGBoost with fallback
-try:
+try:  # Optional dependency for gradient boosted trees
     from xgboost import XGBClassifier
-    HAS_XGBOOST = True
-except ImportError:
-    HAS_XGBOOST = False
-    print("XGBoost not available, skipping XGB model")
 
-# Project paths
-ROOT = Path(__file__).resolve().parent.parent
-PROCESSED_DIR = ROOT / 'processed'
-EMBEDDINGS_DIR = ROOT / 'embeddings'
-MODELS_DIR = ROOT / 'models'
-RESULTS_DIR = ROOT / 'results'
+    HAS_XGB = True
+except ImportError:  # pragma: no cover - optional runtime dependency
+    HAS_XGB = False
 
-# Create directories if they don't exist
-for dir_path in [MODELS_DIR, RESULTS_DIR]:
-    dir_path.mkdir(exist_ok=True)
 
-# Optimization for multiple cores
-CPU_COUNT = os.cpu_count()
-if CPU_COUNT:
-    N_JOBS = max(1, CPU_COUNT - 1)
-else:
-    N_JOBS = -1
+###############################################################################
+# Hierarchy definition and helper utilities
+###############################################################################
 
-def _json_default(obj):
-    """JSON serializer for non-standard types (e.g., numpy types/arrays)."""
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return str(obj)
+hierarchy: Mapping[str, Mapping[str, Sequence[str]]] = {
+    "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
+    "escalate": {
+        "escalated_command": ["escalated_sudo_session"],
+        "attacker_change_user": [],
+        "reverse_shell": [],
+    },
+    "attacker_vpn": {},
+    "dnsteal": {
+        "dnsteal-received": [],
+        "dnsteal-dropped": [],
+        "exfiltration-service": [],
+    },
+}
 
-def check_existing_predictions(log_type, model_name, embedding_type=None, force_restart=False):
-    """Check if predictions already exist for a specific model and log type."""
-    if force_restart:
-        return None, None
-    
-    # Create results directory path
-    results_dir = RESULTS_DIR / f"multilabel_{log_type}"
-    
-    # Look for existing prediction files
-    prediction_file = results_dir / f"{model_name}_predictions.pkl"
-    metrics_file = results_dir / f"{model_name}_metrics.pkl"
-    
-    if prediction_file.exists() and metrics_file.exists():
-        try:
-            # Load existing predictions and metrics
-            with open(prediction_file, 'rb') as f:
-                existing_data = pickle.load(f)
-            
-            with open(metrics_file, 'rb') as f:
-                existing_metrics = pickle.load(f)
-            
-            # Check if the data matches current configuration
-            if (existing_data.get('log_type') == log_type and
-                existing_data.get('model_name') == model_name and
-                existing_data.get('embedding_type') == embedding_type):
-                
-                print(f"✅ Found existing predictions for {model_name} on {log_type}")
-                print(f"   📁 Loading from: {prediction_file}")
-                return existing_data, existing_metrics
-            
-        except Exception as e:
-            print(f"⚠️  Could not load existing predictions for {model_name}: {e}")
-    
-    return None, None
 
-def save_predictions_and_metrics(log_type, model_name, predictions, metrics, embedding_type=None):
-    """Save predictions and metrics in the same style as transformer outputs."""
+@dataclass(frozen=True)
+class BaselineConfig:
+    """Configuration for classical baselines."""
+
+    contamination: float = 0.2
+    min_train_anomalies: int = 512
+    rare_class_threshold: int = 512
+    min_synthetic_target: int = 64
+    max_synthetic_multiplier: float = 2.0
+    hard_negative_multiplier: float = 1.5
+    test_ratio: float = 0.15
+    val_ratio: float = 0.15
+    random_state: int = 42
+    include_logistic: bool = True
+    include_random_forest: bool = True
+    include_xgb: bool = True
+    n_estimators: int = 200
+    max_depth: Optional[int] = None
+    xgb_learning_rate: float = 0.1
+    xgb_estimators: int = 200
+    report_top_k: int = 15
+
+
+@dataclass
+class DatasetBundle:
+    """Container for dataset splits and metadata."""
+
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_val: np.ndarray
+    y_val: np.ndarray
+    X_test: np.ndarray
+    y_test: np.ndarray
+    label_names: List[str]
+    smote_summary: Dict[str, Dict[str, float]]
+
+
+@dataclass
+class ModelMetrics:
+    """Evaluation metrics for a baseline model."""
+
+    model_name: str
+    micro_f1: float
+    macro_f1: float
+    weighted_f1: float
+    micro_precision: float
+    micro_recall: float
+    macro_precision: float
+    macro_recall: float
+    subset_accuracy: float
+    jaccard_micro: float
+    jaccard_macro: float
+    hamming: float
+    report: str
+
+
+@dataclass
+class RunSummary:
+    """Summary of a full baseline run for a log type and embedding."""
+
+    log_type: str
+    embedding_type: str
+    metrics: List[ModelMetrics] = field(default_factory=list)
+    dataset_stats: Dict[str, float] = field(default_factory=dict)
+
+
+###############################################################################
+# Embedding loading utilities (mirrors transformer.py)
+###############################################################################
+
+
+def safe_load(path: Path) -> Optional[np.ndarray]:
+    """Loads a pickle file safely, handling truncated/corrupted files."""
+
     try:
-        # Match transformer-style directory
-        results_dir = RESULTS_DIR
-        results_dir.mkdir(parents=True, exist_ok=True)
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"✗ {path.name}: {exc}")
+        return None
 
-        # Timestamped file like transformer evaluation
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        report_path = results_dir / f"hierarchical_{log_type}_evaluation_{timestamp}.txt"
 
-        # Write concise report to align with transformer
-        with open(report_path, 'w') as f:
-            f.write(f"Hierarchical Transformer Evaluation Report (Baselines)\n")
-            f.write(f"Log Type: {log_type}\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Dataset: {len(predictions['y_pred'])} test samples\n")
-            f.write("="*50 + "\n\n")
+def _resolve_embedding_roots(embedding_type: str) -> Tuple[List[Path], List[Path]]:
+    """Returns candidate roots for a given embedding type."""
 
-            f.write("Overall Metrics:\n")
-            f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
-            f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
-            f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
-            f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
-            f.write(f"Weighted F1: {metrics['weighted_f1']:.4f}\n")
-            f.write(f"Jaccard (Micro): {metrics['jaccard_micro']:.4f}\n")
-            f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n")
+    mapping = {
+        "fasttext": ["fasttext", "fasttext_embeddings", ""],
+        "word2vec": ["word2vec", "word2vec_embeddings"],
+        "logbert": ["logbert", "logbert_embeddings"],
+    }
 
-        print(f"Saved baseline report: {report_path}")
-    except Exception as e:
-        print(f"⚠️  Could not save baseline report: {e}")
+    subdirs = mapping.get(embedding_type, [""])
+    search_order: List[Path] = []
+    seen: set[str] = set()
 
-def create_multilabel_models(n_labels, random_state=42, large_dataset=False, skip_knn=False, skip_lr=False, skip_rf=False, skip_xgb=False, has_xgb=False, fast=False):
-    """Create multi-label ML models.
-    If fast=True, return only a lightweight Logistic Regression baseline and simplify hyperparameters.
-    """
-    models = {}
+    for subdir in subdirs:
+        candidate = Path("embeddings") / subdir if subdir else Path("embeddings")
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        search_order.append(candidate)
+        seen.add(key)
 
-    # Fast path: LR only
-    if fast:
-        models['lr'] = MultiOutputClassifier(
-            LogisticRegression(solver='saga', max_iter=50, tol=1e-2),
-            n_jobs=N_JOBS
+    existing = [path for path in search_order if path.exists()]
+    return (existing if existing else search_order, search_order)
+
+
+def _iter_embedding_dirs(candidate_roots: Iterable[Path]) -> Iterable[Path]:
+    """Yields directories that may contain serialized embeddings."""
+
+    for root in candidate_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if child.is_dir():
+                yield child
+
+
+def _load_embeddings_from_roots(
+    embedding_type: str,
+    candidate_roots: Iterable[Path],
+    target_log_type: Optional[str],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, dict]]:
+    embeddings: Dict[str, np.ndarray] = {}
+    labels: Dict[str, dict] = {}
+
+    def load_single(directory: Path, logical_name: str) -> None:
+        if logical_name in embeddings:
+            return
+        log_pkl = directory / f"log_{logical_name}.pkl"
+        label_pkl = directory / f"label_{logical_name}.pkl"
+        if not (log_pkl.exists() and label_pkl.exists()):
+            return
+        print(f"Loading {logical_name} ({embedding_type})...", end=" ")
+        log_array = safe_load(log_pkl)
+        label_obj = safe_load(label_pkl)
+        if isinstance(log_array, np.ndarray) and isinstance(label_obj, dict):
+            embeddings[logical_name] = log_array.astype(np.float32)
+            labels[logical_name] = label_obj
+            print("✓")
+        else:
+            print("✗")
+
+    if target_log_type:
+        slug = target_log_type
+        for root in candidate_roots:
+            target_dir = root / slug
+            if target_dir.exists():
+                load_single(target_dir, slug)
+        return embeddings, labels
+
+    for directory in _iter_embedding_dirs(candidate_roots):
+        load_single(directory, directory.name)
+
+    return embeddings, labels
+
+
+def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]):
+    roots, search_order = _resolve_embedding_roots(embedding_type)
+    embeddings, labels = _load_embeddings_from_roots(embedding_type, roots, target_log_type)
+
+    if target_log_type and target_log_type not in embeddings:
+        searched = [str((root / target_log_type).resolve()) for root in search_order]
+        raise FileNotFoundError(
+            f"Embeddings for '{target_log_type}' not found for {embedding_type}. Checked: {', '.join(searched)}"
         )
-        return models
 
-    # Random Forest (defaults, but parallelized and slightly lighter for safety)
-    if not skip_rf:
-        models['rf'] = MultiOutputClassifier(
-            RandomForestClassifier(
-                n_estimators=100,
-                random_state=random_state,
-                n_jobs=N_JOBS
-            ),
-            n_jobs=N_JOBS
+    if not embeddings:
+        searched = ", ".join(str(path.resolve()) if path.exists() else str(path) for path in search_order)
+        hint = {
+            "fasttext": "python src/fasttext_embedding.py --output-subdir fasttext",
+            "word2vec": "python src/word2vec_embedding_thesis.py --output-subdir word2vec",
+            "logbert": "python src/logbert_embeddings.py --output-subdir logbert",
+        }.get(embedding_type, "<embedding script>")
+        raise FileNotFoundError(
+            f"No valid {embedding_type} embeddings located. Checked directories: {searched}.\n"
+            f"Generate embeddings via:\n  {hint}"
         )
 
-    # Logistic Regression (defaults)
-    if not skip_lr:
-        models['lr'] = MultiOutputClassifier(
-            LogisticRegression(solver='saga', max_iter=200, tol=1e-3),
-            n_jobs=N_JOBS
+    print(f"Loaded {len(embeddings)} log types for {embedding_type}")
+    return embeddings, labels
+
+
+def load_fasttext_embeddings(target_log_type: Optional[str] = None):
+    return _load_embedding_dispatch("fasttext", target_log_type)
+
+
+def load_word2vec_embeddings(target_log_type: Optional[str] = None):
+    return _load_embedding_dispatch("word2vec", target_log_type)
+
+
+def load_logbert_embeddings(target_log_type: Optional[str] = None):
+    return _load_embedding_dispatch("logbert", target_log_type)
+
+
+###############################################################################
+# Dataset preparation
+###############################################################################
+
+
+def flatten_hierarchy(tree: Mapping[str, Mapping[str, Sequence[str]]]):
+    """Flattens the hierarchy into a generator of node names."""
+
+    for node, children in tree.items():
+        yield node
+        if isinstance(children, Mapping):
+            for child, leaves in children.items():
+                yield child
+                for leaf in leaves:
+                    yield leaf
+
+
+def create_multilabel_targets(label_dict: Mapping[str, np.ndarray]) -> Optional[np.ndarray]:
+    """Aligns label vectors with the flattened hierarchy."""
+
+    vectors = label_dict.get("vectors")
+    if vectors is None:
+        return None
+
+    node_list = list(flatten_hierarchy(hierarchy))
+    target = np.zeros((vectors.shape[0], len(node_list)), dtype=np.float32)
+    width = min(vectors.shape[1], target.shape[1])
+    target[:, :width] = vectors[:, :width]
+    return target
+
+
+def _concatenate_feature_blocks(vectors: np.ndarray) -> np.ndarray:
+    """Returns a flattened feature representation across embedding segments."""
+
+    return vectors.astype(np.float32, copy=False)
+
+
+def build_parent_lookup(tree: Mapping[str, Mapping[str, Sequence[str]]]) -> Dict[str, Optional[str]]:
+    """Creates a lookup from each node to its parent in the hierarchy."""
+
+    parents: Dict[str, Optional[str]] = {}
+
+    def recurse(current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]) -> None:
+        for node, children in current.items():
+            parents.setdefault(node, parent)
+            if isinstance(children, Mapping):
+                recurse(children, node)
+                for intermediate, leaves in children.items():
+                    parents.setdefault(intermediate, node)
+                    for leaf in leaves:
+                        parents.setdefault(str(leaf), intermediate)
+
+    recurse(tree, None)
+    return parents
+
+
+def _apply_hierarchy_aware_smote(
+    X: np.ndarray,
+    y: np.ndarray,
+    label_names: List[str],
+    config: BaselineConfig,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[str, float]]]:
+    """Generates synthetic samples to improve minority coverage."""
+
+    rng = np.random.default_rng(config.random_state)
+    parent_lookup = build_parent_lookup(hierarchy)
+    name_to_index = {name: idx for idx, name in enumerate(label_names)}
+
+    adaptive_threshold = int(0.05 * len(y)) if len(y) > 0 else config.rare_class_threshold
+    rare_threshold = max(config.min_synthetic_target, min(config.rare_class_threshold, adaptive_threshold))
+
+    global_std = np.std(X, axis=0, keepdims=True)
+    global_std[global_std < 1e-6] = 1.0
+    global_std = global_std.astype(np.float32)
+
+    synthetic_features: List[np.ndarray] = []
+    synthetic_targets: List[np.ndarray] = []
+    per_class_stats: Dict[str, Dict[str, float]] = {}
+
+    for idx, name in enumerate(label_names):
+        positives = np.where(y[:, idx] == 1)[0]
+        pos_count = positives.size
+        per_class_stats[name] = {"original": float(pos_count)}
+
+        if pos_count == 0 or pos_count > rare_threshold or pos_count < 2:
+            continue
+
+        target_cap = min(
+            max(pos_count + config.min_synthetic_target, int(pos_count * config.max_synthetic_multiplier)),
+            rare_threshold,
         )
+        synth_needed = max(0, target_cap - pos_count)
+        if synth_needed == 0:
+            continue
 
-    # K-Nearest Neighbors (defaults)
-    if not skip_knn:
-        models['knn'] = MultiOutputClassifier(KNeighborsClassifier(n_neighbors=3), n_jobs=N_JOBS)
+        pair_idx = rng.choice(positives, size=(synth_needed, 2), replace=True)
+        base_a = X[pair_idx[:, 0]]
+        base_b = X[pair_idx[:, 1]]
+        lam = rng.random(synth_needed, dtype=np.float32)[:, None]
 
-    # XGBoost (defaults if available)
-    if has_xgb and HAS_XGBOOST and not skip_xgb:
-        models['xgb'] = MultiOutputClassifier(XGBClassifier(n_estimators=100, tree_method='hist', n_jobs=N_JOBS), n_jobs=N_JOBS)
+        class_std = np.std(X[positives], axis=0, keepdims=True)
+        class_std = np.where(class_std < 1e-6, global_std, class_std).astype(np.float32)
+        noise = rng.normal(0.0, 1.0, size=base_a.shape).astype(np.float32) * class_std * 0.02
+
+        X_new = base_a + lam * (base_b - base_a) + noise
+        Y_new = np.maximum(y[pair_idx[:, 0]], y[pair_idx[:, 1]]).astype(np.float32)
+
+        synthetic_features.append(X_new)
+        synthetic_targets.append(Y_new)
+
+        parent_name = parent_lookup.get(name)
+        if parent_name and parent_name in name_to_index:
+            parent_idx = name_to_index[parent_name]
+            parent_only = np.where((y[:, parent_idx] == 1) & (y[:, idx] == 0))[0]
+            if parent_only.size > 0:
+                neg_quota = min(parent_only.size, int(synth_needed * config.hard_negative_multiplier))
+                if neg_quota > 0:
+                    neg_idx = rng.choice(parent_only, size=neg_quota, replace=False)
+                    synthetic_features.append(X[neg_idx])
+                    synthetic_targets.append(y[neg_idx].astype(np.float32))
+
+        per_class_stats[name]["after_synth"] = per_class_stats[name]["original"] + float(synth_needed)
+
+    if synthetic_features:
+        X_aug = np.vstack([X] + synthetic_features)
+        y_aug = np.vstack([y] + synthetic_targets)
+    else:
+        X_aug, y_aug = X, y
+
+    return X_aug, y_aug, per_class_stats
+
+
+def _rebalance_contamination(
+    X: np.ndarray,
+    y: np.ndarray,
+    config: BaselineConfig,
+    label_names: List[str],
+    per_class_stats: Dict[str, Dict[str, float]],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[str, float]]]:
+    """Matches the desired contamination ratio via oversampling/undersampling."""
+
+    rng = np.random.default_rng(config.random_state + 1)
+
+    normal_mask = y.sum(axis=1) == 0
+    anomaly_mask = ~normal_mask
+    X_normals, Y_normals = X[normal_mask], y[normal_mask]
+    X_anomalies, Y_anomalies = X[anomaly_mask], y[anomaly_mask]
+
+    desired_total = max(len(X), len(X_anomalies) + len(X_normals))
+    desired_anomaly = max(config.min_train_anomalies, int(desired_total * config.contamination))
+    desired_anomaly = min(desired_anomaly, len(X_anomalies)) if len(X_anomalies) > 0 else 0
+    desired_normal = max(1, desired_total - desired_anomaly)
+
+    if len(X_normals) >= desired_normal:
+        idx = rng.choice(len(X_normals), size=desired_normal, replace=False)
+        X_normals_bal, Y_normals_bal = X_normals[idx], Y_normals[idx]
+    else:
+        deficit = desired_normal - len(X_normals)
+        replicated = X_normals[rng.choice(len(X_normals), size=deficit, replace=True)] if len(X_normals) > 0 else np.zeros((0, X.shape[1]), dtype=np.float32)
+        replicated_y = Y_normals[rng.choice(len(Y_normals), size=deficit, replace=True)] if len(Y_normals) > 0 else np.zeros((0, y.shape[1]), dtype=np.float32)
+        X_normals_bal = np.vstack([X_normals, replicated]) if len(X_normals) else replicated
+        Y_normals_bal = np.vstack([Y_normals, replicated_y]) if len(Y_normals) else replicated_y
+
+    if desired_anomaly == 0 or len(X_anomalies) == 0:
+        X_anomalies_bal = np.zeros((0, X.shape[1]), dtype=np.float32)
+        Y_anomalies_bal = np.zeros((0, y.shape[1]), dtype=np.float32)
+    elif len(X_anomalies) <= desired_anomaly:
+        X_anomalies_bal, Y_anomalies_bal = X_anomalies, Y_anomalies
+    else:
+        idx = rng.choice(len(X_anomalies), size=desired_anomaly, replace=False)
+        X_anomalies_bal, Y_anomalies_bal = X_anomalies[idx], Y_anomalies[idx]
+
+    X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
+    y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
+
+    before_counts = y.sum(axis=0)
+    after_counts = y_balanced.sum(axis=0)
+    for idx, name in enumerate(label_names):
+        stats = per_class_stats.setdefault(name, {})
+        stats.setdefault("original", float(before_counts[idx]))
+        stats["balanced"] = float(after_counts[idx])
+
+    return X_balanced, y_balanced, per_class_stats
+
+
+def prepare_training_bundle(
+    vectors: np.ndarray,
+    labels: Optional[np.ndarray],
+    config: BaselineConfig,
+) -> DatasetBundle:
+    """Splits embeddings into train/val/test sets and balances the training set."""
+
+    features = _concatenate_feature_blocks(vectors)
+    if labels is None:
+        labels = np.zeros((features.shape[0], len(list(flatten_hierarchy(hierarchy)))), dtype=np.float32)
+
+    label_names = list(flatten_hierarchy(hierarchy))[: labels.shape[1]]
+
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        features,
+        labels,
+        test_size=config.test_ratio,
+        random_state=config.random_state,
+        stratify=(labels.sum(axis=1) > 0).astype(int) if labels.sum() > 0 else None,
+    )
+
+    val_size = config.val_ratio / (1.0 - config.test_ratio)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=val_size,
+        random_state=config.random_state,
+        stratify=(y_temp.sum(axis=1) > 0).astype(int) if y_temp.sum() > 0 else None,
+    )
+
+    X_aug, y_aug, per_class = _apply_hierarchy_aware_smote(X_train, y_train, label_names, config)
+    X_balanced, y_balanced, per_class = _rebalance_contamination(X_aug, y_aug, config, label_names, per_class)
+
+    smote_summary = {
+        name: {
+            key: float(value)
+            for key, value in stats.items()
+            if value is not None
+        }
+        for name, stats in per_class.items()
+    }
+
+    return DatasetBundle(
+        X_train=X_balanced,
+        y_train=y_balanced,
+        X_val=X_val,
+        y_val=y_val,
+        X_test=X_test,
+        y_test=y_test,
+        label_names=label_names,
+        smote_summary=smote_summary,
+    )
+
+
+###############################################################################
+# Model training and evaluation
+###############################################################################
+
+
+def _build_models(config: BaselineConfig) -> Dict[str, MultiOutputClassifier]:
+    """Constructs the set of baseline models based on config flags."""
+
+    models: Dict[str, MultiOutputClassifier] = {}
+
+    if config.include_logistic:
+        lr = LogisticRegression(
+            penalty="l2",
+            solver="saga",
+            max_iter=200,
+            tol=1e-3,
+            C=1.0,
+            n_jobs=-1,
+            random_state=config.random_state,
+        )
+        models["logistic"] = MultiOutputClassifier(lr, n_jobs=-1)
+
+    if config.include_random_forest:
+        rf = RandomForestClassifier(
+            n_estimators=config.n_estimators,
+            max_depth=config.max_depth,
+            min_samples_leaf=2,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+            random_state=config.random_state,
+        )
+        models["random_forest"] = MultiOutputClassifier(rf, n_jobs=-1)
+
+    if config.include_xgb and HAS_XGB:
+        xgb = XGBClassifier(
+            learning_rate=config.xgb_learning_rate,
+            n_estimators=config.xgb_estimators,
+            max_depth=6,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_lambda=1.0,
+            reg_alpha=0.5,
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=config.random_state,
+        )
+        models["xgboost"] = MultiOutputClassifier(xgb, n_jobs=-1)
 
     return models
 
-def find_available_log_types(embedding_type: str = None):
-    """Find available log types from embeddings directory."""
-    log_types = set()
-    
-    # For backward compatibility, check both old and new formats
-    if embedding_type:
-        # New format: embeddings/<embedding_type>/<log_type>/
-        base = EMBEDDINGS_DIR / embedding_type
-        if base.exists():
-            for log_dir in base.iterdir():
-                if log_dir.is_dir():
-                    name = log_dir.name
-                    # Check for both old and new naming conventions
-                    if ((log_dir / f"log_{name}.pkl").exists() and (log_dir / f"label_{name}.pkl").exists()) or \
-                       ((log_dir / "embeddings.pkl").exists() and (log_dir / "labels.pkl").exists()):
-                        log_types.add(name)
-    else:
-        # Legacy format: embeddings/<log_type>/
-        if EMBEDDINGS_DIR.exists():
-            for path in EMBEDDINGS_DIR.iterdir():
-                if path.is_dir():
-                    # Check for embeddings.pkl and labels.pkl in direct subdirs
-                    if (path / "embeddings.pkl").exists() and (path / "labels.pkl").exists():
-                        log_types.add(path.name)
-                    # Also check for log_<type>.pkl format
-                    elif (path / f"log_{path.name}.pkl").exists() and (path / f"label_{path.name}.pkl").exists():
-                        log_types.add(path.name)
-    
-    return sorted(list(log_types))
 
-def load_multilabel_data(log_type, embedding_type: str = None):
-    """Load embeddings and multi-label data."""
-    print(f"Loading {log_type} data...")
-    
-    # Candidate search order - check both old and new formats
-    candidates = []
-    if embedding_type:
-        base = EMBEDDINGS_DIR / embedding_type / log_type
-        # New format
-        candidates.append((base / 'embeddings.pkl', base / 'labels.pkl'))
-        # Old format
-        candidates.append((base / f'log_{log_type}.pkl', base / f'label_{log_type}.pkl'))
-    
-    # Legacy format (direct under embeddings/)
-    legacy = EMBEDDINGS_DIR / log_type
-    candidates.append((legacy / 'embeddings.pkl', legacy / 'labels.pkl'))
-    candidates.append((legacy / f'log_{log_type}.pkl', legacy / f'label_{log_type}.pkl'))
-    
-    embeddings = label_data = None
-    used_path = None
-    for x_path, y_path in candidates:
-        if x_path.exists() and y_path.exists():
-            with open(x_path, 'rb') as f:
-                embeddings = pickle.load(f)
-            with open(y_path, 'rb') as f:
-                label_data = pickle.load(f)
-            used_path = x_path.parent
-            print(f"✅ Loaded data from: {used_path}")
-            break
-    
-    if embeddings is None:
-        raise FileNotFoundError(f"Embeddings for {log_type} not found. Searched in: " + ", ".join([str(p[0].parent) for p in candidates]))
-    
-    # Try to load attack types description file - check multiple locations
-    attack_types_files = []
-    if used_path:
-        attack_types_files.append(used_path / f'attack_types_{log_type}.txt')
-        attack_types_files.append(used_path / 'key.txt')
-    attack_types_files.append(EMBEDDINGS_DIR / log_type / f'attack_types_{log_type}.txt')
-    
-    description_from_file = None
-    for attack_types_file in attack_types_files:
-        if attack_types_file.exists():
-            try:
-                with open(attack_types_file, 'r') as f:
-                    description_from_file = f.read()
-                    print(f"✅ Found attack types description file: {attack_types_file}")
-                    break
-            except Exception as e:
-                print(f"⚠️  Could not read attack types file {attack_types_file}: {e}")
-    
-    # Extract binary vectors and class names
-    if isinstance(label_data, dict) and 'vectors' in label_data:
-        binary_vectors = label_data['vectors']
-        class_names = label_data.get('classes', [])
-        
-        # Show description if available
-        if 'description' in label_data:
-            print(f"Description: {label_data['description']}")
-        elif description_from_file:
-            print(f"Description from file available")
-            
-    else:
-        # Fallback for old format
-        binary_vectors = label_data
-        class_names = [f'class_{i}' for i in range(binary_vectors.shape[1])]
-    
-    # Convert to numpy arrays and ensure proper format for multi-label
-    if not isinstance(embeddings, np.ndarray):
-        embeddings = np.array(embeddings)
-    # Ensure float32 to reduce memory pressure
-    if embeddings.dtype != np.float32:
-        embeddings = embeddings.astype(np.float32, copy=False)
-    if not isinstance(binary_vectors, np.ndarray):
-        binary_vectors = np.array(binary_vectors)
-    
-    # Ensure binary vectors are in correct format (0s and 1s)
-    binary_vectors = binary_vectors.astype(np.int8, copy=False)
-    
-    print(f"Loaded {len(embeddings)} samples with {len(class_names)} classes")
-    print(f"Embedding dimension: {embeddings.shape[1]}")
-    print(f"Label matrix shape: {binary_vectors.shape}")
-    print(f"Data types: embeddings={embeddings.dtype}, labels={binary_vectors.dtype}")
-    
-    # Calculate comprehensive label statistics
-    labels_per_sample = binary_vectors.sum(axis=1)
-    print(f"\nMulti-label Statistics:")
-    print(f"  Average labels per sample: {labels_per_sample.mean():.2f}")
-    print(f"  Labels per sample range: {labels_per_sample.min()} - {labels_per_sample.max()}")
-    print(f"  Samples with no labels: {(labels_per_sample == 0).sum()}")
-    print(f"  Samples with multiple labels: {(labels_per_sample > 1).sum()}")
-    
-    # Class frequency and distribution
-    class_freq = binary_vectors.sum(axis=0)
-    print(f"\nClass frequencies (each class is independent):")
-    for i, (cls, freq) in enumerate(zip(class_names, class_freq)):
-        percentage = freq/len(binary_vectors)*100
-        print(f"  Column {i}: {cls:<15} {freq:>6} samples ({percentage:>5.1f}%)")
-    
-    # Show some example combinations
-    print(f"\nExample label combinations:")
-    unique_combinations = []
-    for i in range(min(10, len(binary_vectors))):
-        combo = binary_vectors[i]
-        if not any((combo == uc).all() for uc in unique_combinations):
-            unique_combinations.append(combo)
-            active_classes = [class_names[j] for j, val in enumerate(combo) if val == 1]
-            if not active_classes:
-                active_classes = ['normal/no_attack']
-            print(f"  {combo} -> {', '.join(active_classes)}")
-        if len(unique_combinations) >= 5:
-            break
-    
-    return embeddings, binary_vectors, class_names
+def _fit_pipeline(model: MultiOutputClassifier, X: np.ndarray, y: np.ndarray) -> Pipeline:
+    """Creates and fits a standardised pipeline wrapping the estimator."""
 
-def calculate_multilabel_metrics(y_true, y_pred, y_prob=None):
-    """Calculate comprehensive multi-label metrics."""
-    metrics = {}
-    
-    # Basic multi-label metrics
-    metrics['hamming_loss'] = hamming_loss(y_true, y_pred)
-    metrics['subset_accuracy'] = accuracy_score(y_true, y_pred)
-    
-    # F1 scores
-    metrics['micro_f1'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['macro_f1'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['weighted_f1'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    metrics['samples_f1'] = f1_score(y_true, y_pred, average='samples', zero_division=0)
-    
-    # Precision and Recall
-    metrics['micro_precision'] = precision_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['macro_precision'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['micro_recall'] = recall_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['macro_recall'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    
-    # Jaccard similarity
-    metrics['jaccard_micro'] = jaccard_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['jaccard_macro'] = jaccard_score(y_true, y_pred, average='macro', zero_division=0)
-    
-    # Per-class metrics
-    per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
-    per_class_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
-    per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
-    
-    # Calculate additional per-class metrics
-    per_class_accuracy = []
-    per_class_specificity = []
-    per_class_fpr = []
-    per_class_npv = []
-    per_class_tp = []
-    per_class_fp = []
-    per_class_tn = []
-    per_class_fn = []
-    
-    # Calculate confusion matrix for each class
-    multilabel_cm = multilabel_confusion_matrix(y_true, y_pred)
-    
-    for i in range(y_true.shape[1]):
-        cm = multilabel_cm[i]
-        tn, fp, fn, tp = cm.ravel()
-        
-        # Store confusion matrix values
-        per_class_tp.append(int(tp))
-        per_class_fp.append(int(fp))
-        per_class_tn.append(int(tn))
-        per_class_fn.append(int(fn))
-        
-        # Calculate additional metrics
-        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-        npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-        
-        per_class_accuracy.append(float(accuracy))
-        per_class_specificity.append(float(specificity))
-        per_class_fpr.append(float(fpr))
-        per_class_npv.append(float(npv))
-    
-    metrics['per_class'] = {
-        'f1': per_class_f1.tolist(),
-        'precision': per_class_precision.tolist(),
-        'recall': per_class_recall.tolist(),
-        'accuracy': per_class_accuracy,
-        'specificity': per_class_specificity,
-        'false_positive_rate': per_class_fpr,
-        'negative_predictive_value': per_class_npv,
-        'true_positives': per_class_tp,
-        'false_positives': per_class_fp,
-        'true_negatives': per_class_tn,
-        'false_negatives': per_class_fn
-    }
-    
+    pipeline = Pipeline(
+        steps=[
+            ("scale", StandardScaler()),
+            ("clf", model),
+        ]
+    )
+    pipeline.fit(X, y)
+    return pipeline
+
+
+def _evaluate_predictions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    average: str,
+) -> Tuple[float, float, float]:
+    """Returns precision, recall, f1 for the requested averaging scheme."""
+
+    precision = precision_score(y_true, y_pred, average=average, zero_division=0)
+    recall = recall_score(y_true, y_pred, average=average, zero_division=0)
+    f1 = f1_score(y_true, y_pred, average=average, zero_division=0)
+    return precision, recall, f1
+
+
+def train_and_evaluate_models(bundle: DatasetBundle, config: BaselineConfig) -> List[ModelMetrics]:
+    """Trains all configured models and returns their evaluation metrics."""
+
+    models = _build_models(config)
+    metrics: List[ModelMetrics] = []
+
+    for name, estimator in models.items():
+        print(f"\nTraining {name}...")
+        pipeline = _fit_pipeline(estimator, bundle.X_train, bundle.y_train)
+        y_pred = pipeline.predict(bundle.X_test)
+
+        micro_prec, micro_rec, micro_f1 = _evaluate_predictions(bundle.y_test, y_pred, "micro")
+        macro_prec, macro_rec, macro_f1 = _evaluate_predictions(bundle.y_test, y_pred, "macro")
+        weighted_f1 = f1_score(bundle.y_test, y_pred, average="weighted", zero_division=0)
+
+        report = classification_report(
+            bundle.y_test,
+            y_pred,
+            target_names=bundle.label_names[: bundle.y_test.shape[1]],
+            zero_division=0,
+        )
+
+        metrics.append(
+            ModelMetrics(
+                model_name=name,
+                micro_f1=micro_f1,
+                macro_f1=macro_f1,
+                weighted_f1=weighted_f1,
+                micro_precision=micro_prec,
+                micro_recall=micro_rec,
+                macro_precision=macro_prec,
+                macro_recall=macro_rec,
+                subset_accuracy=accuracy_score(bundle.y_test, y_pred),
+                jaccard_micro=jaccard_score(bundle.y_test, y_pred, average="micro", zero_division=0),
+                jaccard_macro=jaccard_score(bundle.y_test, y_pred, average="macro", zero_division=0),
+                hamming=hamming_loss(bundle.y_test, y_pred),
+                report=report,
+            )
+        )
+
     return metrics
 
-def train_evaluate_multilabel_model(model_name, model, X_train, y_train, X_test, y_test, 
-                                   class_names, results_dir, log_type=None, embedding_type=None, force_restart=False):
-    """Train and evaluate a multi-label model."""
-    
-    # Check for existing predictions first
-    if log_type:
-        existing_data, existing_metrics = check_existing_predictions(log_type, model_name, embedding_type, force_restart)
-        if existing_data is not None and existing_metrics is not None:
-            print(f"⏩ Skipping training for {model_name} - using existing predictions")
-            
-            # Display concise per-class classification report in console (from cache)
-            print(f"\n{model_name.upper()} - Per-Class Classification Report (FROM CACHE):")
-            print("=" * 80)
-            print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
-            print("-" * 54)
 
-            # Calculate support for each class from y_test
-            support = y_test.sum(axis=0)
+###############################################################################
+# Reporting utilities
+###############################################################################
 
-            for i, cls_name in enumerate(class_names):
-                f1 = existing_metrics['per_class']['f1'][i]
-                precision = existing_metrics['per_class']['precision'][i]
-                recall = existing_metrics['per_class']['recall'][i]
-                sup = int(support[i])
 
-                # Only show classes with support > 0 to keep it concise
-                if sup > 0:
-                    print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
+def _write_report(summary: RunSummary, output_dir: Path) -> None:
+    """Persists evaluation metrics to a timestamped report."""
 
-            # Show summary stats
-            print("-" * 54)
-            print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
-
-            # Create report from existing data
-            report_path = results_dir / f'{model_name}_multilabel_report.txt'
-            with open(report_path, 'w') as f:
-                f.write(f"{model_name.upper()} Multi-Label Classification Report (FROM CACHE)\n")
-                f.write("=" * 60 + "\n")
-                f.write(f"Using cached predictions from: {existing_data.get('timestamp', 'unknown')}\n")
-                # Be tolerant to different cache keys
-                cached_len = None
-                for key in ['predictions', 'y_pred']:
-                    if key in existing_data:
-                        try:
-                            cached_len = len(existing_data[key])
-                            break
-                        except Exception:
-                            pass
-                f.write(f"Test samples: {cached_len if cached_len is not None else 'unknown'}\n")
-                f.write(f"Number of classes: {len(class_names)}\n\n")
-                
-                f.write("OVERALL METRICS:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"Subset Accuracy: {existing_metrics['subset_accuracy']:.4f}\n")
-                f.write(f"Hamming Loss: {existing_metrics['hamming_loss']:.4f}\n")
-                f.write(f"Micro F1: {existing_metrics['micro_f1']:.4f}\n")
-                f.write(f"Macro F1: {existing_metrics['macro_f1']:.4f}\n")
-                f.write(f"Weighted F1: {existing_metrics['weighted_f1']:.4f}\n")
-                f.write(f"Samples F1: {existing_metrics['samples_f1']:.4f}\n")
-                f.write(f"Jaccard (Micro): {existing_metrics['jaccard_micro']:.4f}\n")
-                f.write(f"Jaccard (Macro): {existing_metrics['jaccard_macro']:.4f}\n\n")
-                
-                f.write("PER-CLASS METRICS:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
-                f.write("-" * 90 + "\n")
-                
-                # Calculate support for each class
-                support = y_test.sum(axis=0)
-                
-                for i, cls_name in enumerate(class_names):
-                    f1 = existing_metrics['per_class']['f1'][i]
-                    precision = existing_metrics['per_class']['precision'][i]
-                    recall = existing_metrics['per_class']['recall'][i]
-                    accuracy = existing_metrics['per_class']['accuracy'][i]
-                    specificity = existing_metrics['per_class']['specificity'][i]
-                    fpr = existing_metrics['per_class']['false_positive_rate'][i]
-                    sup = int(support[i])
-                    
-                    f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
-                
-                # Add detailed confusion matrix information
-                f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
-                f.write("-" * 60 + "\n")
-                
-                for i, cls_name in enumerate(class_names):
-                    tp = existing_metrics['per_class']['true_positives'][i]
-                    fp = existing_metrics['per_class']['false_positives'][i]
-                    tn = existing_metrics['per_class']['true_negatives'][i]
-                    fn = existing_metrics['per_class']['false_negatives'][i]
-                    npv = existing_metrics['per_class']['negative_predictive_value'][i]
-                    
-                    f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
-            
-            print(f"📊 Report created from cache: {report_path}")
-            
-            # Return cached results
-            return {
-                'model_name': model_name,
-                'training_time': 0.0,  # No training time
-                'metrics': existing_metrics,
-                'cached': True
-            }
-    
-    print(f"Training {model_name.upper()} model...")
-    print(f"Dataset: {len(X_train)} samples × {X_train.shape[1]} features × {y_train.shape[1]} classes")
-
-    # Add memory usage info if available
-    try:
-        import psutil
-        process = psutil.Process()
-        mem_before = process.memory_info().rss / 1024 / 1024  # MB
-        print(f"Memory before training: {mem_before:.1f} MB")
-    except ImportError:
-        print("(Install psutil for memory monitoring)")
-
-    start_time = time.time()
-
-    # Train the model with timeout protection
-    try:
-        model.fit(X_train, y_train)
-        training_time = time.time() - start_time
-        print(f"Training completed in {training_time:.1f} seconds")
-
-        # Memory usage after training
-        try:
-            mem_after = process.memory_info().rss / 1024 / 1024  # MB
-            mem_used = mem_after - mem_before
-            print(f"Memory after training: {mem_after:.1f} MB (used: {mem_used:.1f} MB)")
-        except:
-            pass
-
-    except Exception as e:
-        training_time = time.time() - start_time
-        print(f"Training failed after {training_time:.1f} seconds: {e}")
-        raise
-    
-    # Save the trained model
-    model_path = MODELS_DIR / f'multilabel_{model_name}.joblib'
-    joblib.dump(model, model_path)
-    
-    # Generate predictions
-    print(f"Generating predictions for {model_name.upper()}...")
-    y_pred = model.predict(X_test)
-    
-    # Get prediction probabilities if available
-    y_prob = None
-    if hasattr(model, "predict_proba"):
-        try:
-            y_prob = model.predict_proba(X_test)
-        except:
-            pass
-    
-    # Calculate metrics
-    metrics = calculate_multilabel_metrics(y_test, y_pred, y_prob)
-
-    # Display concise per-class classification report in console
-    print(f"\n{model_name.upper()} - Per-Class Classification Report:")
-    print("=" * 80)
-    print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
-    print("-" * 54)
-
-    # Calculate support for each class
-    support = y_test.sum(axis=0)
-
-    for i, cls_name in enumerate(class_names):
-        f1 = metrics['per_class']['f1'][i]
-        precision = metrics['per_class']['precision'][i]
-        recall = metrics['per_class']['recall'][i]
-        sup = int(support[i])
-
-        # Only show classes with support > 0 to keep it concise
-        if sup > 0:
-            print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
-
-    # Show summary stats
-    print("-" * 54)
-    print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
-
-    # Write transformer-style simple report
-    from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    report_path = results_dir / f"hierarchical_{log_type or 'unknown'}_evaluation_{timestamp}.txt"
-    with open(report_path, 'w') as f:
-        f.write(f"Hierarchical Transformer Evaluation Report (Baseline: {model_name})\n")
-        f.write(f"Log Type: {log_type or 'unknown'}\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Dataset: {len(y_test)} test samples\n")
-        f.write("="*50 + "\n\n")
-        f.write("Overall Metrics:\n")
-        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
-        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
-        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
-        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
-        f.write(f"Samples F1: {metrics['samples_f1']:.4f}\n")
-        f.write(f"Jaccard (Micro): {metrics['jaccard_micro']:.4f}\n")
-        f.write(f"Jaccard (Macro): {metrics['jaccard_macro']:.4f}\n")
-    
-    # Optional visualizations kept the same
-    create_multilabel_visualization(y_test, y_pred, class_names, model_name, results_dir)
-    
-    # Save predictions and metrics for future reuse
-    if log_type:
-        predictions_data = {
-            'y_pred': y_pred,
-            'y_prob': y_prob
-        }
-        save_predictions_and_metrics(log_type, model_name, predictions_data, metrics, embedding_type)
-    
-    return {
-        'model_name': model_name,
-        'training_time': training_time,
-        'metrics': metrics,
-        'cached': False
-    }
+    report_path = output_dir / f"baselines_{summary.log_type}_{summary.embedding_type}_{timestamp}.txt"
 
-def create_multilabel_visualization(y_true, y_pred, class_names, model_name, results_dir):
-    """Create visualizations for multi-label results."""
-    
-    # 1. Per-class performance heatmap
-    plt.figure(figsize=(12, 8))
-    
-    # Calculate per-class metrics
-    per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
-    per_class_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
-    per_class_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
-    support = y_true.sum(axis=0)
-    
-    # Create metrics matrix
-    metrics_matrix = np.array([per_class_precision, per_class_recall, per_class_f1]).T
-    
-    # Only show top 15 classes by support
-    if len(class_names) > 15:
-        top_indices = np.argsort(support)[-15:]
-        metrics_matrix = metrics_matrix[top_indices]
-        display_names = [class_names[i] for i in top_indices]
-    else:
-        display_names = class_names
-    
-    sns.heatmap(metrics_matrix, 
-                annot=True, 
-                fmt='.3f', 
-                cmap='RdYlBu_r',
-                xticklabels=['Precision', 'Recall', 'F1'],
-                yticklabels=display_names)
-    
-    plt.title(f'{model_name.upper()} - Per-Class Performance')
-    plt.tight_layout()
-    plt.savefig(results_dir / f'{model_name}_performance_heatmap.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 2. Label distribution comparison
-    plt.figure(figsize=(14, 6))
-    
-    # True vs Predicted label counts
-    true_counts = y_true.sum(axis=0)
-    pred_counts = y_pred.sum(axis=0)
-    
-    x = np.arange(len(class_names))
-    width = 0.35
-    
-    plt.bar(x - width/2, true_counts, width, label='True', alpha=0.8)
-    plt.bar(x + width/2, pred_counts, width, label='Predicted', alpha=0.8)
-    
-    plt.xlabel('Classes')
-    plt.ylabel('Frequency')
-    plt.title(f'{model_name.upper()} - True vs Predicted Label Distribution')
-    plt.xticks(x, class_names, rotation=45, ha='right')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(results_dir / f'{model_name}_label_distribution.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 3. Labels per sample distribution
-    plt.figure(figsize=(10, 6))
-    
-    true_labels_per_sample = y_true.sum(axis=1)
-    pred_labels_per_sample = y_pred.sum(axis=1)
-    
-    plt.hist(true_labels_per_sample, bins=range(0, max(true_labels_per_sample) + 2), 
-             alpha=0.7, label='True', density=True)
-    plt.hist(pred_labels_per_sample, bins=range(0, max(pred_labels_per_sample) + 2), 
-             alpha=0.7, label='Predicted', density=True)
-    
-    plt.xlabel('Number of Labels per Sample')
-    plt.ylabel('Density')
-    plt.title(f'{model_name.upper()} - Labels per Sample Distribution')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(results_dir / f'{model_name}_labels_per_sample.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    with report_path.open("w") as handle:
+        handle.write(f"Baseline Evaluation Report\n")
+        handle.write(f"Log Type: {summary.log_type}\n")
+        handle.write(f"Embedding: {summary.embedding_type}\n")
+        handle.write(f"Timestamp: {timestamp}\n")
+        handle.write("=" * 60 + "\n\n")
 
-def train_traditional_xgboost(X_train, y_train, X_test, y_test, class_names, results_dir, 
-                             log_type=None, embedding_type=None, force_restart=False):
-    """Train XGBoost using traditional MultiOutputClassifier approach."""
-    
-    # Check for existing predictions first
-    if log_type:
-        existing_data, existing_metrics = check_existing_predictions(log_type, 'xgboost_traditional', embedding_type, force_restart)
-        if existing_data is not None and existing_metrics is not None:
-            print(f"⏩ Skipping training for xgboost_traditional - using existing predictions")
-            
-            # Display concise per-class classification report in console (from cache)
-            print(f"\nXGBOOST_TRADITIONAL - Per-Class Classification Report (FROM CACHE):")
-            print("=" * 80)
-            print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
-            print("-" * 54)
+        handle.write("Overall Dataset Statistics:\n")
+        for key, value in summary.dataset_stats.items():
+            handle.write(f"  {key}: {value}\n")
+        handle.write("\n")
 
-            # Calculate support for each class from y_test
-            support = y_test.sum(axis=0)
+        for metric in summary.metrics:
+            handle.write(f"Model: {metric.model_name}\n")
+            handle.write(f"  Micro F1       : {metric.micro_f1:.4f}\n")
+            handle.write(f"  Macro F1       : {metric.macro_f1:.4f}\n")
+            handle.write(f"  Weighted F1    : {metric.weighted_f1:.4f}\n")
+            handle.write(f"  Micro Precision: {metric.micro_precision:.4f}\n")
+            handle.write(f"  Micro Recall   : {metric.micro_recall:.4f}\n")
+            handle.write(f"  Macro Precision: {metric.macro_precision:.4f}\n")
+            handle.write(f"  Macro Recall   : {metric.macro_recall:.4f}\n")
+            handle.write(f"  Subset Accuracy: {metric.subset_accuracy:.4f}\n")
+            handle.write(f"  Jaccard Micro  : {metric.jaccard_micro:.4f}\n")
+            handle.write(f"  Jaccard Macro  : {metric.jaccard_macro:.4f}\n")
+            handle.write(f"  Hamming Loss   : {metric.hamming:.4f}\n\n")
+            handle.write("Per-class report:\n")
+            handle.write(metric.report)
+            handle.write("\n" + "-" * 60 + "\n\n")
 
-            for i, cls_name in enumerate(class_names):
-                f1 = existing_metrics['per_class']['f1'][i]
-                precision = existing_metrics['per_class']['precision'][i]
-                recall = existing_metrics['per_class']['recall'][i]
-                sup = int(support[i])
-
-                # Only show classes with support > 0 to keep it concise
-                if sup > 0:
-                    print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
-
-            # Show summary stats
-            print("-" * 54)
-            print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
-
-            # Create report from existing data
-            report_path = results_dir / 'xgboost_traditional_report.txt'
-            with open(report_path, 'w') as f:
-                f.write("XGBoost Traditional Multi-Label Classification Report (FROM CACHE)\n")
-                f.write("=" * 60 + "\n")
-                f.write(f"Using cached predictions from: {existing_data.get('timestamp', 'unknown')}\n")
-                f.write(f"Approach: MultiOutputClassifier with XGBoost\n\n")
-                
-                f.write("OVERALL METRICS:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"Subset Accuracy: {existing_metrics['subset_accuracy']:.4f}\n")
-                f.write(f"Hamming Loss: {existing_metrics['hamming_loss']:.4f}\n")
-                f.write(f"Micro F1: {existing_metrics['micro_f1']:.4f}\n")
-                f.write(f"Macro F1: {existing_metrics['macro_f1']:.4f}\n")
-                f.write(f"Micro Precision: {existing_metrics['micro_precision']:.4f}\n")
-                f.write(f"Micro Recall: {existing_metrics['micro_recall']:.4f}\n\n")
-                
-                f.write("PER-CLASS METRICS:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
-                f.write("-" * 90 + "\n")
-                
-                # Calculate support for each class
-                support = y_test.sum(axis=0)
-                
-                for i, cls_name in enumerate(class_names):
-                    f1 = existing_metrics['per_class']['f1'][i]
-                    precision = existing_metrics['per_class']['precision'][i]
-                    recall = existing_metrics['per_class']['recall'][i]
-                    accuracy = existing_metrics['per_class']['accuracy'][i]
-                    specificity = existing_metrics['per_class']['specificity'][i]
-                    fpr = existing_metrics['per_class']['false_positive_rate'][i]
-                    sup = int(support[i])
-                    f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
-                
-                # Add detailed confusion matrix information
-                f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
-                f.write("-" * 60 + "\n")
-                
-                for i, cls_name in enumerate(class_names):
-                    tp = existing_metrics['per_class']['true_positives'][i]
-                    fp = existing_metrics['per_class']['false_positives'][i]
-                    tn = existing_metrics['per_class']['true_negatives'][i]
-                    fn = existing_metrics['per_class']['false_negatives'][i]
-                    npv = existing_metrics['per_class']['negative_predictive_value'][i]
-                    
-                    f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
-            
-            print(f"📊 Report created from cache: {report_path}")
-            
-            # Return cached results
-            return {
-                'model_name': 'xgboost_traditional',
-                'training_time': 0.0,  # No training time
-                'metrics': existing_metrics,
-                'cached': True
-            }
-    
-    print(f"\nTraining traditional XGBoost with MultiOutputClassifier...")
-    
-    start_time = time.time()
-    
-    # Use standard MultiOutputClassifier with XGBoost
-    # This approach handles imbalanced data better than One-vs-Rest
-    model = MultiOutputClassifier(
-        XGBClassifier(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            n_jobs=N_JOBS,
-            tree_method='hist',
-            use_label_encoder=False,
-            verbosity=0,
-            eval_metric='logloss'
-        )
-    )
-    
-    # Train the model
-    model.fit(X_train, y_train)
-    training_time = time.time() - start_time
-    
-    # Generate predictions
-    print("Generating XGBoost predictions...")
-    y_pred = model.predict(X_test)
-    
-    # Calculate metrics
-    metrics = calculate_multilabel_metrics(y_test, y_pred)
-
-    # Display concise per-class classification report in console
-    print(f"\nXGBOOST_TRADITIONAL - Per-Class Classification Report:")
-    print("=" * 80)
-    print(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Support':<8}")
-    print("-" * 54)
-
-    # Calculate support for each class
-    support = y_test.sum(axis=0)
-
-    for i, cls_name in enumerate(class_names):
-        f1 = metrics['per_class']['f1'][i]
-        precision = metrics['per_class']['precision'][i]
-        recall = metrics['per_class']['recall'][i]
-        sup = int(support[i])
-
-        # Only show classes with support > 0 to keep it concise
-        if sup > 0:
-            print(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {sup:<8}")
-
-    # Show summary stats
-    print("-" * 54)
-    print(f"Total classes: {len(class_names)} | Classes with data: {(support > 0).sum()}")
-
-    # Save detailed results
-    report_path = results_dir / 'xgboost_traditional_report.txt'
-    with open(report_path, 'w') as f:
-        f.write("XGBoost Traditional Multi-Label Classification Report\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"Total training time: {training_time:.2f} seconds\n")
-        f.write(f"Approach: MultiOutputClassifier with XGBoost\n\n")
-        
-        f.write("OVERALL METRICS:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}\n")
-        f.write(f"Hamming Loss: {metrics['hamming_loss']:.4f}\n")
-        f.write(f"Micro F1: {metrics['micro_f1']:.4f}\n")
-        f.write(f"Macro F1: {metrics['macro_f1']:.4f}\n")
-        f.write(f"Micro Precision: {metrics['micro_precision']:.4f}\n")
-        f.write(f"Micro Recall: {metrics['micro_recall']:.4f}\n\n")
-        
-        f.write("PER-CLASS METRICS:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'F1':<8} {'Precision':<10} {'Recall':<8} {'Accuracy':<10} {'Specificity':<12} {'FPR':<8} {'Support':<8}\n")
-        f.write("-" * 90 + "\n")
-        
-        # Calculate support for each class
-        support = y_test.sum(axis=0)
-        
-        for i, cls_name in enumerate(class_names):
-            f1 = metrics['per_class']['f1'][i]
-            precision = metrics['per_class']['precision'][i]
-            recall = metrics['per_class']['recall'][i]
-            accuracy = metrics['per_class']['accuracy'][i]
-            specificity = metrics['per_class']['specificity'][i]
-            fpr = metrics['per_class']['false_positive_rate'][i]
-            sup = int(support[i])
-            f.write(f"{cls_name:<20} {f1:<8.3f} {precision:<10.3f} {recall:<8.3f} {accuracy:<10.3f} {specificity:<12.3f} {fpr:<8.3f} {sup:<8}\n")
-        
-        # Add detailed confusion matrix information
-        f.write("\nDETAILED PER-CLASS CONFUSION MATRIX:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"{'Class':<20} {'TP':<6} {'FP':<6} {'TN':<6} {'FN':<6} {'NPV':<8}\n")
-        f.write("-" * 60 + "\n")
-        
-        for i, cls_name in enumerate(class_names):
-            tp = metrics['per_class']['true_positives'][i]
-            fp = metrics['per_class']['false_positives'][i]
-            tn = metrics['per_class']['true_negatives'][i]
-            fn = metrics['per_class']['false_negatives'][i]
-            npv = metrics['per_class']['negative_predictive_value'][i]
-            
-            f.write(f"{cls_name:<20} {tp:<6} {fp:<6} {tn:<6} {fn:<6} {npv:<8.3f}\n")
-    
-    print(f"XGBoost traditional report saved to: {report_path}")
-    
-    # Save the trained model
-    model_path = MODELS_DIR / f'xgboost_traditional.joblib'
-    joblib.dump(model, model_path)
-    
-    # Save predictions and metrics for future reuse
-    if log_type:
-        predictions_data = {
-            'y_pred': y_pred,
-            'y_prob': None  # XGBoost traditional doesn't provide probabilities in this format
-        }
-        save_predictions_and_metrics(log_type, 'xgboost_traditional', predictions_data, metrics, embedding_type)
-    
-    return {
-        'model_name': 'xgboost_traditional',
-        'training_time': training_time,
-        'metrics': metrics,
-        'cached': False
-    }
+    print(f"Saved baseline report: {report_path}")
 
 
+###############################################################################
+# Entry point
+###############################################################################
 
-def main():
-    """Main function for multi-label ML baseline with a simple CLI (like transformer.py)."""
-    parser = argparse.ArgumentParser(description='Multi-Label ML Baseline for Log Analysis')
-    parser.add_argument('--embedding_type', '--embedding-type', dest='embedding_type', type=str, default='all',
-                        choices=['all', 'logbert', 'fasttext', 'word2vec'],
-                        help='Type of embeddings to use (default: all)')
-    parser.add_argument('--log_type', '--log-type', dest='log_type', type=str, default=None,
-                        help='Specific log type to process (processes all if not specified)')
-    parser.add_argument('--sample_size', '--sample-size', dest='sample_size', type=int, default=None,
-                        help='Optional subsample size BEFORE splitting (processes full dataset by default)')
-    parser.add_argument('--fast', action='store_true',
-                        help='Fast pass baseline (LR only, minimal visuals)')
-    parser.add_argument('--skip_large_models', action='store_true',
-                        help='Skip RF and XGBoost on datasets > 500K samples')
-    args = parser.parse_args()
 
-    # Determine which embedding types to process
-    embedding_types = ['fasttext', 'word2vec', 'logbert'] if args.embedding_type == 'all' else [args.embedding_type]
+def run_baseline(
+    embedding_type: str,
+    embeddings: Mapping[str, np.ndarray],
+    labels: Mapping[str, Mapping[str, np.ndarray]],
+    config: BaselineConfig,
+    output_dir: Path,
+    target_log_type: Optional[str] = None,
+) -> None:
+    """Executes the baseline workflow for all available log types."""
 
-    # Fixed settings for simplicity
-    test_size = 0.2
-    KNN_TRAIN_CAP = 80000
-    KNN_TEST_CAP = 30000
-    RF_TRAIN_CAP = 200000  # Cap RF to avoid excessive memory/time
-    LR_TRAIN_CAP = 500000  # Cap LR for very large datasets
-    XGB_TRAIN_CAP = 300000  # Cap XGBoost for memory efficiency
-
-    for embedding_type in embedding_types:
-        log_types = find_available_log_types(embedding_type)
-        if not log_types:
-            print(f"No processed log types found for {embedding_type}. Skipping...")
+    for log_type, vectors in embeddings.items():
+        if target_log_type and log_type != target_log_type:
             continue
 
-        # Filter log types if a specific one is requested
-        if args.log_type:
-            if args.log_type in log_types:
-                log_types_to_process = [args.log_type]
-            else:
-                print(f"Log type '{args.log_type}' not found in {embedding_type}. Available: {log_types}")
-                continue
-        else:
-            log_types_to_process = log_types
+        print("\n" + "=" * 60)
+        print(f"Processing {log_type} with {embedding_type} embeddings")
+        print("=" * 60)
 
-        print(f"\n{'='*60}")
-        print(f"Processing with {embedding_type} embeddings")
-        print(f"Available log types: {log_types}")
-        print('='*60)
+        label_target = create_multilabel_targets(labels.get(log_type, {}))
+        bundle = prepare_training_bundle(vectors, label_target, config)
 
-        for log_type in log_types_to_process:
-            print(f"\n{'='*50}")
-            print(f"Processing {log_type} ({embedding_type})")
-            print('='*50)
+        total_samples = vectors.shape[0]
+        anomaly_count = int((label_target.sum(axis=1) > 0).sum()) if label_target is not None else 0
+        normal_count = total_samples - anomaly_count
 
-            # Create results directory
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            results_dir = RESULTS_DIR / f"multilabel_{log_type}_{timestamp}"
-            results_dir.mkdir(exist_ok=True)
+        dataset_stats = {
+            "original_samples": total_samples,
+            "original_normals": normal_count,
+            "original_anomalies": anomaly_count,
+            "train_samples": int(bundle.X_train.shape[0]),
+            "validation_samples": int(bundle.X_val.shape[0]),
+            "test_samples": int(bundle.X_test.shape[0]),
+        }
 
-            try:
-                # Load data
-                X, y, class_names = load_multilabel_data(log_type, embedding_type)
+        print("Balanced dataset distribution (post-SMOTE):")
+        print(f"  Train samples : {bundle.X_train.shape[0]}")
+        print(f"  Validation    : {bundle.X_val.shape[0]}")
+        print(f"  Test          : {bundle.X_test.shape[0]}")
 
-                # Optional subsampling BEFORE split (full dataset by default) [[memory:4887039]]
-                if args.sample_size and args.sample_size < len(X):
-                    rng = np.random.default_rng(42)
-                    idx = rng.choice(len(X), size=args.sample_size, replace=False)
-                    X = X[idx]
-                    y = y[idx]
-                    print(f"Subsampled to {len(X)} examples for speed")
+        top_k = config.report_top_k
+        print("  Per-class adjustments (top changes):")
+        adjustments = []
+        for name, stats in bundle.smote_summary.items():
+            original = stats.get("original", 0.0)
+            balanced = stats.get("balanced", original)
+            delta = balanced - original
+            adjustments.append((name, original, balanced, delta))
+        adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
+        for name, original, balanced, delta in adjustments[:top_k]:
+            trend = "++" if delta > 0 else "--" if delta < 0 else "=="
+            print(f"    {name:<25} {balanced:>6.0f} ({trend} {delta:+.0f})")
 
-                # Skip if no positive labels
-                if y.sum() == 0:
-                    print(f"No positive labels found for {log_type}, skipping...")
-                    continue
+        metrics = train_and_evaluate_models(bundle, config)
+        summary = RunSummary(
+            log_type=log_type,
+            embedding_type=embedding_type,
+            metrics=metrics,
+            dataset_stats=dataset_stats,
+        )
+        _write_report(summary, output_dir)
 
-                # Split data
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=test_size, random_state=42, stratify=None
-                )
 
-                print(f"Train set: {len(X_train)} | Test set: {len(X_test)}")
+def parse_arguments() -> argparse.Namespace:
+    """Parses CLI arguments."""
 
-                # Standardize features
-                scaler = StandardScaler()
-                X_train_scaled = scaler.fit_transform(X_train)
-                X_test_scaled = scaler.transform(X_test)
+    parser = argparse.ArgumentParser(description="Classical multi-label baselines")
+    parser.add_argument(
+        "--embedding-type",
+        type=str,
+        default="fasttext",
+        choices=["fasttext", "word2vec", "logbert", "all"],
+        help="Embedding type to evaluate (default: fasttext)",
+    )
+    parser.add_argument(
+        "--log-type",
+        type=str,
+        default=None,
+        help="Optional log type to restrict evaluation",
+    )
+    parser.add_argument(
+        "--skip-xgb",
+        action="store_true",
+        help="Disable XGBoost baseline",
+    )
+    parser.add_argument(
+        "--skip-rf",
+        action="store_true",
+        help="Disable Random Forest baseline",
+    )
+    parser.add_argument(
+        "--skip-lr",
+        action="store_true",
+        help="Disable Logistic Regression baseline",
+    )
+    parser.add_argument(
+        "--contamination",
+        type=float,
+        default=0.2,
+        help="Target contamination ratio for training set balancing",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed",
+    )
+    return parser.parse_args()
 
-                # Save scaler
-                joblib.dump(scaler, MODELS_DIR / f'scaler_{log_type}.joblib')
 
-                # Create models with intelligent skipping for large datasets
-                large_dataset = len(X_train) > 300000
-                very_large_dataset = len(X_train) > 500000
+def main() -> None:
+    args = parse_arguments()
 
-                # Skip heavy models on very large datasets
-                skip_rf = very_large_dataset and args.skip_large_models
-                skip_xgb = very_large_dataset and args.skip_large_models
+    config = BaselineConfig(
+        contamination=args.contamination,
+        include_xgb=not args.skip_xgb and HAS_XGB,
+        include_random_forest=not args.skip_rf,
+        include_logistic=not args.skip_lr,
+        random_state=args.random_state,
+    )
 
-                if very_large_dataset:
-                    print(f"⚠️  Large dataset detected ({len(X_train)} samples)")
-                    if args.skip_large_models:
-                        print("⏭️  Skipping RF and XGBoost (--skip_large_models enabled)")
-                    else:
-                        print("⚡ Training heavy models - this may take a long time")
+    embedding_order = [
+        "fasttext",
+        "word2vec",
+        "logbert",
+    ] if args.embedding_type == "all" else [args.embedding_type]
 
-                models = create_multilabel_models(
-                    len(class_names),
-                    large_dataset=large_dataset,
-                    skip_knn=large_dataset,
-                    skip_lr=False,
-                    skip_rf=skip_rf,
-                    skip_xgb=skip_xgb,
-                    has_xgb=HAS_XGBOOST,
-                    fast=args.fast
-                )
+    results_dir = Path("results")
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-                model_names = list(models.keys())
-                results = []
+    loaders = {
+        "fasttext": load_fasttext_embeddings,
+        "word2vec": load_word2vec_embeddings,
+        "logbert": load_logbert_embeddings,
+    }
 
-                # Train and evaluate each model
-                for model_name in model_names:
-                    print(f"\n{'-'*40}")
-                    print(f"Training {model_name.upper()} for {log_type}")
-                    print(f"{'-'*40}")
+    for embedding_type in embedding_order:
+        print("\n" + "=" * 60)
+        print(f"Evaluating embedding: {embedding_type}")
+        print("=" * 60)
 
-                    try:
-                        # Apply dataset size caps based on model type
-                        if model_name == 'knn':
-                            # Cap KNN to avoid extremely long runs
-                            train_cap = KNN_TRAIN_CAP
-                            test_cap = KNN_TEST_CAP
-                        elif model_name == 'rf':
-                            # Cap RF to avoid excessive memory/time
-                            train_cap = RF_TRAIN_CAP
-                            test_cap = len(X_test_scaled)  # Don't cap test for RF
-                        elif model_name == 'lr':
-                            # Cap LR for very large datasets
-                            train_cap = LR_TRAIN_CAP
-                            test_cap = len(X_test_scaled)  # Don't cap test for LR
-                        elif model_name == 'xgb':
-                            # Cap XGBoost for memory efficiency
-                            train_cap = XGB_TRAIN_CAP
-                            test_cap = len(X_test_scaled)  # Don't cap test for XGBoost
-                        else:
-                            train_cap = len(X_train_scaled)  # No cap for other models
-                            test_cap = len(X_test_scaled)
+        loader = loaders.get(embedding_type)
+        if loader is None:
+            print(f"Skipping unsupported embedding type: {embedding_type}")
+            continue
 
-                        # Apply training set cap
-                        if len(X_train_scaled) > train_cap:
-                            sel = np.random.choice(len(X_train_scaled), train_cap, replace=False)
-                            X_train_local = X_train_scaled[sel]
-                            y_train_local = y_train[sel]
-                            print(f"{model_name.upper()} train capped to {len(X_train_local)} samples")
-                        else:
-                            X_train_local = X_train_scaled
-                            y_train_local = y_train
+        try:
+            embeddings, labels = loader(args.log_type)
+        except FileNotFoundError as exc:
+            print(f"Skipping {embedding_type}: {exc}")
+            continue
 
-                        # Apply test set cap (usually only for KNN)
-                        if len(X_test_scaled) > test_cap:
-                            sel = np.random.choice(len(X_test_scaled), test_cap, replace=False)
-                            X_test_local = X_test_scaled[sel]
-                            y_test_local = y_test[sel]
-                            print(f"{model_name.upper()} test capped to {len(X_test_local)} samples")
-                        else:
-                            X_test_local = X_test_scaled
-                            y_test_local = y_test
+        run_baseline(
+            embedding_type=embedding_type,
+            embeddings=embeddings,
+            labels=labels,
+            config=config,
+            output_dir=results_dir,
+            target_log_type=args.log_type,
+        )
 
-                        result = train_evaluate_multilabel_model(
-                            f"{model_name}_{log_type}",
-                            models[model_name],
-                            X_train_local, y_train_local,
-                            X_test_local, y_test_local,
-                            class_names, results_dir,
-                            log_type, embedding_type, False
-                        )
 
-                        results.append(result)
-                    except Exception as e:
-                        print(f"Error training {model_name}: {e}")
-                        continue
+if __name__ == "__main__":
+    import pickle  # Local import to avoid unused when module imported
 
-                # Create concise summary [[memory:4887036]]
-                if results:
-                    print(f"\n{'='*60}")
-                    print(f"SUMMARY FOR {log_type.upper()} ({embedding_type})")
-                    print(f"{'='*60}")
-                    cached_count = sum(1 for r in results if r.get('cached', False))
-                    trained_count = len(results) - cached_count
-                    print(f"Models trained: {trained_count}, from cache: {cached_count}")
-                    print(f"{'Model':<28} {'Macro F1':<10} {'Micro F1':<10} {'Hamming':<10} {'Time (s)':<10}")
-                    print("-" * 74)
-                    for result in sorted(results, key=lambda x: x['metrics']['macro_f1'], reverse=True):
-                        model_name = result['model_name']
-                        metrics = result['metrics']
-                        time_taken = result['training_time']
-                        print(f"{model_name:<28} {metrics['macro_f1']:<10.4f} {metrics['micro_f1']:<10.4f} {metrics['hamming_loss']:<10.4f} {time_taken:<10.2f}")
-
-                    summary_path = results_dir / 'summary.json'
-                    with open(summary_path, 'w') as f:
-                        json.dump({
-                            'embedding_type': embedding_type,
-                            'log_type': log_type,
-                            'results': results,
-                            'class_names': class_names,
-                            'test_size': test_size,
-                            'timestamp': timestamp
-                        }, f, indent=2)
-                    print(f"Results saved to: {results_dir}")
-
-            except Exception as e:
-                print(f"Error processing {log_type} ({embedding_type}): {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-    print("\nMulti-label baseline evaluation completed!")
-
-if __name__ == '__main__':
     main()

@@ -42,7 +42,12 @@ hierarchy = {
 }
 
 TARGET_CONTAMINATION = 0.2  # Desired attack proportion in the balanced training set
-MIN_TRAIN_ANOMALIES = 512   # Ensure sufficient anomaly diversity during SMOTE
+MIN_TRAIN_ANOMALIES = 400   # Ensure sufficient anomaly diversity during SMOTE
+RARE_CLASS_THRESHOLD = 512  # Upper bound for rare-class synthetic targets
+MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
+MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
+HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
+BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 
 
 @dataclass(frozen=True)
@@ -603,7 +608,8 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         Y_anomalies = y_aug[anomaly_mask]
 
         # Compute desired normal/anomaly counts based on contamination rate and dataset size
-        desired_total = max(len(X_aug), 2000)
+        base_total = len(X_aug)
+        desired_total = min(BALANCED_SAMPLE_TARGET, base_total)
         desired_anomaly = max(1, int(round(desired_total * target_contamination)))
         desired_normal = max(1, desired_total - desired_anomaly)
 
@@ -660,21 +666,19 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
 
         print("\nPer-class adjustments:")
-        display_limit = 25
-        shown = 0
+        adjustments = []
         for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
             before = int(original_class_counts[idx])
             after = int(balanced_class_counts[idx])
             if before == 0 and after == 0:
                 continue
             delta = after - before
+            adjustments.append((name, before, after, delta))
+
+        adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
+        for name, before, after, delta in adjustments:
             trend = "++" if delta > 0 else "--" if delta < 0 else "=="
-            print(f"  {name:<25} {after:>7} ({trend} {delta:+d})")
-            shown += 1
-            if shown >= display_limit:
-                if y_balanced.shape[1] - (idx + 1) > 0:
-                    print("  ...")
-                break
+            print(f"  {name:<25} {after:>6} ({trend} {delta:+d})")
 
         cls_bal, mean_bal, maxp_bal, attn_bal = split_features(X_balanced)
         dataset = TensorDataset(
