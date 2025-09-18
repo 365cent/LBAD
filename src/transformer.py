@@ -118,6 +118,11 @@ class HierarchicalTransformer(nn.Module):
         self.topological_order: List[str] = []
         self._build_heads(self.hierarchy)
         self._reverse_topological_order = list(reversed(self.topological_order))
+        self.register_buffer(
+            "decision_thresholds",
+            torch.full((len(self.node_to_index),), 0.5, dtype=torch.float32),
+            persistent=False,
+        )
 
     @property
     def device(self) -> torch.device:
@@ -708,6 +713,68 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         spinner.stop_and_persist(text="Resampling failed (fallback to original loader)")
         return train_loader
 
+
+def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> Optional[np.ndarray]:
+    """Calibrates per-class decision thresholds using validation predictions."""
+
+    node_names = list(model.node_to_index.keys())
+    if not node_names:
+        return None
+
+    model.eval()
+    all_probs: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for cls_tokens, mean_pooling, max_pooling, attn, targets in loader:
+            cls_tokens = cls_tokens.to(device, non_blocking=True)
+            mean_pooling = mean_pooling.to(device, non_blocking=True)
+            max_pooling = max_pooling.to(device, non_blocking=True)
+            attn = attn.to(device, non_blocking=True)
+
+            _, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
+            aggregated = model.propagate_labels(outputs)
+            batch_probs = torch.zeros((cls_tokens.size(0), len(node_names)), device=device)
+            for name, prob in aggregated.items():
+                idx = model.node_to_index[name]
+                batch_probs[:, idx] = prob.view(-1)
+            all_probs.append(batch_probs.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+
+    if not all_probs:
+        return None
+
+    probs = np.vstack(all_probs)
+    targets = np.vstack(all_targets)
+    thresholds = np.full(probs.shape[1], 0.5, dtype=np.float32)
+    candidate_thresholds = np.linspace(0.1, 0.95, 18)
+
+    for idx in range(probs.shape[1]):
+        y_true = targets[:, idx]
+        pos_count = y_true.sum()
+        if pos_count == 0:
+            thresholds[idx] = 0.99
+            continue
+
+        best_f1 = -1.0
+        best_threshold = 0.5
+        p = probs[:, idx]
+        for thr in candidate_thresholds:
+            y_pred = (p >= thr).astype(np.int32)
+            tp = np.logical_and(y_pred == 1, y_true == 1).sum()
+            fp = np.logical_and(y_pred == 1, y_true == 0).sum()
+            fn = np.logical_and(y_pred == 0, y_true == 1).sum()
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+            if f1 > best_f1 or (f1 == best_f1 and thr > best_threshold):
+                best_f1 = f1
+                best_threshold = thr
+        thresholds[idx] = best_threshold
+
+    return thresholds
+
+
 def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
     """Trains the transformer with reconstruction and hierarchy regularizers."""
     train = smote_data(train_loader, val_loader, target_contamination=TARGET_CONTAMINATION)
@@ -716,8 +783,8 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
     mse_loss = nn.MSELoss()
-    use_amp = device.type in ["cuda", "mps"]  # Enable for M2
-    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+    use_amp = device.type in ["cuda", "mps"]
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
@@ -872,6 +939,14 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
+    thresholds = calibrate_thresholds(model, val_loader)
+    if thresholds is not None:
+        threshold_tensor = torch.from_numpy(thresholds).to(device)
+        if hasattr(model, "decision_thresholds") and model.decision_thresholds.shape[0] == threshold_tensor.shape[0]:
+            model.decision_thresholds.data.copy_(threshold_tensor)
+        else:
+            model.register_buffer("decision_thresholds", threshold_tensor, persistent=False)
+
     spinner.stop_and_persist(text="Training completed")
     return model
 
@@ -889,11 +964,15 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
             
             _, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
             propagated = model.propagate_labels(outputs)
+            thresholds = getattr(model, "decision_thresholds", None)
             batch_preds = np.zeros((cls_tokens.shape[0], len(node_names)))
             for name, probs in propagated.items():
                 if name in model.node_to_index:
                     idx = model.node_to_index[name]
-                    batch_preds[:, idx] = (probs.cpu().numpy() > 0.5).astype(int).squeeze()
+                    threshold = 0.5
+                    if thresholds is not None and idx < thresholds.shape[0]:
+                        threshold = float(thresholds[idx].item())
+                    batch_preds[:, idx] = (probs >= threshold).cpu().numpy().astype(int).squeeze()
             
             all_preds.append(batch_preds)
             all_targets.append(targets.cpu().numpy())
