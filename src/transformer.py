@@ -382,12 +382,46 @@ def create_multilabel_targets(labels_dict, hierarchy):
     
     return targets
 
+def _slice_and_pad(
+    array: np.ndarray,
+    start: int,
+    width: int,
+) -> np.ndarray:
+    """Returns a slice of given width, padding or truncating to match exactly."""
+
+    if width <= 0:
+        return np.zeros((array.shape[0], 0), dtype=array.dtype)
+
+    end = start + width
+    if start >= array.shape[1]:
+        return np.zeros((array.shape[0], width), dtype=array.dtype)
+
+    chunk = array[:, start:min(end, array.shape[1])]
+    cur_width = chunk.shape[1]
+    if cur_width == width:
+        return chunk
+    if cur_width > width:
+        return chunk[:, :width]
+
+    pad_width = width - cur_width
+    padding = np.zeros((array.shape[0], pad_width), dtype=array.dtype)
+    return np.hstack([chunk, padding])
+
+
 def load_datasets(embeddings, labels, batch_size=128):
     datasets = {}
+    base_config = TransformerConfig()
+    cls_dim = 768
+    mean_dim = 768
+    max_dim = 768
+    attn_dim = base_config.attn_input_dim
+
     for log_type, log_vectors in embeddings.items():
-        cls_tokens, mean_pooling = log_vectors[:, :768], log_vectors[:, 768:1536]
-        max_pooling, attn = log_vectors[:, 1536:2304], log_vectors[:, 2304:]
-        
+        cls_tokens = _slice_and_pad(log_vectors, 0, cls_dim)
+        mean_pooling = _slice_and_pad(log_vectors, cls_dim, mean_dim)
+        max_pooling = _slice_and_pad(log_vectors, cls_dim + mean_dim, max_dim)
+        attn = _slice_and_pad(log_vectors, cls_dim + mean_dim + max_dim, attn_dim)
+
         if log_type in labels:
             targets = create_multilabel_targets(labels[log_type], hierarchy)
         else:
