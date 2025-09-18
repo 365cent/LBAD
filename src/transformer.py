@@ -49,6 +49,7 @@ MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
 HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
 BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
+MAX_CLASS_TRAIN_FRACTION = 0.6   # Max proportion of a class allocated to training split
 
 
 @dataclass(frozen=True)
@@ -1104,10 +1105,13 @@ def main():
                         if class_indices.size == 0:
                             continue
                         class_anomalies = np.intersect1d(class_indices, anomaly_idx_np, assume_unique=False)
-                        if class_anomalies.size == 0:
+                        total_class = class_anomalies.size
+                        if total_class == 0:
                             continue
-                        take = min(class_anomalies.size, MIN_CLASS_TRAIN_SAMPLES)
-                        sampled = coverage_rng.choice(class_anomalies, size=take, replace=False)
+                        max_fractional = int(total_class * MAX_CLASS_TRAIN_FRACTION)
+                        train_quota = min(total_class, max(1, min(MIN_CLASS_TRAIN_SAMPLES, max_fractional)))
+                        train_quota = min(train_quota, total_class)
+                        sampled = coverage_rng.choice(class_anomalies, size=train_quota, replace=False)
                         coverage_set.update(int(x) for x in sampled)
 
                 coverage_indices = np.array(sorted(coverage_set), dtype=np.int64)
