@@ -48,6 +48,7 @@ MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
 MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
 HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
 BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
+MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
 
 
 @dataclass(frozen=True)
@@ -1083,18 +1084,51 @@ def main():
                 normal_train = normal_idx
 
             if len(anomaly_idx) > 0:
-                permuted_anomalies = anomaly_idx[torch.randperm(len(anomaly_idx))]
                 base_normals = max(len(normal_train), 1)
                 ratio_denominator = max(1.0 - TARGET_CONTAMINATION, 1e-6)
                 contamination_target = int(math.ceil(base_normals * TARGET_CONTAMINATION / ratio_denominator))
                 desired_anomaly_train = max(
-                    min(len(permuted_anomalies), MIN_TRAIN_ANOMALIES),
+                    min(len(anomaly_idx), MIN_TRAIN_ANOMALIES),
                     contamination_target,
                 )
-                desired_anomaly_train = min(desired_anomaly_train, len(permuted_anomalies))
+                desired_anomaly_train = min(desired_anomaly_train, len(anomaly_idx))
 
-                anomaly_train = permuted_anomalies[:desired_anomaly_train]
-                remaining_anomalies = permuted_anomalies[desired_anomaly_train:]
+                anomaly_idx_np = anomaly_idx.cpu().numpy()
+                coverage_rng = np.random.default_rng(42)
+                coverage_set: set[int] = set()
+
+                if all_targets.numel() > 0:
+                    label_tensor = all_targets.to(dtype=torch.bool, device="cpu")
+                    for class_idx in range(label_tensor.shape[1]):
+                        class_indices = torch.nonzero(label_tensor[:, class_idx], as_tuple=True)[0].cpu().numpy()
+                        if class_indices.size == 0:
+                            continue
+                        class_anomalies = np.intersect1d(class_indices, anomaly_idx_np, assume_unique=False)
+                        if class_anomalies.size == 0:
+                            continue
+                        take = min(class_anomalies.size, MIN_CLASS_TRAIN_SAMPLES)
+                        sampled = coverage_rng.choice(class_anomalies, size=take, replace=False)
+                        coverage_set.update(int(x) for x in sampled)
+
+                coverage_indices = np.array(sorted(coverage_set), dtype=np.int64)
+                coverage_tensor = torch.from_numpy(coverage_indices).to(dtype=torch.long, device=anomaly_idx.device)
+                if coverage_tensor.numel() > desired_anomaly_train:
+                    perm = coverage_tensor[torch.randperm(coverage_tensor.numel())]
+                    anomaly_train = perm[:desired_anomaly_train]
+                    overflow = perm[desired_anomaly_train:]
+                    remaining_base = torch.from_numpy(
+                        np.setdiff1d(anomaly_idx_np, anomaly_train.cpu().numpy(), assume_unique=False)
+                    ).to(dtype=torch.long, device=anomaly_idx.device)
+                    remaining_anomalies = torch.cat([overflow, remaining_base])
+                else:
+                    remaining_pool_np = np.setdiff1d(anomaly_idx_np, coverage_indices, assume_unique=False)
+                    remaining_pool = torch.from_numpy(remaining_pool_np).to(dtype=torch.long, device=anomaly_idx.device)
+                    if remaining_pool.numel() > 0:
+                        remaining_pool = remaining_pool[torch.randperm(remaining_pool.numel())]
+                    additional_needed = max(0, desired_anomaly_train - coverage_tensor.numel())
+                    additional = remaining_pool[:additional_needed]
+                    anomaly_train = concat_indices([coverage_tensor, additional]) if additional.numel() else coverage_tensor
+                    remaining_anomalies = remaining_pool[additional_needed:]
 
                 if len(remaining_anomalies) > 0:
                     split_point = len(remaining_anomalies) // 2
