@@ -871,12 +871,12 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
 def main():
     
     parser = argparse.ArgumentParser(description='Train hierarchical transformer on log embeddings')
-    parser.add_argument('--embedding_type', type=str, default='all', 
+    parser.add_argument('--embedding-type', type=str, default='all', 
                        choices=['all', 'logbert', 'fasttext', 'word2vec'],
                        help='Type of embeddings to use (default: all)')
-    parser.add_argument('--log_type', type=str, default=None,
+    parser.add_argument('--log-type', type=str, default=None,
                        help='Specific log type to process (processes all if not specified)')
-    parser.add_argument('--sample_size', type=int, default=None,
+    parser.add_argument('--sample-size', type=int, default=None,
                        help='Subsample size for processing (processes full dataset if not specified)')
     
     args = parser.parse_args()
@@ -992,7 +992,7 @@ def main():
                     print("Triton not available or compile failed; using eager mode.")
             model = train_model(model, train_loader, val_loader, epochs=10)
 
-            evaluate_model(model, test_loader, log_type)
+            evaluate_model(model, test_loader, log_type, embedding_type)
 
             Path("models").mkdir(exist_ok=True)
             model_path = f"models/hierarchical_{log_type}_{embedding_type}.pth"
