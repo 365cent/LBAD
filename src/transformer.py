@@ -13,7 +13,6 @@ import torch.nn as nn
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from imblearn.over_sampling import BorderlineSMOTE, KMeansSMOTE
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -237,13 +236,33 @@ class HierarchicalTransformer(nn.Module):
         _, aggregated = self._dp_probabilities(outputs)
         return aggregated
 
+
+def build_parent_lookup(tree: Mapping[str, Mapping[str, Sequence[str]]]) -> Dict[str, Optional[str]]:
+    """Creates a lookup from each node to its parent in the hierarchy."""
+
+    parents: Dict[str, Optional[str]] = {}
+
+    def recurse(current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]) -> None:
+        for node, children in current.items():
+            parents.setdefault(node, parent)
+            if isinstance(children, Mapping):
+                recurse(children, node)
+                for intermediate, leaves in children.items():
+                    parents.setdefault(intermediate, node)
+                    for leaf in leaves:
+                        parents.setdefault(str(leaf), intermediate)
+
+    recurse(tree, None)
+    return parents
+
+
 def _resolve_embedding_roots(embedding_type: str) -> Tuple[List[Path], List[Path]]:
     """Returns candidate root directories that may contain embeddings."""
 
     mapping = {
         "fasttext": ["fasttext", "fasttext_embeddings", ""],
-        "word2vec": ["word2vec", "word2vec_embeddings", ""],
-        "logbert": ["logbert", "logbert_embeddings", ""],
+        "word2vec": ["word2vec", "word2vec_embeddings"],
+        "logbert": ["logbert", "logbert_embeddings"],
     }
 
     subdirs = mapping.get(embedding_type, [""])
@@ -481,6 +500,8 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         node_names = list(flatten_hierarchy(hierarchy))
         if len(node_names) < y.shape[1]:
             node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
+        node_to_index = {name: idx for idx, name in enumerate(node_names)}
+        parent_lookup = build_parent_lookup(hierarchy)
 
         rng = np.random.default_rng(42)
 
@@ -515,7 +536,12 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         # Targeted synthetic samples per class for rare attacks
         synthetic_features: List[np.ndarray] = []
         synthetic_targets: List[np.ndarray] = []
-        rare_threshold = max(1000, int(0.05 * len(y)))
+        adaptive_threshold = int(0.05 * len(y)) if len(y) > 0 else RARE_CLASS_THRESHOLD
+        rare_threshold = max(MIN_SYNTHETIC_TARGET, min(RARE_CLASS_THRESHOLD, adaptive_threshold))
+
+        global_std = np.std(X, axis=0, keepdims=True)
+        global_std[global_std < 1e-6] = 1.0
+        global_std = global_std.astype(np.float32)
 
         for c in range(y.shape[1]):
             pos_idx = np.where(y[:, c] == 1)[0]
@@ -523,48 +549,45 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
             if pos_count == 0 or pos_count > rare_threshold:
                 continue
 
-            neg_idx = np.where(y[:, c] == 0)[0]
-            if neg_idx.size == 0:
+            if pos_count < 2:
                 continue
 
-            neg_keep = min(neg_idx.size, max(pos_count * 3, 256))
-            neg_sample = rng.choice(neg_idx, size=neg_keep, replace=False)
-            select_idx = np.concatenate([pos_idx, neg_sample])
-            X_c = X[select_idx]
-            y_c = y[select_idx, c].astype(int)
-
-            if y_c.sum() <= 1:
+            target_cap = min(
+                max(pos_count + MIN_SYNTHETIC_TARGET, int(pos_count * MAX_SYNTHETIC_MULTIPLIER)),
+                rare_threshold,
+            )
+            synth_needed = max(0, target_cap - pos_count)
+            if synth_needed == 0:
                 continue
 
-            if pos_count < 10:
-                sampler = KMeansSMOTE(
-                    sampling_strategy="minority",
-                    random_state=42,
-                    k_neighbors=max(1, min(pos_count - 1, 3)),
-                    cluster_balance_threshold=0.1,
-                )
-            else:
-                sampler = BorderlineSMOTE(
-                    sampling_strategy="minority",
-                    random_state=42,
-                    kind="borderline-1",
-                )
+            pair_idx = rng.choice(pos_idx, size=(synth_needed, 2), replace=True)
+            base_a = X[pair_idx[:, 0]]
+            base_b = X[pair_idx[:, 1]]
+            lam = rng.random(synth_needed, dtype=np.float32)[:, None]
 
-            try:
-                X_res, y_res = sampler.fit_resample(X_c, y_c)
-            except Exception:
-                continue
+            class_std = np.std(X[pos_idx], axis=0, keepdims=True)
+            class_std = np.where(class_std < 1e-6, global_std, class_std).astype(np.float32)
+            noise = rng.normal(0.0, 1.0, size=base_a.shape).astype(np.float32)
+            noise *= class_std
+            noise *= 0.02
+            X_new = base_a + lam * (base_b - base_a) + noise
 
-            new_mask = np.arange(len(X_res)) >= len(X_c)
-            new_pos = new_mask & (y_res == 1)
-            if not np.any(new_pos):
-                continue
+            Y_new = np.maximum(y[pair_idx[:, 0]], y[pair_idx[:, 1]]).astype(np.float32)
 
-            X_new = X_res[new_pos].astype(np.float32)
-            Y_new = np.zeros((X_new.shape[0], y.shape[1]), dtype=np.float32)
-            Y_new[:, c] = 1.0
             synthetic_features.append(X_new)
             synthetic_targets.append(Y_new)
+
+            node_name = node_names[c] if c < len(node_names) else None
+            parent_name = parent_lookup.get(node_name) if node_name else None
+            if parent_name and parent_name in node_to_index:
+                parent_idx = node_to_index[parent_name]
+                parent_only = np.where((y[:, parent_idx] == 1) & (y[:, c] == 0))[0]
+                if parent_only.size > 0:
+                    neg_quota = min(parent_only.size, int(synth_needed * HARD_NEGATIVE_MULTIPLIER))
+                    if neg_quota > 0:
+                        neg_idx = rng.choice(parent_only, size=neg_quota, replace=False)
+                        synthetic_features.append(X[neg_idx])
+                        synthetic_targets.append(y[neg_idx].astype(np.float32))
 
         if synthetic_features:
             X_aug = np.vstack([X] + synthetic_features)
