@@ -238,7 +238,9 @@ class HierarchicalTransformer(nn.Module):
 def load_logbert_embeddings(target_log_type: str = None):
     embeddings_dir = Path("embeddings/logbert")
     if not embeddings_dir.exists():
-        raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
+        raise FileNotFoundError(f"LogBERT embeddings not found: {embeddings_dir}\n"
+                               f"Please generate embeddings first by running:\n"
+                               f"  python src/logbert_embeddings.py --output-subdir logbert")
     
     embeddings, labels, skipped = {}, {}, []
     
@@ -280,7 +282,9 @@ def load_logbert_embeddings(target_log_type: str = None):
 def load_fasttext_embeddings(target_log_type: str = None):
     embeddings_dir = Path("embeddings/fasttext")
     if not embeddings_dir.exists():
-        raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
+        raise FileNotFoundError(f"FastText embeddings not found: {embeddings_dir}\n"
+                               f"Please generate embeddings first by running:\n"
+                               f"  python src/fasttext_embedding.py --output-subdir fasttext")
     
     embeddings, labels, skipped = {}, {}, []
     
@@ -322,7 +326,9 @@ def load_fasttext_embeddings(target_log_type: str = None):
 def load_word2vec_embeddings(target_log_type: str = None):
     embeddings_dir = Path("embeddings/word2vec")
     if not embeddings_dir.exists():
-        raise FileNotFoundError(f"Embeddings not found: {embeddings_dir}")
+        raise FileNotFoundError(f"Word2Vec embeddings not found: {embeddings_dir}\n"
+                               f"Please generate embeddings first by running:\n"
+                               f"  python src/word2vec_embedding_thesis.py --output-subdir word2vec")
     
     embeddings, labels, skipped = {}, {}, []
     if target_log_type:
@@ -869,6 +875,14 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
     print(f"\nEvaluation report saved: {report_path}")
 
 def main():
+    print("Hierarchical Transformer for Log Analysis")
+    print("=" * 50)
+    print("Note: This script requires pre-generated embeddings.")
+    print("If you see 'Embeddings not found' errors, please generate embeddings first:")
+    print("  - FastText: python src/fasttext_embedding.py --output-subdir fasttext")
+    print("  - Word2Vec: python src/word2vec_embedding_thesis.py --output-subdir word2vec") 
+    print("  - LogBERT: python src/logbert_embeddings.py --output-subdir logbert")
+    print("=" * 50)
     
     parser = argparse.ArgumentParser(description='Train hierarchical transformer on log embeddings')
     parser.add_argument('--embedding-type', type=str, default='all', 
