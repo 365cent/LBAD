@@ -2,7 +2,7 @@ import argparse
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import halo
 import numpy as np
@@ -235,136 +235,121 @@ class HierarchicalTransformer(nn.Module):
         _, aggregated = self._dp_probabilities(outputs)
         return aggregated
 
-def load_logbert_embeddings(target_log_type: str = None):
-    embeddings_dir = Path("embeddings/logbert")
-    if not embeddings_dir.exists():
-        raise FileNotFoundError(f"LogBERT embeddings not found: {embeddings_dir}\n"
-                               f"Please generate embeddings first by running:\n"
-                               f"  python src/logbert_embeddings.py --output-subdir logbert")
-    
-    embeddings, labels, skipped = {}, {}, []
-    
-    if target_log_type:
-        embed_dir = embeddings_dir / target_log_type
-        log_pkl, label_pkl = embed_dir / f"log_{target_log_type}.pkl", embed_dir / f"label_{target_log_type}.pkl"
+def _resolve_embedding_roots(embedding_type: str) -> Tuple[List[Path], List[Path]]:
+    """Returns candidate root directories that may contain embeddings."""
+
+    mapping = {
+        "fasttext": ["fasttext", "fasttext_embeddings", ""],
+        "word2vec": ["word2vec", "word2vec_embeddings", ""],
+        "logbert": ["logbert", "logbert_embeddings", ""],
+    }
+
+    subdirs = mapping.get(embedding_type, [""])
+    search_order: List[Path] = []
+    seen: set[str] = set()
+
+    for subdir in subdirs:
+        path = Path("embeddings") / subdir if subdir else Path("embeddings")
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        search_order.append(path)
+        seen.add(key)
+
+    existing = [path for path in search_order if path.exists()]
+    return (existing if existing else search_order, search_order)
+
+
+def _iter_embedding_dirs(candidate_roots: Iterable[Path]) -> Iterable[Path]:
+    """Yields child directories under candidate roots that may store embeddings."""
+
+    for root in candidate_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        yield from sorted([child for child in root.iterdir() if child.is_dir()])
+
+
+def _load_embeddings_from_roots(
+    embedding_type: str,
+    candidate_roots: Iterable[Path],
+    target_log_type: Optional[str],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, dict], List[str]]:
+    embeddings: Dict[str, np.ndarray] = {}
+    labels: Dict[str, dict] = {}
+    skipped: List[str] = []
+
+    def load_single(embed_dir: Path, logical_name: str) -> None:
+        if logical_name in embeddings:
+            return
+        log_pkl = embed_dir / f"log_{logical_name}.pkl"
+        label_pkl = embed_dir / f"label_{logical_name}.pkl"
         if not (log_pkl.exists() and label_pkl.exists()):
-            raise FileNotFoundError(f"Embeddings for {target_log_type} not found in {embeddings_dir}")
-        print(f"Loading {target_log_type}...", end=" ")
+            return
+        print(f"Loading {logical_name} ({embedding_type})...", end=" ")
         log_data = safe_load(log_pkl)
         label_data = safe_load(label_pkl)
-        if log_data is None or label_data is None:
-            raise ValueError(f"Failed to load embeddings for {target_log_type}")
-        embeddings[target_log_type] = log_data
-        labels[target_log_type] = label_data
-        print("✓")
-    else:
-        for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
-            log_type = embed_dir.name
-            log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
-            if not (log_pkl.exists() and label_pkl.exists()):
-                continue
-            print(f"Loading {log_type}...", end=" ")
-            log_data = safe_load(log_pkl)
-            label_data = safe_load(label_pkl)
-            if log_data is not None and label_data is not None:
-                embeddings[log_type] = log_data
-                labels[log_type] = label_data
-                print("✓")
-            else:
-                skipped.append(log_type)
-    
+        if log_data is not None and label_data is not None:
+            embeddings[logical_name] = log_data
+            labels[logical_name] = label_data
+            print("✓")
+        else:
+            print("✗")
+            skipped.append(logical_name)
+
+    if target_log_type:
+        slug = target_log_type
+        for root in candidate_roots:
+            embed_dir = root / slug
+            if embed_dir.exists():
+                load_single(embed_dir, slug)
+        return embeddings, labels, skipped
+
+    for embed_dir in _iter_embedding_dirs(candidate_roots):
+        logical_name = embed_dir.name
+        load_single(embed_dir, logical_name)
+
+    return embeddings, labels, skipped
+
+
+def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]):
+    roots, search_order = _resolve_embedding_roots(embedding_type)
+    embeddings, labels, skipped = _load_embeddings_from_roots(embedding_type, roots, target_log_type)
+
+    if target_log_type and target_log_type not in embeddings:
+        searched = [str((root / target_log_type).resolve()) for root in search_order]
+        raise FileNotFoundError(
+            f"Embeddings for '{target_log_type}' not found for {embedding_type}. Checked: {', '.join(searched)}"
+        )
+
     if not embeddings:
-        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
-    
-    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
+        searched = ", ".join(str(path.resolve()) if path.exists() else str(path) for path in search_order)
+        generate_hint = {
+            "fasttext": "python src/fasttext_embedding.py --output-subdir fasttext",
+            "word2vec": "python src/word2vec_embedding_thesis.py --output-subdir word2vec",
+            "logbert": "python src/logbert_embeddings.py --output-subdir logbert",
+        }.get(embedding_type, "<embedding script>")
+        raise FileNotFoundError(
+            f"No valid {embedding_type} embeddings located. Checked directories: {searched}.\n"
+            f"Generate embeddings via:\n  {generate_hint}"
+        )
+
+    print(
+        f"Loaded {len(embeddings)} log types for {embedding_type}" +
+        (f" (skipped {len(skipped)})" if skipped else "")
+    )
     return embeddings, labels
+
+
+def load_logbert_embeddings(target_log_type: str = None):
+    return _load_embedding_dispatch("logbert", target_log_type)
+
 
 def load_fasttext_embeddings(target_log_type: str = None):
-    embeddings_dir = Path("embeddings/fasttext")
-    if not embeddings_dir.exists():
-        raise FileNotFoundError(f"FastText embeddings not found: {embeddings_dir}\n"
-                               f"Please generate embeddings first by running:\n"
-                               f"  python src/fasttext_embedding.py --output-subdir fasttext")
-    
-    embeddings, labels, skipped = {}, {}, []
-    
-    if target_log_type:
-        embed_dir = embeddings_dir / target_log_type
-        log_pkl, label_pkl = embed_dir / f"log_{target_log_type}.pkl", embed_dir / f"label_{target_log_type}.pkl"
-        if not (log_pkl.exists() and label_pkl.exists()):
-            raise FileNotFoundError(f"Embeddings for {target_log_type} not found in {embeddings_dir}")
-        print(f"Loading {target_log_type}...", end=" ")
-        log_data = safe_load(log_pkl)
-        label_data = safe_load(label_pkl)
-        if log_data is None or label_data is None:
-            raise ValueError(f"Failed to load embeddings for {target_log_type}")
-        embeddings[target_log_type] = log_data
-        labels[target_log_type] = label_data
-        print("✓")
-    else:
-        for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
-            log_type = embed_dir.name
-            log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
-            if not (log_pkl.exists() and label_pkl.exists()):
-                continue
-            print(f"Loading {log_type}...", end=" ")
-            log_data = safe_load(log_pkl)
-            label_data = safe_load(label_pkl)
-            if log_data is not None and label_data is not None:
-                embeddings[log_type] = log_data
-                labels[log_type] = label_data
-                print("✓")
-            else:
-                skipped.append(log_type)
-    
-    if not embeddings:
-        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
-    
-    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
-    return embeddings, labels
+    return _load_embedding_dispatch("fasttext", target_log_type)
+
 
 def load_word2vec_embeddings(target_log_type: str = None):
-    embeddings_dir = Path("embeddings/word2vec")
-    if not embeddings_dir.exists():
-        raise FileNotFoundError(f"Word2Vec embeddings not found: {embeddings_dir}\n"
-                               f"Please generate embeddings first by running:\n"
-                               f"  python src/word2vec_embedding_thesis.py --output-subdir word2vec")
-    
-    embeddings, labels, skipped = {}, {}, []
-    if target_log_type:
-        embed_dir = embeddings_dir / target_log_type
-        log_pkl, label_pkl = embed_dir / f"log_{target_log_type}.pkl", embed_dir / f"label_{target_log_type}.pkl"
-        if not (log_pkl.exists() and label_pkl.exists()):
-            raise FileNotFoundError(f"Embeddings for {target_log_type} not found in {embeddings_dir}")
-        print(f"Loading {target_log_type}...", end=" ")
-        log_data = safe_load(log_pkl)
-        label_data = safe_load(label_pkl)
-        if log_data is None or label_data is None:
-            raise ValueError(f"Failed to load embeddings for {target_log_type}")
-        embeddings[target_log_type] = log_data
-        labels[target_log_type] = label_data
-        print("✓")
-    else:
-        for embed_dir in [d for d in embeddings_dir.iterdir() if d.is_dir()]:
-            log_type = embed_dir.name
-            log_pkl, label_pkl = embed_dir / f"log_{log_type}.pkl", embed_dir / f"label_{log_type}.pkl"
-            if not (log_pkl.exists() and label_pkl.exists()):
-                continue
-            print(f"Loading {log_type}...", end=" ")
-            log_data = safe_load(log_pkl)
-            label_data = safe_load(label_pkl)
-            if log_data is not None and label_data is not None:
-                embeddings[log_type] = log_data
-                labels[log_type] = label_data
-                print("✓")
-            else:
-                skipped.append(log_type)
-    
-    if not embeddings:
-        raise ValueError("No valid embeddings could be loaded. All pickle files appear corrupted.")
-    
-    print(f"Loaded {len(embeddings)} log types" + (f" (skipped {len(skipped)})" if skipped else ""))
-    return embeddings, labels
+    return _load_embedding_dispatch("word2vec", target_log_type)
 
 def flatten_hierarchy(h, parent=None):
     """Yields each node in the hierarchy in a flat traversal."""
