@@ -1,10 +1,10 @@
 import argparse
-import contextlib
-import math
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import math
 
 import halo
 import numpy as np
@@ -44,10 +44,6 @@ hierarchy = {
 
 TARGET_CONTAMINATION = 0.2  # Desired attack proportion in the balanced training set
 MIN_TRAIN_ANOMALIES = 512   # Ensure sufficient anomaly diversity during SMOTE
-RARE_CLASS_THRESHOLD = 512  # Upper bound for rare-class synthetic targets
-MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
-MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
-HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
 
 
 @dataclass(frozen=True)
@@ -240,40 +236,6 @@ class HierarchicalTransformer(nn.Module):
 
         _, aggregated = self._dp_probabilities(outputs)
         return aggregated
-
-
-def build_parent_lookup(tree: Mapping[str, Mapping[str, Sequence[str]]]) -> Dict[str, Optional[str]]:
-    """Creates a mapping from node name to its parent within the global hierarchy."""
-
-    parent_map: Dict[str, Optional[str]] = {}
-
-    def recurse(current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]) -> None:
-        for node, children in current.items():
-            parent_map.setdefault(node, parent)
-            if isinstance(children, Mapping):
-                recurse(children, node)
-                for intermediate, leaves in children.items():
-                    parent_map.setdefault(intermediate, node)
-                    for leaf in leaves:
-                        parent_map.setdefault(str(leaf), intermediate)
-
-    recurse(tree, None)
-    return parent_map
-
-
-def autocast_context(device_type: str, enabled: bool):
-    """Returns an autocast context manager compatible with PyTorch 2.1+."""
-
-    if not enabled:
-        return contextlib.nullcontext()
-
-    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        return torch.amp.autocast(device_type=device_type, enabled=True)
-
-    if device_type == "cuda":  # Fallback for older PyTorch releases
-        return torch.cuda.amp.autocast(enabled=True)
-
-    return contextlib.nullcontext()
 
 def _resolve_embedding_roots(embedding_type: str) -> Tuple[List[Path], List[Path]]:
     """Returns candidate root directories that may contain embeddings."""
@@ -519,8 +481,6 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         node_names = list(flatten_hierarchy(hierarchy))
         if len(node_names) < y.shape[1]:
             node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
-        node_to_index = {name: idx for idx, name in enumerate(node_names)}
-        parent_lookup = build_parent_lookup(hierarchy)
 
         rng = np.random.default_rng(42)
 
@@ -555,8 +515,7 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         # Targeted synthetic samples per class for rare attacks
         synthetic_features: List[np.ndarray] = []
         synthetic_targets: List[np.ndarray] = []
-        adaptive_threshold = int(0.05 * len(y)) if len(y) > 0 else 0
-        rare_threshold = max(64, min(RARE_CLASS_THRESHOLD, adaptive_threshold))
+        rare_threshold = max(1000, int(0.05 * len(y)))
 
         for c in range(y.shape[1]):
             pos_idx = np.where(y[:, c] == 1)[0]
@@ -604,37 +563,8 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
             X_new = X_res[new_pos].astype(np.float32)
             Y_new = np.zeros((X_new.shape[0], y.shape[1]), dtype=np.float32)
             Y_new[:, c] = 1.0
-
-            # Limit synthetic growth to prevent precision collapse downstream
-            max_target_total = max(
-                pos_count + MIN_SYNTHETIC_TARGET,
-                int(pos_count * MAX_SYNTHETIC_MULTIPLIER),
-            )
-            max_target_total = min(max_target_total, rare_threshold)
-            desired_total_pos = max(pos_count, max_target_total)
-            max_new = max(0, desired_total_pos - pos_count)
-            if max_new == 0:
-                continue
-            if X_new.shape[0] > max_new:
-                select = rng.choice(X_new.shape[0], size=max_new, replace=False)
-                X_new = X_new[select]
-                Y_new = Y_new[select]
-
             synthetic_features.append(X_new)
             synthetic_targets.append(Y_new)
-
-            # Inject hard negatives: parent active, current label inactive
-            node_name = node_names[c] if c < len(node_names) else None
-            parent_name = parent_lookup.get(node_name) if node_name else None
-            if parent_name and parent_name in node_to_index:
-                parent_idx = node_to_index[parent_name]
-                parent_positive = np.where((y[:, parent_idx] == 1) & (y[:, c] == 0))[0]
-                if parent_positive.size > 0 and max_new > 0:
-                    negative_budget = int(min(parent_positive.size, max_new * HARD_NEGATIVE_MULTIPLIER))
-                    if negative_budget > 0:
-                        neg_idx = rng.choice(parent_positive, size=negative_budget, replace=False)
-                        synthetic_features.append(X[neg_idx])
-                        synthetic_targets.append(y[neg_idx].astype(np.float32))
 
         if synthetic_features:
             X_aug = np.vstack([X] + synthetic_features)
@@ -757,8 +687,8 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
     mse_loss = nn.MSELoss()
-    use_amp = device.type in ["cuda", "mps"]
-    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
+    use_amp = device.type in ["cuda", "mps"]  # Enable for M2
+    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
@@ -823,7 +753,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
             attn = attn.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with autocast_context(device.type, enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
 
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
@@ -872,7 +802,9 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
                 max_pooling = max_pooling.to(device, non_blocking=True)
                 attn = attn.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                ctx = autocast_context(device.type, enabled=use_amp)
+                # Use CUDA autocast only when CUDA; avoid triton/inductor path on CPU/MPS
+                use_cuda_amp = (device.type=="cuda")
+                ctx = torch.cuda.amp.autocast(enabled=use_cuda_amp)
                 with ctx:
                     recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                     feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
