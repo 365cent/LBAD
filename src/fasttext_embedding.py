@@ -36,15 +36,20 @@ Example label structure:
 }
 """
 
+import argparse
+import json
 import os
-import pandas as pd
+import pickle
+from functools import lru_cache
+from itertools import repeat
+from pathlib import Path
+from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from gensim.models import KeyedVectors
 from gensim.utils import simple_preprocess
-from pathlib import Path
-import pickle
-from tqdm import tqdm
 """
 Best-effort setup of writable cache/config dirs when $HOME is restricted.
 - Matplotlib: use ./\.mplconfig
@@ -65,13 +70,9 @@ except Exception:
     # If creation fails (e.g., read-only FS), fall back silently
     pass
 import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 import seaborn as sns
-import json
-import multiprocessing
-import argparse
-from functools import partial
 from halo import Halo
+from sklearn.manifold import TSNE
 try:
     import gensim.downloader as api
     HAS_GENSIM = True
@@ -92,7 +93,10 @@ def parse_example(example):
     }
     return tf.io.parse_single_example(example, feature_description)
 
-def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
+def load_tfrecord_files(
+    directory: Path = PROCESSED_DIR,
+    log_type_filter: Optional[str] = None,
+) -> pd.DataFrame:
     """Load TFRecord files from directory into a DataFrame with optimized processing."""
     # Get list of all tfrecord files
     if log_type_filter:
@@ -109,25 +113,34 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
                 tfrecord_files.extend(log_dir_path.glob("*.tfrecord"))
         if not tfrecord_files:
             raise FileNotFoundError(f"No TFRecord files found in {directory}")
-    
     print(f"Loading {len(tfrecord_files)} TFRecord files...")
-    
+
     # Process files in batches
     all_logs = []
     all_labels_json = []
     all_log_types = []
-    
+
     spinner = Halo(text='Loading files', spinner='dots')
     spinner.start()
-    
+
+    dataset_options = tf.data.Options()
+    dataset_options.experimental_deterministic = False
+    batch_size = 1024
+    autotune = getattr(tf.data, 'AUTOTUNE', tf.data.experimental.AUTOTUNE)
+
     for file_idx, file_path in enumerate(tfrecord_files):
         try:
             spinner.text = f"Loading file {file_idx+1}/{len(tfrecord_files)}: {file_path.name}"
             log_type = file_path.parent.name
             
             # Use TensorFlow's optimized API for batch processing
-            dataset = tf.data.TFRecordDataset(str(file_path), compression_type="GZIP", num_parallel_reads=4)
-            dataset = dataset.batch(1000)  # Process in batches
+            dataset = tf.data.TFRecordDataset(
+                str(file_path),
+                compression_type="GZIP",
+                num_parallel_reads=autotune,
+            )
+            dataset = dataset.with_options(dataset_options)
+            dataset = dataset.batch(batch_size).prefetch(autotune)
             
             for batch in dataset:
                 parsed_batch = tf.io.parse_example(batch, {
@@ -140,7 +153,7 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
                 
                 all_logs.extend(logs)
                 all_labels_json.extend(labels)
-                all_log_types.extend([log_type] * len(logs))
+                all_log_types.extend(repeat(log_type, len(logs)))
                 
         except Exception as e:
             spinner.text = f"Error processing file {file_path}: {e}"
@@ -149,20 +162,21 @@ def load_tfrecord_files(directory=PROCESSED_DIR, log_type_filter=None):
             spinner.start()
     
     spinner.succeed(f"Loaded {len(all_logs)} log entries")
-    
+
     return pd.DataFrame({
         'log': all_logs, 
         'label_json': all_labels_json,
         'log_type': all_log_types
     })
 
-def normalize_label(label):
+def normalize_label(label: Optional[str]) -> Optional[str]:
     """Normalize attack labels to ensure consistency."""
     if not label:
         return label
     return label.replace('-', '_').lower().strip()
 
-def get_labels_from_json(label_json_str):
+
+def get_labels_from_json(label_json_str: str) -> Set[str]:
     """Extract labels from JSON string."""
     try:
         labels = json.loads(label_json_str)
@@ -172,24 +186,30 @@ def get_labels_from_json(label_json_str):
     except json.JSONDecodeError:
         return set()
 
-def collect_unique_labels_from_data(df):
+def collect_unique_labels_from_data(
+    df: pd.DataFrame,
+    *,
+    show_progress: bool = True,
+) -> List[str]:
     """Extract all unique attack labels from the dataset efficiently."""
     all_unique_labels = set()
-    
-    spinner = Halo(text='Collecting unique labels', spinner='dots')
-    spinner.start()
-    
+
+    spinner = Halo(text='Collecting unique labels', spinner='dots') if show_progress else None
+    if spinner:
+        spinner.start()
+
     for label_json_str in df['label_json']:
         all_unique_labels.update(get_labels_from_json(label_json_str))
-    
-    # Remove empty labels
+
     all_unique_labels.discard('')
     all_unique_labels.discard(None)
-    
-    spinner.succeed(f"Found {len(all_unique_labels)} unique attack types")
-    return sorted(list(all_unique_labels))
 
-def load_pretrained_fasttext():
+    if spinner:
+        spinner.succeed(f"Found {len(all_unique_labels)} unique attack types")
+
+    return sorted(all_unique_labels)
+
+def load_pretrained_fasttext() -> Optional[KeyedVectors]:
     """Load pre-trained FastText model."""
     spinner = Halo(text='Loading pre-trained FastText model', spinner='dots')
     spinner.start()
@@ -217,29 +237,51 @@ def load_pretrained_fasttext():
                 print("Consider installing fasttext manually or check internet connection")
                 return None
 
-def preprocess_text(text):
-    """Preprocess text for embedding."""
-    return simple_preprocess(text)
+@lru_cache(maxsize=50000)
+def _cached_preprocess(text: str) -> Tuple[str, ...]:
+    """Tokenize text with caching to avoid repeated preprocessing."""
+    return tuple(simple_preprocess(text))
 
-def embed_text(model, tokens):
+
+def preprocess_text(text: str) -> Tuple[str, ...]:
+    """Preprocess text for embedding."""
+    if not text:
+        return tuple()
+    return _cached_preprocess(text)
+
+def embed_text(
+    model: KeyedVectors,
+    tokens: Sequence[str],
+    vector_cache: Optional[MutableMapping[str, np.ndarray]] = None,
+) -> np.ndarray:
     """Generate embedding for tokenized text using pre-trained FastText."""
     if not tokens:
         return np.zeros(model.vector_size, dtype=np.float32)
-    
-    # Vectorized approach for better performance
-    valid_tokens = [token for token in tokens if token in model]
-    
-    if valid_tokens:
-        # Get all embeddings at once and compute mean
-        embeddings_matrix = np.array([model[token] for token in valid_tokens], dtype=np.float32)
-        return np.mean(embeddings_matrix, axis=0)
-    else:
-        return np.zeros(model.vector_size, dtype=np.float32)
 
-def embed_labels(model, labels):
+    cache: MutableMapping[str, np.ndarray]
+    cache = vector_cache if vector_cache is not None else {}
+
+    accumulator = np.zeros(model.vector_size, dtype=np.float32)
+    count = 0
+
+    for token in tokens:
+        vector = cache.get(token)
+        if vector is None and token in model:
+            vector = np.asarray(model[token], dtype=np.float32)
+            cache[token] = vector
+        if vector is None:
+            continue
+        accumulator += vector
+        count += 1
+
+    if count == 0:
+        return np.zeros(model.vector_size, dtype=np.float32)
+    return accumulator / count
+
+def embed_labels(model: KeyedVectors, labels: Sequence[str]) -> np.ndarray:
     """Generate embeddings for labels."""
     if not labels:
-        return np.zeros(model.vector_size)
+        return np.zeros(model.vector_size, dtype=np.float32)
     
     label_embeddings = []
     for label in labels:
@@ -251,23 +293,34 @@ def embed_labels(model, labels):
     if label_embeddings:
         return np.mean(label_embeddings, axis=0)
     else:
-        return np.zeros(model.vector_size)
+        return np.zeros(model.vector_size, dtype=np.float32)
 
-def create_binary_label_vector(label_json_str, all_attack_types):
+def create_binary_label_vector(
+    label_json_str: str,
+    all_attack_types: Sequence[str],
+    *,
+    attack_index: Optional[Mapping[str, int]] = None,
+) -> np.ndarray:
     """Create binary vector representation for multi-label classification."""
     labels = get_labels_from_json(label_json_str)
-    
-    # Binary vector: [0 1 0] means only second class is present
-    binary_vector = np.zeros(len(all_attack_types), dtype=np.int8)  # Use int8 for memory efficiency
-    
-    # Vectorized approach for better performance
-    if labels:
-        attack_indices = [i for i, attack in enumerate(all_attack_types) if attack in labels]
-        binary_vector[attack_indices] = 1
-    
+
+    if not all_attack_types:
+        return np.zeros(0, dtype=np.int8)
+
+    lookup = attack_index or {attack: idx for idx, attack in enumerate(all_attack_types)}
+
+    binary_vector = np.zeros(len(all_attack_types), dtype=np.int8)
+    for label in labels:
+        index = lookup.get(label)
+        if index is not None:
+            binary_vector[index] = 1
+
     return binary_vector
 
-def display_data_distribution(df, log_type_name="all combined"):
+def display_data_distribution(
+    df: pd.DataFrame,
+    log_type_name: str = "all combined",
+) -> Tuple[int, int]:
     """Calculate and display data distribution statistics."""
     print(f"\n{'='*20} Data Distribution for '{log_type_name}' {'='*20}")
     
@@ -318,110 +371,74 @@ def display_data_distribution(df, log_type_name="all combined"):
     print(f"{'='*70}\n")
     return attack_count, normal_count
 
-def process_embeddings_batch(model, tokens_batch):
-    """Process a batch of tokens for embedding generation."""
-    return [embed_text(model, tokens) for tokens in tokens_batch]
-
-def process_labels_batch(labels_batch, attack_types):
-    """Process a batch of labels for binary vector generation."""
-    return [create_binary_label_vector(label_json, attack_types) for label_json in labels_batch]
-
-def process_embeddings(df, model, use_global_attack_list=False):
-    """Process logs and create embeddings with binary label vectors - optimized version."""
+def process_embeddings(
+    df: pd.DataFrame,
+    model: KeyedVectors,
+    use_global_attack_list: bool = False,
+) -> pd.DataFrame:
+    """Process logs and create embeddings with binary label vectors."""
     spinner = Halo(text='Processing log embeddings', spinner='dots')
     spinner.start()
-    
+
+    df = df.copy()
     total_count = len(df)
-    batch_size = 500  # Optimized batch size for better performance
-    
-    # Tokenize logs in batches
-    spinner.text = "Tokenizing logs in batches"
-    tokenized_logs = []
-    
-    # Use vectorized string operations where possible
-    for i in range(0, total_count, batch_size):
-        end_idx = min(i + batch_size, total_count)
-        batch_logs = df['log'].iloc[i:end_idx]
-        
-        if i % 2000 == 0:  # Update progress less frequently
-            spinner.text = f"Tokenizing logs: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-        
-        # Process batch
-        batch_tokens = [preprocess_text(log) for log in batch_logs]
-        tokenized_logs.extend(batch_tokens)
-    
-    df['tokens'] = tokenized_logs
-    
-    # Create log embeddings in batches
-    spinner.text = "Creating log embeddings in batches"
-    log_embeddings = []
-    
-    for i in range(0, total_count, batch_size):
-        end_idx = min(i + batch_size, total_count)
-        tokens_batch = tokenized_logs[i:end_idx]
-        
-        if i % 2000 == 0:
-            spinner.text = f"Creating log embeddings: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-        
-        # Process batch with multiprocessing could be added here if needed
-        batch_embeddings = process_embeddings_batch(model, tokens_batch)
-        log_embeddings.extend(batch_embeddings)
-    
-    # Convert to numpy array for better memory efficiency
-    log_embeddings_array = np.array(log_embeddings, dtype=np.float32)
-    df['log_embedding'] = list(log_embeddings_array)  # Convert back to list for pandas
-    
-    # Process labels in batches
-    spinner.text = "Processing binary label vectors in batches"
-    
+    if total_count == 0:
+        spinner.succeed('No records found for embedding')
+        df['log_embedding'] = []
+        df['binary_labels'] = []
+        return df
+
+    batch_size = 500
+    embedding_cache: Dict[str, np.ndarray] = {}
+    log_embeddings = np.empty((total_count, model.vector_size), dtype=np.float32)
+    binary_labels: List[np.ndarray] = [np.zeros(0, dtype=np.int8) for _ in range(total_count)]
+
     if use_global_attack_list:
-        # Use all labels across all log types
-        attack_types = collect_unique_labels_from_data(df)
-        
-        binary_labels = []
-        for i in range(0, total_count, batch_size):
-            end_idx = min(i + batch_size, total_count)
-            labels_batch = df['label_json'].iloc[i:end_idx]
-            
-            if i % 2000 == 0:
-                spinner.text = f"Processing labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-            
-            batch_binary = process_labels_batch(labels_batch, attack_types)
-            binary_labels.extend(batch_binary)
-        
-        df['binary_labels'] = binary_labels
+        attack_types = collect_unique_labels_from_data(df, show_progress=False)
+        attack_lookup = {attack: idx for idx, attack in enumerate(attack_types)}
         df.attrs['attack_types'] = attack_types
     else:
-        # Process by log type
-        log_type_to_attacks = {}
+        log_type_to_attacks: Dict[str, List[str]] = {}
+        log_type_to_index: Dict[str, Dict[str, int]] = {}
         for log_type, group_df in df.groupby('log_type'):
-            spinner.text = f"Processing log type: {log_type}"
-            log_type_to_attacks[log_type] = collect_unique_labels_from_data(group_df)
-        
-        # Process all labels in batches
-        binary_labels = []
-        for i in range(0, total_count, batch_size):
-            end_idx = min(i + batch_size, total_count)
-            
-            if i % 2000 == 0:
-                spinner.text = f"Processing binary labels: {end_idx}/{total_count} ({end_idx/total_count*100:.1f}%)"
-            
-            batch_binary = []
-            for j in range(i, end_idx):
-                row = df.iloc[j]
-                log_type = row['log_type']
-                if log_type in log_type_to_attacks:
-                    binary_vector = create_binary_label_vector(row['label_json'], log_type_to_attacks[log_type])
-                else:
-                    binary_vector = np.array([], dtype=np.int8)
-                batch_binary.append(binary_vector)
-            
-            binary_labels.extend(batch_binary)
-        
-        df['binary_labels'] = binary_labels
+            spinner.text = f"Building label vocabulary for {log_type}"
+            attacks = collect_unique_labels_from_data(group_df, show_progress=False)
+            log_type_to_attacks[log_type] = attacks
+            log_type_to_index[log_type] = {attack: idx for idx, attack in enumerate(attacks)}
         df.attrs['log_type_to_attacks'] = log_type_to_attacks
-    
-    spinner.succeed("Embedding processing complete")
+
+    spinner.text = 'Generating embeddings and label vectors'
+    for start in range(0, total_count, batch_size):
+        end = min(start + batch_size, total_count)
+        spinner.text = f"Processing records {end}/{total_count} ({end/total_count*100:.1f}%)"
+
+        batch = df.iloc[start:end]
+        for offset, row in enumerate(batch.itertuples(index=False)):
+            idx = start + offset
+            tokens = preprocess_text(row.log)
+            log_embeddings[idx] = embed_text(model, tokens, vector_cache=embedding_cache)
+
+            if use_global_attack_list:
+                binary_labels[idx] = create_binary_label_vector(
+                    row.label_json,
+                    attack_types,
+                    attack_index=attack_lookup,
+                )
+            else:
+                attacks = log_type_to_attacks.get(row.log_type, [])
+                if attacks:
+                    binary_labels[idx] = create_binary_label_vector(
+                        row.label_json,
+                        attacks,
+                        attack_index=log_type_to_index[row.log_type],
+                    )
+                else:
+                    binary_labels[idx] = np.zeros(0, dtype=np.int8)
+
+    df['log_embedding'] = list(log_embeddings)
+    df['binary_labels'] = binary_labels
+
+    spinner.succeed('Embedding processing complete')
     return df
 
 def visualize_embeddings(df, output_file=None):
@@ -454,7 +471,7 @@ def visualize_embeddings(df, output_file=None):
     # 2. Balanced sampling – keep all minority classes, down-sample major ones
     # -------------------------------------------------------------------------
     spinner.text = "Applying balanced sampling to limit dataset size"
-    np.random.seed(42)  # Reproducibility
+    rng = np.random.default_rng(42)
 
     selected_indices = []
     label_to_indices = {}
@@ -463,14 +480,14 @@ def visualize_embeddings(df, output_file=None):
 
     for lbl, indices in label_to_indices.items():
         if len(indices) > MAX_POINTS_PER_CLASS:
-            sampled = np.random.choice(indices, MAX_POINTS_PER_CLASS, replace=False)
+            sampled = rng.choice(indices, MAX_POINTS_PER_CLASS, replace=False)
             selected_indices.extend(sampled)
         else:
             selected_indices.extend(indices)  # Keep all if already small
 
     # If we still exceed the global cap, randomly subsample the union (keeps balance reasonably well)
     if len(selected_indices) > MAX_TOTAL_POINTS:
-        selected_indices = list(np.random.choice(selected_indices, MAX_TOTAL_POINTS, replace=False))
+        selected_indices = list(rng.choice(selected_indices, MAX_TOTAL_POINTS, replace=False))
 
     # -------------------------------------------------------------------------
     # 3. Gather embeddings and labels for the sampled indices
