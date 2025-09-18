@@ -1,19 +1,20 @@
+import argparse
 import pickle
-import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+import halo
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from torch.utils.data import TensorDataset, DataLoader, random_split
+from sklearn.decomposition import PCA
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from imblearn.over_sampling import KMeansSMOTE, BorderlineSMOTE
-from imblearn.combine import SMOTETomek
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from imblearn.over_sampling import BorderlineSMOTE, KMeansSMOTE
 from imblearn.under_sampling import RandomUnderSampler
-from imblearn.pipeline import Pipeline as ImbPipeline
-import halo
-import argparse
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -42,103 +43,197 @@ hierarchy = {
     "dnsteal": {"dnsteal-received": [], "dnsteal-dropped": [], "exfiltration-service": []}
 }
 
+
+@dataclass(frozen=True)
+class TransformerConfig:
+    """Configuration for the hierarchical single-layer transformer."""
+
+    hidden_dim: int = 384
+    bottleneck_dim: int = 192
+    num_heads: int = 4
+    dropout: float = 0.1
+    attn_input_dim: int = 10
+
 class HierarchicalTransformer(nn.Module):
-    def __init__(self, hierarchy, hidden_dim=512, num_heads=4, num_layers=2):
+    """Hierarchical transformer with single-layer encoder and DP smoothing."""
+
+    def __init__(
+        self,
+        hierarchy: Mapping[str, Mapping[str, Sequence[str]]],
+        config: Optional[TransformerConfig] = None,
+    ) -> None:
         super().__init__()
+        self.config = config or TransformerConfig()
         self.hierarchy = hierarchy
-        self.cls_proj, self.mean_proj = nn.Linear(768, hidden_dim), nn.Linear(768, hidden_dim)
-        self.max_proj, self.attn_proj = nn.Linear(768, hidden_dim), nn.Linear(10, hidden_dim)
+        self.hidden_dim = self.config.hidden_dim
+        self.reconstruction_dim = 768 * 3 + self.config.attn_input_dim
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        def _build_proj(input_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(input_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(self.config.dropout),
+            )
 
-        self.bottleneck = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.decoder = nn.Sequential(nn.Linear(hidden_dim // 2, hidden_dim), nn.ReLU(),
-                                     nn.Linear(hidden_dim, 2314))
+        self.cls_proj = _build_proj(768)
+        self.mean_proj = _build_proj(768)
+        self.max_proj = _build_proj(768)
+        self.attn_proj = _build_proj(self.config.attn_input_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.config.num_heads,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=self.config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.sequence_dropout = nn.Dropout(self.config.dropout)
+        self.post_encoder_norm = nn.LayerNorm(self.hidden_dim)
+
+        self.bottleneck = nn.Linear(self.hidden_dim, self.config.bottleneck_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(self.config.bottleneck_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.hidden_dim, self.reconstruction_dim),
+        )
 
         self.heads = nn.ModuleDict()
-        self.parent_child_map = {}
-        self.node_to_index = {}
+        self.children_map: Dict[str, List[str]] = {}
+        self.parent_map: Dict[str, str] = {}
+        self.node_to_index: Dict[str, int] = {}
+        self.root_nodes: List[str] = []
+        self.topological_order: List[str] = []
         self._build_heads(self.hierarchy)
+        self._reverse_topological_order = list(reversed(self.topological_order))
 
-    def _build_heads(self, hierarchy, parent=None):
-        idx = len(self.node_to_index)
-        for node, children in hierarchy.items():
-            self.heads[node] = nn.Linear(self.bottleneck.out_features, 1)
-            self.node_to_index[node] = idx
-            idx += 1
-            if parent:
-                if parent not in self.parent_child_map:
-                    self.parent_child_map[parent] = []
-                self.parent_child_map[parent].append(node)
-            
-            if isinstance(children, dict):
-                for child, leaves in children.items():
-                    self.heads[child] = nn.Linear(self.bottleneck.out_features, 1)
-                    self.node_to_index[child] = idx
-                    idx += 1
-                    if node not in self.parent_child_map:
-                        self.parent_child_map[node] = []
-                    self.parent_child_map[node].append(child)
-                    
-                    for leaf in leaves:
-                        self.heads[leaf] = nn.Linear(self.bottleneck.out_features, 1)
-                        self.node_to_index[leaf] = idx
-                        idx += 1
-                        if child not in self.parent_child_map:
-                            self.parent_child_map[child] = []
-                        self.parent_child_map[child].append(leaf)
+    @property
+    def device(self) -> torch.device:
+        """Returns the primary device for the model."""
 
-    def forward(self, cls_tokens, mean_pooling, max_pooling, attn):
-        cls_h, mean_h = self.cls_proj(cls_tokens), self.mean_proj(mean_pooling)
-        max_h, attn_h = self.max_proj(max_pooling), self.attn_proj(attn)
+        return next(self.parameters()).device
+
+    def _register_node(self, name: str, parent: Optional[str]) -> None:
+        """Registers a node in the hierarchy and creates a linear head if needed."""
+
+        if name not in self.heads:
+            self.heads[name] = nn.Linear(self.config.bottleneck_dim, 1)
+        if name not in self.node_to_index:
+            self.node_to_index[name] = len(self.node_to_index)
+            self.topological_order.append(name)
+        if parent is None:
+            if name not in self.root_nodes:
+                self.root_nodes.append(name)
+            return
+
+        children = self.children_map.setdefault(parent, [])
+        if name not in children:
+            children.append(name)
+        self.parent_map[name] = parent
+
+    def _build_heads(
+        self,
+        tree: Mapping[str, Mapping[str, Sequence[str]]],
+        parent: Optional[str] = None,
+    ) -> None:
+        """Recursively builds linear heads for each hierarchical node."""
+
+        for node, children in tree.items():
+            self._register_node(node, parent)
+            if isinstance(children, Mapping):
+                self._build_heads(children, node)
+            elif isinstance(children, (list, tuple, set)):
+                for child in children:
+                    self._register_node(str(child), node)
+            elif children is None:
+                continue
+            else:
+                raise TypeError(f"Unsupported hierarchy type for node '{node}': {type(children)}")
+
+    def forward(
+        self,
+        cls_tokens: torch.Tensor,
+        mean_pooling: torch.Tensor,
+        max_pooling: torch.Tensor,
+        attn: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Runs a forward pass and returns reconstruction, latent, and logits."""
+
+        if attn.shape[-1] != self.config.attn_input_dim:
+            raise ValueError(
+                f"Attention features expected dim {self.config.attn_input_dim}, got {attn.shape[-1]}"
+            )
+
+        cls_h = self.cls_proj(cls_tokens)
+        mean_h = self.mean_proj(mean_pooling)
+        max_h = self.max_proj(max_pooling)
+        attn_h = self.attn_proj(attn)
 
         combined = torch.stack([cls_h, mean_h, max_h, attn_h], dim=1)
-        h_enc = self.encoder(combined)
-        pooled = h_enc.mean(1)
+        combined = self.sequence_dropout(combined)
+        encoded = self.encoder(combined)
+        pooled = encoded.mean(dim=1)
+        pooled = self.post_encoder_norm(pooled)
 
-        z = self.bottleneck(pooled)
+        z = F.gelu(self.bottleneck(pooled))
         recon = self.decoder(z)
-        
-        # compute logits (not sigmoid yet for BCEWithLogitsLoss)
+
         outputs = {name: torch.clamp(head(z), -10.0, 10.0) for name, head in self.heads.items()}
         return recon, z, outputs
 
-    def hierarchy_consistency_loss(self, outputs):
-        """Penalty if child probability > parent probability"""
-        consistency_loss = torch.tensor(0.0, device=next(iter(outputs.values())).device)
-        count = 0
+    def _dp_probabilities(
+        self, outputs: Mapping[str, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Returns raw and hierarchy-consistent probabilities via DP smoothing."""
 
-        for parent, children in self.parent_child_map.items():
-            if parent in outputs:
-                # Clamp logits before sigmoid for numerical stability
-                parent_logits = torch.clamp(outputs[parent], -10.0, 10.0)
-                parent_prob = torch.sigmoid(parent_logits)
+        if not outputs:
+            return {}, {}
 
-                for child in children:
-                    if child in outputs:
-                        child_logits = torch.clamp(outputs[child], -10.0, 10.0)
-                        child_prob = torch.sigmoid(child_logits)
-                        violation = F.relu(child_prob - parent_prob)
-                        consistency_loss += violation.mean()
-                        count += 1
-
-        # Return average if we have any violations, otherwise return 0
-        return consistency_loss / max(count, 1)
-
-    def propagate_labels(self, outputs):
-        """Propagate active parent labels to children"""
-        propagated = {}
+        base_probs: Dict[str, torch.Tensor] = {}
         for name, logits in outputs.items():
-            propagated[name] = torch.sigmoid(logits)
-        
-        for parent, children in self.parent_child_map.items():
-            if parent in propagated:
-                parent_active = (propagated[parent] > 0.5).float()
-                for child in children:
-                    if child in propagated:
-                        propagated[child] = torch.maximum(propagated[child], parent_active)
-        return propagated
+            base_probs[name] = torch.sigmoid(torch.clamp(logits, -10.0, 10.0))
+
+        aggregated: Dict[str, torch.Tensor] = {}
+        for name in self._reverse_topological_order:
+            if name not in base_probs:
+                continue
+            prob = base_probs[name]
+            children = self.children_map.get(name, [])
+            if children:
+                child_probs = [aggregated[child] for child in children if child in aggregated]
+                if child_probs:
+                    child_stack = torch.stack(child_probs, dim=0)
+                    child_summary = child_stack.max(dim=0).values
+                    prob = torch.maximum(prob, child_summary)
+            aggregated[name] = prob
+
+        for name, prob in base_probs.items():
+            aggregated.setdefault(name, prob)
+
+        return base_probs, aggregated
+
+    def hierarchy_consistency_loss(self, outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Encourages logits to respect the hierarchy using DP smoothing."""
+
+        if not outputs:
+            return torch.tensor(0.0, device=self.device)
+
+        base_probs, aggregated = self._dp_probabilities(outputs)
+        losses = []
+        for name, base in base_probs.items():
+            target = aggregated[name]
+            losses.append(F.smooth_l1_loss(base, target, beta=0.05, reduction="mean"))
+        return torch.stack(losses).mean()
+
+    def propagate_labels(self, outputs: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Returns hierarchy-consistent probabilities for inference."""
+
+        _, aggregated = self._dp_probabilities(outputs)
+        return aggregated
 
 def load_logbert_embeddings(target_log_type: str = None):
     embeddings_dir = Path("embeddings/logbert")
@@ -266,7 +361,7 @@ def load_word2vec_embeddings(target_log_type: str = None):
     return embeddings, labels
 
 def flatten_hierarchy(h, parent=None):
-    """Flatten hierarchy to list of all nodes"""
+    """Yields each node in the hierarchy in a flat traversal."""
     for node, children in h.items():
         yield node
         if isinstance(children, dict):
@@ -276,7 +371,7 @@ def flatten_hierarchy(h, parent=None):
                     yield leaf
 
 def create_multilabel_targets(labels_dict, hierarchy):
-    """Convert label vectors to multi-label targets aligned with hierarchy"""
+    """Aligns label vectors with the flattened hierarchy layout."""
     if 'vectors' not in labels_dict:
         return None
     
@@ -338,7 +433,7 @@ def load_datasets(embeddings, labels, batch_size=128):
     return datasets
 
 def smote_data(train_loader, val_loader):
-    """Apply balanced resampling to address class imbalance"""
+    """Performs lightweight SMOTE/undersampling to mitigate class imbalance."""
     spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
     spinner.start()
 
@@ -349,6 +444,10 @@ def smote_data(train_loader, val_loader):
             for i, tensor in enumerate(batch):
                 all_data[i].append(tensor.detach().cpu().numpy())
         cls, mean, maxp, attn, y = [np.vstack(data) for data in all_data]
+
+        if int(y.sum()) == 0:
+            spinner.stop_and_persist(text="Skipping resampling (only normal samples detected)")
+            return train_loader
 
         # Safety cap: limit rows used for resampling to avoid OOM/very long runs
         n_total = y.shape[0]
@@ -403,17 +502,27 @@ def smote_data(train_loader, val_loader):
             # Apply resampling pipeline
             try:
                 # Determine strategy based on class balance
-                if pos_count < target_per_class:
-                    # Oversample minority class
-                    k_neighbors = min(3, pos_count - 1) if pos_count > 1 else 1
-                    oversample_ratio = min(target_per_class / max(pos_count, 1), 1.5)  # replace
-                    
-                    smote = BorderlineSMOTE(
-                        sampling_strategy={1: min(int(pos_count * oversample_ratio), pos_count + 20000)},
-                        k_neighbors=max(2, k_neighbors),
-                        random_state=42,
-                        kind='borderline-1'
-                    )
+                if pos_count <= 1:
+                    X_resampled, y_resampled = X_class, y_class
+                elif pos_count < target_per_class:
+                    k_neighbors = min(3, pos_count - 1)
+                    if pos_count < 5:
+                        smote = KMeansSMOTE(
+                            sampling_strategy="auto",
+                            random_state=42,
+                            k_neighbors=max(1, k_neighbors),
+                            cluster_balance_threshold=0.1,
+                        )
+                    else:
+                        oversample_ratio = min(target_per_class / max(pos_count, 1), 1.5)
+                        smote = BorderlineSMOTE(
+                            sampling_strategy={
+                                1: min(int(pos_count * oversample_ratio), pos_count + 20000)
+                            },
+                            k_neighbors=max(2, k_neighbors),
+                            random_state=42,
+                            kind="borderline-1",
+                        )
                     X_resampled, y_resampled = smote.fit_resample(X_class, y_class)
                 else:
                     X_resampled, y_resampled = X_class, y_class
@@ -483,7 +592,8 @@ def smote_data(train_loader, val_loader):
         except:
             pass
 
-def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, lambda_hier=0.5):
+def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
+    """Trains the transformer with reconstruction and hierarchy regularizers."""
     train = smote_data(train_loader, val_loader)
     if len(train) == 0:
         train = train_loader
@@ -579,7 +689,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                 hier_loss = model.hierarchy_consistency_loss(outputs)
                 hier_loss = torch.clamp(hier_loss, 0, 10.0)
 
-                total_loss = 0.001 * recon_loss + ml_loss + 0.01 * hier_loss
+                total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
@@ -632,7 +742,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=1.0, la
                     hier_loss = model.hierarchy_consistency_loss(outputs)
                     hier_loss = torch.clamp(hier_loss, 0, 10.0)
 
-                    total_loss = 0.001 * recon_loss + ml_loss + 0.01 * hier_loss
+                    total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
 
                     val_losses.append(total_loss.item())
 
@@ -820,28 +930,50 @@ def main():
             normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
             anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
 
-            def stratified_split(indices, train_ratio=0.8, val_ratio=0.1):
+            def stratified_split(indices: torch.Tensor, train_ratio: float = 0.8, val_ratio: float = 0.1):
                 n = len(indices)
                 if n == 0:
-                    return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)
+                    empty = torch.tensor([], dtype=torch.long)
+                    return empty, empty, empty
 
                 n_train = int(train_ratio * n)
                 n_val = int(val_ratio * n)
 
-                # Ensure we have at least 1 sample for each split if possible
                 n_train = max(1, min(n_train, n - 2)) if n > 2 else n_train
                 n_val = max(1, min(n_val, n - n_train - 1)) if n > n_train + 1 else n_val
 
                 perm = torch.randperm(n)
-                return indices[perm[:n_train]], indices[perm[n_train:n_train+n_val]], indices[perm[n_train+n_val:]]
-            
+                train_split = indices[perm[:n_train]]
+                val_split = indices[perm[n_train:n_train + n_val]]
+                test_split = indices[perm[n_train + n_val:]]
+                return train_split, val_split, test_split
+
+            def concat_indices(chunks: List[torch.Tensor]) -> torch.Tensor:
+                filtered = [chunk for chunk in chunks if len(chunk) > 0]
+                if not filtered:
+                    return torch.tensor([], dtype=torch.long)
+                return torch.cat(filtered)
+
             normal_train, normal_val, normal_test = stratified_split(normal_idx)
-            anomaly_train, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
-            
-            train_indices = torch.cat([normal_train, anomaly_train])
-            val_indices = torch.cat([normal_val, anomaly_val])
-            test_indices = torch.cat([normal_test, anomaly_test])
-            
+            _, anomaly_val, anomaly_test = stratified_split(anomaly_idx)
+
+            if len(normal_train) == 0:
+                print("Insufficient normal samples for training; defaulting to all normal logs.")
+                normal_train = normal_idx
+
+            train_indices = normal_train
+            val_indices = concat_indices([normal_val, anomaly_val])
+            test_indices = concat_indices([normal_test, anomaly_test])
+
+            if len(train_indices) == 0:
+                raise ValueError("Dataset does not contain normal samples for unsupervised training.")
+
+            if len(val_indices) == 0 and len(train_indices) > 1:
+                val_indices = train_indices[: max(1, len(train_indices) // 10)]
+
+            if len(test_indices) == 0:
+                test_indices = normal_idx if len(normal_idx) > 0 else anomaly_idx
+
             train_set = torch.utils.data.Subset(dataset, train_indices)
             val_set = torch.utils.data.Subset(dataset, val_indices)
             test_set = torch.utils.data.Subset(dataset, test_indices)
