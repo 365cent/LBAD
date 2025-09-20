@@ -640,24 +640,31 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
                 )
 
             active_classes = [
-                cls_idx for cls_idx in candidate_classes if cls_idx < Y_group.shape[1] and np.any(Y_group[:, cls_idx] == 1)
+                cls_idx
+                for cls_idx in candidate_classes
+                if cls_idx < Y_group.shape[1] and np.any(Y_group[:, cls_idx] == 1)
             ]
             if not active_classes:
                 active_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
+            else:
+                observed_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
+                for cls_idx in observed_classes:
+                    if cls_idx not in active_classes:
+                        active_classes.append(cls_idx)
 
             if not active_classes:
                 replace = len(X_group) < target_count
                 fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
                 return X_group[fallback_idx], Y_group[fallback_idx]
 
-            per_class = max(1, target_count // len(active_classes))
-            remainder = max(0, target_count - per_class * len(active_classes))
+            active_classes = list(dict.fromkeys(active_classes))  # preserve order, drop duplicates
+
+            per_class = max(1, int(math.ceil(target_count / len(active_classes))))
+            target_count = per_class * len(active_classes)
             chosen_indices: List[int] = []
 
             for cls_idx in active_classes:
-                quota = per_class + (1 if remainder > 0 else 0)
-                if remainder > 0:
-                    remainder -= 1
+                quota = per_class
                 indices = np.where(Y_group[:, cls_idx] == 1)[0]
                 if indices.size == 0:
                     continue
