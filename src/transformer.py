@@ -1032,8 +1032,8 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
     all_targets = np.vstack(all_targets)
     
     print("\n=== Per-Class Metrics ===")
-    print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10}")
-    print("-" * 55)
+    print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+    print("-" * 67)
 
     class_metrics = []
     for i, name in enumerate(node_names):
@@ -1042,11 +1042,11 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
             y_pred = all_preds[:, i]
 
             if y_true.sum() > 0:
-                prec, rec, f1, _ = precision_recall_fscore_support(
+                prec, rec, f1, support = precision_recall_fscore_support(
                     y_true, y_pred, average='binary', zero_division=0
                 )
                 class_metrics.append([prec, rec, f1])
-                print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f}")
+                print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {int(support):>10d}")
     
     print("\n=== Overall Metrics ===")
 
@@ -1090,18 +1090,18 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
         f.write("="*50 + "\n\n")
         
         f.write("Per-Class Metrics:\n")
-        f.write(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10}\n")
-        f.write("-" * 55 + "\n")
+        f.write(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n")
+        f.write("-" * 67 + "\n")
         
         for i, name in enumerate(node_names):
             if i < all_targets.shape[1]:
                 y_true = all_targets[:, i]
                 y_pred = all_preds[:, i]
                 if y_true.sum() > 0:
-                    prec, rec, f1, _ = precision_recall_fscore_support(
+                    prec, rec, f1, support = precision_recall_fscore_support(
                         y_true, y_pred, average='binary', zero_division=0
                     )
-                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f}\n")
+                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {int(support):>10d}\n")
         
         f.write(f"\nOverall Metrics:\n")
         f.write(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n")
