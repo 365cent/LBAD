@@ -514,6 +514,14 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
             node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
         node_to_index = {name: idx for idx, name in enumerate(node_names)}
         parent_lookup = build_parent_lookup(hierarchy)
+        parent_nodes = {name for name in parent_lookup.values() if name is not None}
+        leaf_indices = [
+            node_to_index[name]
+            for name in node_names
+            if name in node_to_index and name not in parent_nodes and node_to_index[name] < y.shape[1]
+        ]
+        if not leaf_indices:
+            leaf_indices = list(range(y.shape[1]))
 
         rng = np.random.default_rng(42)
 
@@ -620,31 +628,56 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
         desired_anomaly = max(1, int(round(desired_total * target_contamination)))
         desired_normal = max(1, desired_total - desired_anomaly)
 
-        def downsample_anomalies(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
-            if len(X_group) <= target_count:
-                return X_group, Y_group
-            selected = set()
-            current_total = len(X_group)
-            for c in range(Y_group.shape[1]):
-                class_idx = np.where(Y_group[:, c] == 1)[0]
-                if class_idx.size == 0:
+        def balance_anomalies(
+            X_group: np.ndarray,
+            Y_group: np.ndarray,
+            target_count: int,
+            candidate_classes: Sequence[int],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            if target_count <= 0 or len(X_group) == 0:
+                return np.empty((0, X_group.shape[1]), dtype=np.float32), np.empty(
+                    (0, Y_group.shape[1]), dtype=np.float32
+                )
+
+            active_classes = [
+                cls_idx for cls_idx in candidate_classes if cls_idx < Y_group.shape[1] and np.any(Y_group[:, cls_idx] == 1)
+            ]
+            if not active_classes:
+                active_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
+
+            if not active_classes:
+                replace = len(X_group) < target_count
+                fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
+                return X_group[fallback_idx], Y_group[fallback_idx]
+
+            per_class = max(1, target_count // len(active_classes))
+            remainder = max(0, target_count - per_class * len(active_classes))
+            chosen_indices: List[int] = []
+
+            for cls_idx in active_classes:
+                quota = per_class + (1 if remainder > 0 else 0)
+                if remainder > 0:
+                    remainder -= 1
+                indices = np.where(Y_group[:, cls_idx] == 1)[0]
+                if indices.size == 0:
                     continue
-                quota = max(1, int(target_count * (class_idx.size / current_total)))
-                chosen = rng.choice(class_idx, size=min(quota, class_idx.size), replace=False)
-                selected.update(chosen.tolist())
-            if len(selected) > target_count:
-                selected = set(rng.choice(list(selected), size=target_count, replace=False))
-            remaining = target_count - len(selected)
-            if remaining > 0:
-                pool = np.setdiff1d(np.arange(current_total), np.array(list(selected)))
-                if pool.size > 0:
-                    extra = rng.choice(pool, size=min(remaining, pool.size), replace=False)
-                    selected.update(extra.tolist())
-            chosen_idx = np.array(list(selected))
-            if chosen_idx.size < target_count:
+                replace = indices.size < quota
+                sampled = rng.choice(indices, size=quota, replace=replace)
+                chosen_indices.extend(sampled.tolist())
+
+            if not chosen_indices:
+                replace = len(X_group) < target_count
+                fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
+                return X_group[fallback_idx], Y_group[fallback_idx]
+
+            chosen_idx = np.asarray(chosen_indices, dtype=np.int64)
+            if chosen_idx.size > target_count:
+                chosen_idx = rng.choice(chosen_idx, size=target_count, replace=False)
+            elif chosen_idx.size < target_count:
                 deficit = target_count - chosen_idx.size
-                replenish = rng.choice(np.arange(current_total), size=deficit, replace=True)
+                replenish = rng.choice(len(X_group), size=deficit, replace=True)
                 chosen_idx = np.concatenate([chosen_idx, replenish])
+
             return X_group[chosen_idx], Y_group[chosen_idx]
 
         def adjust_normals(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -657,7 +690,12 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
             return np.vstack([X_group, augment]), np.vstack([Y_group, Y_augmented])
 
         X_normals_bal, Y_normals_bal = adjust_normals(X_normals, Y_normals, desired_normal)
-        X_anomalies_bal, Y_anomalies_bal = downsample_anomalies(X_anomalies, Y_anomalies, desired_anomaly)
+        X_anomalies_bal, Y_anomalies_bal = balance_anomalies(
+            X_anomalies,
+            Y_anomalies,
+            desired_anomaly,
+            leaf_indices,
+        )
 
         X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
         y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
@@ -674,6 +712,7 @@ def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
 
         print("\nPer-class adjustments:")
         adjustments = []
+        adjustments.append(("normal", original_normal, balanced_normal, balanced_normal - original_normal))
         for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
             before = int(original_class_counts[idx])
             after = int(balanced_class_counts[idx])
