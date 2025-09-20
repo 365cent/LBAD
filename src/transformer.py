@@ -1,5 +1,6 @@
 import argparse
 import pickle
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -708,6 +709,33 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
         y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
 
+        # Enforce uniform support across attack (leaf) classes
+        leaf_uniform_target: Optional[int] = None
+        if leaf_indices:
+            leaf_support = {}
+            for leaf_idx in leaf_indices:
+                if leaf_idx >= y_balanced.shape[1]:
+                    continue
+                positives = np.where(y_balanced[:, leaf_idx] == 1)[0]
+                if positives.size > 0:
+                    leaf_support[leaf_idx] = positives
+            if leaf_support:
+                target_leaf_support = max(len(indices) for indices in leaf_support.values())
+                leaf_uniform_target = target_leaf_support
+                extra_features: List[np.ndarray] = []
+                extra_targets: List[np.ndarray] = []
+                for leaf_idx, indices in leaf_support.items():
+                    deficit = target_leaf_support - len(indices)
+                    if deficit <= 0:
+                        continue
+                    replace = len(indices) < deficit
+                    sampled = rng.choice(indices, size=deficit, replace=replace)
+                    extra_features.append(X_balanced[sampled])
+                    extra_targets.append(y_balanced[sampled])
+                if extra_features:
+                    X_balanced = np.vstack([X_balanced] + extra_features).astype(np.float32)
+                    y_balanced = np.vstack([y_balanced] + extra_targets).astype(np.float32)
+
         balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
         balanced_anomaly = int(len(y_balanced) - balanced_normal)
         balanced_class_counts = class_counts(y_balanced)
@@ -717,6 +745,8 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  total samples: {len(y_balanced)}")
         print(f"  normal:  {balanced_normal} (target {desired_normal})")
         print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
+        if leaf_uniform_target is not None:
+            print(f"  leaf class target enforced: {leaf_uniform_target}")
 
         print("\nPer-class adjustments:")
         adjustments = []
@@ -896,7 +926,10 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
             attn = attn.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
+            autocast_ctx = (
+                torch.amp.autocast(device_type="cuda") if device.type == "cuda" else nullcontext()
+            )
+            with autocast_ctx:
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
 
                 feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
@@ -949,7 +982,9 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
                     attn = attn.to(device, non_blocking=True)
                     targets = targets.to(device, non_blocking=True)
                     use_cuda_amp = (device.type=="cuda")
-                    ctx = torch.cuda.amp.autocast(enabled=use_cuda_amp)
+                    ctx = (
+                        torch.amp.autocast(device_type="cuda") if use_cuda_amp else nullcontext()
+                    )
                     with ctx:
                         recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
                         feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
@@ -1042,11 +1077,12 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
             y_pred = all_preds[:, i]
 
             if y_true.sum() > 0:
-                prec, rec, f1, support = precision_recall_fscore_support(
+                prec, rec, f1, _ = precision_recall_fscore_support(
                     y_true, y_pred, average='binary', zero_division=0
                 )
                 class_metrics.append([prec, rec, f1])
-                print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {int(support):>10d}")
+                support = int(y_true.sum())
+                print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}")
     
     print("\n=== Overall Metrics ===")
 
@@ -1098,10 +1134,11 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
                 y_true = all_targets[:, i]
                 y_pred = all_preds[:, i]
                 if y_true.sum() > 0:
-                    prec, rec, f1, support = precision_recall_fscore_support(
+                    prec, rec, f1, _ = precision_recall_fscore_support(
                         y_true, y_pred, average='binary', zero_division=0
                     )
-                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {int(support):>10d}\n")
+                    support = int(y_true.sum())
+                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}\n")
         
         f.write(f"\nOverall Metrics:\n")
         f.write(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n")
