@@ -49,7 +49,8 @@ MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
 HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
 BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
-MAX_CLASS_TRAIN_FRACTION = 0.6   # Max proportion of a class allocated to training split
+MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
+TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
 
 
 @dataclass(frozen=True)
@@ -490,7 +491,7 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
-def smote_data(train_loader, val_loader, target_contamination: float = 0.2):
+def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2):
     """Generates a balanced training loader with controllable contamination ratio."""
 
     spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
@@ -821,7 +822,7 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
     return thresholds
 
 
-def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
+def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
     """Trains the transformer with reconstruction and hierarchy regularizers."""
     train = smote_data(train_loader, val_loader, target_contamination=TARGET_CONTAMINATION)
     if len(train) == 0:
@@ -936,56 +937,60 @@ def train_model(model, train_loader, val_loader, epochs=10, lambda_recon=0.05, l
 
             train_losses.append(total_loss.item())
         model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for cls_tokens, mean_pooling, max_pooling, attn, targets in val_loader:
-                cls_tokens = cls_tokens.to(device, non_blocking=True)
-                mean_pooling = mean_pooling.to(device, non_blocking=True)
-                max_pooling = max_pooling.to(device, non_blocking=True)
-                attn = attn.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-                # Use CUDA autocast only when CUDA; avoid triton/inductor path on CPU/MPS
-                use_cuda_amp = (device.type=="cuda")
-                ctx = torch.cuda.amp.autocast(enabled=use_cuda_amp)
-                with ctx:
-                    recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
-                    feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
-                    recon_loss = mse_loss(recon, feats)
-
-                    recon_loss = torch.clamp(recon_loss, 0, 100.0)
-
-                    if isinstance(outputs, dict):
-                        if outputs:
-                            logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
-                        else:
-                            # Fallback for empty outputs dict
-                            logits = torch.zeros(targets.size(0), len(label_names), device=device)
-                    else:
-                        logits = outputs
-
-                    logits = torch.clamp(logits, -10.0, 10.0)
-
-                    ml_loss = bce_loss(logits, targets)
-                    ml_loss = torch.clamp(ml_loss, 0, 100.0)
-
-                    hier_loss = model.hierarchy_consistency_loss(outputs)
-                    hier_loss = torch.clamp(hier_loss, 0, 10.0)
-
-                    total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
-
-                    val_losses.append(total_loss.item())
-
         avg_train_loss = float(np.mean(train_losses)) if train_losses else 0.0
-        avg_val_loss = float(np.mean(val_losses)) if val_losses else avg_train_loss
-        
-        # Progress checkpoints every 5% [[memory:4887036]]
+
+        if val_loader is not None and len(val_loader) > 0:
+            val_losses = []
+            with torch.no_grad():
+                for cls_tokens, mean_pooling, max_pooling, attn, targets in val_loader:
+                    cls_tokens = cls_tokens.to(device, non_blocking=True)
+                    mean_pooling = mean_pooling.to(device, non_blocking=True)
+                    max_pooling = max_pooling.to(device, non_blocking=True)
+                    attn = attn.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    use_cuda_amp = (device.type=="cuda")
+                    ctx = torch.cuda.amp.autocast(enabled=use_cuda_amp)
+                    with ctx:
+                        recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
+                        feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
+                        recon_loss = mse_loss(recon, feats)
+                        recon_loss = torch.clamp(recon_loss, 0, 100.0)
+
+                        if isinstance(outputs, dict):
+                            if outputs:
+                                logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                            else:
+                                logits = torch.zeros(targets.size(0), len(label_names), device=device)
+                        else:
+                            logits = outputs
+
+                        logits = torch.clamp(logits, -10.0, 10.0)
+
+                        ml_loss = bce_loss(logits, targets)
+                        ml_loss = torch.clamp(ml_loss, 0, 100.0)
+
+                        hier_loss = model.hierarchy_consistency_loss(outputs)
+                        hier_loss = torch.clamp(hier_loss, 0, 10.0)
+
+                        total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+
+                        val_losses.append(total_loss.item())
+
+            avg_val_loss = float(np.mean(val_losses)) if val_losses else avg_train_loss
+        else:
+            avg_val_loss = avg_train_loss
+
         if (epoch + 1) % max(1, epochs // 20) == 0:
-            spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
-        
+            if val_loader is not None and len(val_loader) > 0:
+                spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
+            else:
+                spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f}"
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
-    thresholds = calibrate_thresholds(model, val_loader)
+    calibration_loader = val_loader if val_loader is not None and len(val_loader) > 0 else train
+    thresholds = calibrate_thresholds(model, calibration_loader)
     if thresholds is not None:
         threshold_tensor = torch.from_numpy(thresholds).to(device)
         if hasattr(model, "decision_thresholds") and model.decision_thresholds.shape[0] == threshold_tensor.shape[0]:
@@ -1179,23 +1184,22 @@ def main():
             normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
             anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
 
-            def stratified_split(indices: torch.Tensor, train_ratio: float = 0.8, val_ratio: float = 0.1):
+            def stratified_split(indices: torch.Tensor, train_ratio: float = TRAIN_SPLIT_RATIO):
                 n = len(indices)
                 if n == 0:
                     empty = torch.tensor([], dtype=torch.long)
-                    return empty, empty, empty
+                    return empty, empty
 
-                n_train = int(train_ratio * n)
-                n_val = int(val_ratio * n)
-
-                n_train = max(1, min(n_train, n - 2)) if n > 2 else n_train
-                n_val = max(1, min(n_val, n - n_train - 1)) if n > n_train + 1 else n_val
+                n_train = int(round(train_ratio * n))
+                if n > 1:
+                    n_train = max(1, min(n_train, n - 1))
+                else:
+                    n_train = n
 
                 perm = torch.randperm(n)
                 train_split = indices[perm[:n_train]]
-                val_split = indices[perm[n_train:n_train + n_val]]
-                test_split = indices[perm[n_train + n_val:]]
-                return train_split, val_split, test_split
+                test_split = indices[perm[n_train:]] if n_train < n else torch.tensor([], dtype=torch.long)
+                return train_split, test_split
 
             def concat_indices(chunks: List[torch.Tensor]) -> torch.Tensor:
                 filtered = [chunk for chunk in chunks if len(chunk) > 0]
@@ -1203,21 +1207,19 @@ def main():
                     return torch.tensor([], dtype=torch.long)
                 return torch.cat(filtered)
 
-            normal_train, normal_val, normal_test = stratified_split(normal_idx)
+            normal_train, normal_test = stratified_split(normal_idx)
 
             if len(normal_train) == 0:
                 print("Insufficient normal samples for training; defaulting to all normal logs.")
                 normal_train = normal_idx
 
             if len(anomaly_idx) > 0:
-                base_normals = max(len(normal_train), 1)
-                ratio_denominator = max(1.0 - TARGET_CONTAMINATION, 1e-6)
-                contamination_target = int(math.ceil(base_normals * TARGET_CONTAMINATION / ratio_denominator))
-                desired_anomaly_train = max(
-                    min(len(anomaly_idx), MIN_TRAIN_ANOMALIES),
-                    contamination_target,
-                )
-                desired_anomaly_train = min(desired_anomaly_train, len(anomaly_idx))
+                anomaly_total = len(anomaly_idx)
+                anomaly_train_target = int(round(TRAIN_SPLIT_RATIO * anomaly_total))
+                if anomaly_total > 1:
+                    anomaly_train_target = max(1, min(anomaly_train_target, anomaly_total - 1))
+                else:
+                    anomaly_train_target = anomaly_total
 
                 anomaly_idx_np = anomaly_idx.cpu().numpy()
                 coverage_rng = np.random.default_rng(42)
@@ -1234,17 +1236,18 @@ def main():
                         if total_class == 0:
                             continue
                         max_fractional = int(total_class * MAX_CLASS_TRAIN_FRACTION)
-                        train_quota = min(total_class, max(1, min(MIN_CLASS_TRAIN_SAMPLES, max_fractional)))
+                        quota_target = int(round(TRAIN_SPLIT_RATIO * total_class))
+                        train_quota = min(total_class, max(1, min(quota_target, max_fractional)))
                         train_quota = min(train_quota, total_class)
                         sampled = coverage_rng.choice(class_anomalies, size=train_quota, replace=False)
                         coverage_set.update(int(x) for x in sampled)
 
                 coverage_indices = np.array(sorted(coverage_set), dtype=np.int64)
                 coverage_tensor = torch.from_numpy(coverage_indices).to(dtype=torch.long, device=anomaly_idx.device)
-                if coverage_tensor.numel() > desired_anomaly_train:
+                if coverage_tensor.numel() > anomaly_train_target:
                     perm = coverage_tensor[torch.randperm(coverage_tensor.numel())]
-                    anomaly_train = perm[:desired_anomaly_train]
-                    overflow = perm[desired_anomaly_train:]
+                    anomaly_train = perm[:anomaly_train_target]
+                    overflow = perm[anomaly_train_target:]
                     remaining_base = torch.from_numpy(
                         np.setdiff1d(anomaly_idx_np, anomaly_train.cpu().numpy(), assume_unique=False)
                     ).to(dtype=torch.long, device=anomaly_idx.device)
@@ -1254,44 +1257,28 @@ def main():
                     remaining_pool = torch.from_numpy(remaining_pool_np).to(dtype=torch.long, device=anomaly_idx.device)
                     if remaining_pool.numel() > 0:
                         remaining_pool = remaining_pool[torch.randperm(remaining_pool.numel())]
-                    additional_needed = max(0, desired_anomaly_train - coverage_tensor.numel())
+                    additional_needed = max(0, anomaly_train_target - coverage_tensor.numel())
                     additional = remaining_pool[:additional_needed]
                     anomaly_train = concat_indices([coverage_tensor, additional]) if additional.numel() else coverage_tensor
                     remaining_anomalies = remaining_pool[additional_needed:]
 
-                if len(remaining_anomalies) > 0:
-                    split_point = len(remaining_anomalies) // 2
-                    anomaly_val = remaining_anomalies[:split_point]
-                    anomaly_test = remaining_anomalies[split_point:]
-                else:
-                    anomaly_val = torch.tensor([], dtype=torch.long)
-                    anomaly_test = torch.tensor([], dtype=torch.long)
+                anomaly_test = remaining_anomalies
             else:
                 anomaly_train = torch.tensor([], dtype=torch.long)
-                anomaly_val = torch.tensor([], dtype=torch.long)
                 anomaly_test = torch.tensor([], dtype=torch.long)
 
             train_indices = concat_indices([normal_train, anomaly_train])
-            val_indices = concat_indices([normal_val, anomaly_val])
             test_indices = concat_indices([normal_test, anomaly_test])
 
             if len(train_indices) == 0:
                 raise ValueError("Dataset does not contain normal samples for unsupervised training.")
 
-            if len(val_indices) == 0 and len(train_indices) > 1:
-                val_indices = train_indices[: max(1, len(train_indices) // 10)]
-
-            if len(test_indices) == 0:
-                test_indices = normal_idx if len(normal_idx) > 0 else anomaly_idx
-
             train_set = torch.utils.data.Subset(dataset, train_indices)
-            val_set = torch.utils.data.Subset(dataset, val_indices)
-            test_set = torch.utils.data.Subset(dataset, test_indices)
+            test_set = torch.utils.data.Subset(dataset, test_indices if len(test_indices) > 0 else train_indices)
             train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-            val_loader   = DataLoader(val_set,   batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
             test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-            
-            print(f"Train: {len(train_set)}, Val: {len(val_set)}, Test: {len(test_set)}")
+
+            print(f"Train: {len(train_set)}, Test: {len(test_set)}")
 
             model = HierarchicalTransformer(hierarchy).to(device)
             if device.type == "cuda":
@@ -1300,7 +1287,7 @@ def main():
                     model = torch.compile(model, mode="max-autotune")
                 except Exception:
                     print("Triton not available or compile failed; using eager mode.")
-            model = train_model(model, train_loader, val_loader, epochs=10)
+            model = train_model(model, train_loader, val_loader=None, epochs=10)
 
             evaluate_model(model, test_loader, log_type, embedding_type)
 
