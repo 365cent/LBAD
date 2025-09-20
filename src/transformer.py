@@ -627,8 +627,21 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         # Compute desired normal/anomaly counts based on contamination rate and dataset size
         base_total = len(X_aug)
         desired_total = min(BALANCED_SAMPLE_TARGET, base_total)
-        desired_anomaly = max(1, int(round(desired_total * target_contamination)))
-        desired_normal = max(1, desired_total - desired_anomaly)
+
+        active_leaf_indices = [
+            idx for idx in leaf_indices if idx < y_aug.shape[1] and np.any(y_aug[:, idx] == 1)
+        ]
+
+        per_class_target = None
+        if active_leaf_indices:
+            total_classes = len(active_leaf_indices) + 1  # include normal class
+            per_class_target = max(1, desired_total // total_classes)
+            desired_total = per_class_target * total_classes
+            desired_normal = per_class_target
+            desired_anomaly = per_class_target * len(active_leaf_indices)
+        else:
+            desired_anomaly = max(1, int(round(desired_total * target_contamination)))
+            desired_normal = max(1, desired_total - desired_anomaly)
 
         def balance_anomalies(
             X_group: np.ndarray,
@@ -648,46 +661,53 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             ]
             if not active_classes:
                 active_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
-            else:
-                observed_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
-                for cls_idx in observed_classes:
-                    if cls_idx not in active_classes:
-                        active_classes.append(cls_idx)
 
             if not active_classes:
                 replace = len(X_group) < target_count
                 fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
                 return X_group[fallback_idx], Y_group[fallback_idx]
 
-            active_classes = list(dict.fromkeys(active_classes))  # preserve order, drop duplicates
+            active_classes = list(dict.fromkeys(active_classes))
+            per_class = target_count // len(active_classes)
+            remainder = target_count % len(active_classes)
 
-            per_class = max(1, int(math.ceil(target_count / len(active_classes))))
-            target_count = per_class * len(active_classes)
-            chosen_indices: List[int] = []
+            sampled_features: List[np.ndarray] = []
+            sampled_targets: List[np.ndarray] = []
 
-            for cls_idx in active_classes:
-                quota = per_class
+            for idx, cls_idx in enumerate(active_classes):
+                quota = per_class + (1 if idx < remainder else 0)
+                if quota <= 0:
+                    continue
                 indices = np.where(Y_group[:, cls_idx] == 1)[0]
                 if indices.size == 0:
                     continue
                 replace = indices.size < quota
                 sampled = rng.choice(indices, size=quota, replace=replace)
-                chosen_indices.extend(sampled.tolist())
+                sampled_features.append(X_group[sampled])
+                sampled_targets.append(Y_group[sampled])
 
-            if not chosen_indices:
+            if not sampled_features:
                 replace = len(X_group) < target_count
                 fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
                 return X_group[fallback_idx], Y_group[fallback_idx]
 
-            chosen_idx = np.asarray(chosen_indices, dtype=np.int64)
-            if chosen_idx.size > target_count:
-                chosen_idx = rng.choice(chosen_idx, size=target_count, replace=False)
-            elif chosen_idx.size < target_count:
-                deficit = target_count - chosen_idx.size
-                replenish = rng.choice(len(X_group), size=deficit, replace=True)
-                chosen_idx = np.concatenate([chosen_idx, replenish])
+            X_bal = np.vstack(sampled_features).astype(np.float32)
+            y_bal = np.vstack(sampled_targets).astype(np.float32)
 
-            return X_group[chosen_idx], Y_group[chosen_idx]
+            if len(X_bal) > target_count:
+                perm = rng.permutation(len(X_bal))[:target_count]
+                X_bal = X_bal[perm]
+                y_bal = y_bal[perm]
+            elif len(X_bal) < target_count:
+                deficit = target_count - len(X_bal)
+                replenish = rng.choice(len(X_group), size=deficit, replace=len(X_group) < deficit)
+                X_extra = X_group[replenish]
+                y_extra = Y_group[replenish]
+                X_bal = np.vstack([X_bal, X_extra]).astype(np.float32)
+                y_bal = np.vstack([y_bal, y_extra]).astype(np.float32)
+
+            perm = rng.permutation(len(X_bal))
+            return X_bal[perm], y_bal[perm]
 
         def adjust_normals(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
             if len(X_group) >= target_count:
@@ -709,33 +729,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
         y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
 
-        # Enforce uniform support across attack (leaf) classes
-        leaf_uniform_target: Optional[int] = None
-        if leaf_indices:
-            leaf_support = {}
-            for leaf_idx in leaf_indices:
-                if leaf_idx >= y_balanced.shape[1]:
-                    continue
-                positives = np.where(y_balanced[:, leaf_idx] == 1)[0]
-                if positives.size > 0:
-                    leaf_support[leaf_idx] = positives
-            if leaf_support:
-                target_leaf_support = max(len(indices) for indices in leaf_support.values())
-                leaf_uniform_target = target_leaf_support
-                extra_features: List[np.ndarray] = []
-                extra_targets: List[np.ndarray] = []
-                for leaf_idx, indices in leaf_support.items():
-                    deficit = target_leaf_support - len(indices)
-                    if deficit <= 0:
-                        continue
-                    replace = len(indices) < deficit
-                    sampled = rng.choice(indices, size=deficit, replace=replace)
-                    extra_features.append(X_balanced[sampled])
-                    extra_targets.append(y_balanced[sampled])
-                if extra_features:
-                    X_balanced = np.vstack([X_balanced] + extra_features).astype(np.float32)
-                    y_balanced = np.vstack([y_balanced] + extra_targets).astype(np.float32)
-
         balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
         balanced_anomaly = int(len(y_balanced) - balanced_normal)
         balanced_class_counts = class_counts(y_balanced)
@@ -745,9 +738,8 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  total samples: {len(y_balanced)}")
         print(f"  normal:  {balanced_normal} (target {desired_normal})")
         print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
-        if leaf_uniform_target is not None:
-            print(f"  leaf class target enforced: {leaf_uniform_target}")
-
+        if per_class_target is not None:
+            print(f"  per-class target (normal + leaves): {per_class_target}")
         print("\nPer-class adjustments:")
         adjustments = []
         adjustments.append(("normal", original_normal, balanced_normal, balanced_normal - original_normal))
