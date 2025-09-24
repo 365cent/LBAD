@@ -654,57 +654,52 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     (0, Y_group.shape[1]), dtype=np.float32
                 )
 
-            active_classes = [
-                cls_idx
-                for cls_idx in candidate_classes
-                if cls_idx < Y_group.shape[1] and np.any(Y_group[:, cls_idx] == 1)
-            ]
-            if not active_classes:
-                active_classes = [c for c in range(Y_group.shape[1]) if np.any(Y_group[:, c] == 1)]
+            # Collect only classes that actually have positive samples in the anomaly pool.
+            class_positive_indices: List[Tuple[int, np.ndarray]] = []
+            seen: set[int] = set()
+            for cls_idx in candidate_classes:
+                if cls_idx >= Y_group.shape[1] or cls_idx in seen:
+                    continue
+                seen.add(cls_idx)
+                positives = np.where(Y_group[:, cls_idx] == 1)[0]
+                if positives.size:
+                    class_positive_indices.append((cls_idx, positives))
 
-            if not active_classes:
-                replace = len(X_group) < target_count
-                fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
-                return X_group[fallback_idx], Y_group[fallback_idx]
+            if not class_positive_indices:
+                fallback = np.where(Y_group.sum(axis=1) > 0)[0]
+                if fallback.size == 0:
+                    return np.empty((0, X_group.shape[1]), dtype=np.float32), np.empty(
+                        (0, Y_group.shape[1]), dtype=np.float32
+                    )
+                take = min(target_count, fallback.size)
+                select = rng.choice(fallback, size=take, replace=fallback.size < take)
+                return X_group[select], Y_group[select]
 
-            active_classes = list(dict.fromkeys(active_classes))
-            per_class = target_count // len(active_classes)
-            remainder = target_count % len(active_classes)
+            per_class = max(1, math.ceil(target_count / len(class_positive_indices)))
+            adjusted_target = per_class * len(class_positive_indices)
 
             sampled_features: List[np.ndarray] = []
             sampled_targets: List[np.ndarray] = []
 
-            for idx, cls_idx in enumerate(active_classes):
-                quota = per_class + (1 if idx < remainder else 0)
-                if quota <= 0:
-                    continue
-                indices = np.where(Y_group[:, cls_idx] == 1)[0]
-                if indices.size == 0:
-                    continue
-                replace = indices.size < quota
-                sampled = rng.choice(indices, size=quota, replace=replace)
+            for cls_idx, positives in class_positive_indices:
+                quota = per_class
+                replace = positives.size < quota
+                sampled = rng.choice(positives, size=quota, replace=replace)
                 sampled_features.append(X_group[sampled])
                 sampled_targets.append(Y_group[sampled])
-
-            if not sampled_features:
-                replace = len(X_group) < target_count
-                fallback_idx = rng.choice(len(X_group), size=target_count, replace=replace)
-                return X_group[fallback_idx], Y_group[fallback_idx]
 
             X_bal = np.vstack(sampled_features).astype(np.float32)
             y_bal = np.vstack(sampled_targets).astype(np.float32)
 
-            if len(X_bal) > target_count:
-                perm = rng.permutation(len(X_bal))[:target_count]
+            if len(X_bal) > adjusted_target:
+                perm = rng.permutation(len(X_bal))[:adjusted_target]
                 X_bal = X_bal[perm]
                 y_bal = y_bal[perm]
-            elif len(X_bal) < target_count:
-                deficit = target_count - len(X_bal)
-                replenish = rng.choice(len(X_group), size=deficit, replace=len(X_group) < deficit)
-                X_extra = X_group[replenish]
-                y_extra = Y_group[replenish]
-                X_bal = np.vstack([X_bal, X_extra]).astype(np.float32)
-                y_bal = np.vstack([y_bal, y_extra]).astype(np.float32)
+            elif len(X_bal) < adjusted_target:
+                deficit = adjusted_target - len(X_bal)
+                replen_idx = rng.choice(len(X_group), size=deficit, replace=len(X_group) < deficit)
+                X_bal = np.vstack([X_bal, X_group[replen_idx]]).astype(np.float32)
+                y_bal = np.vstack([y_bal, Y_group[replen_idx]]).astype(np.float32)
 
             perm = rng.permutation(len(X_bal))
             return X_bal[perm], y_bal[perm]
@@ -725,6 +720,12 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             desired_anomaly,
             leaf_indices,
         )
+
+        # Align reported targets with achieved class sizes to make balance explicit
+        desired_normal = X_normals_bal.shape[0]
+        desired_anomaly = X_anomalies_bal.shape[0]
+        if per_class_target is not None:
+            per_class_target = desired_normal
 
         X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
         y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
