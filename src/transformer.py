@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, TensorDataset, Sampler
+from torch.utils.data import DataLoader, TensorDataset, Sampler, Subset
 
 warnings.filterwarnings(
     "ignore",
@@ -580,19 +580,24 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
     try:
         dataset = getattr(train_loader, "dataset", None)
-        if not isinstance(dataset, TensorDataset) or len(dataset.tensors) < 5:
+        subset_indices: Optional[np.ndarray] = None
+        base_dataset = dataset
+        if isinstance(dataset, Subset):
+            base_dataset = dataset.dataset
+            subset_indices = np.asarray(dataset.indices, dtype=np.int64)
+
+        if not isinstance(base_dataset, TensorDataset) or len(base_dataset.tensors) < 5:
             spinner.stop_and_persist(text="Streaming resampler requires TensorDataset with targets; using original loader")
             return train_loader
 
-        cls_tensor, mean_tensor, maxp_tensor, attn_tensor, y_tensor = dataset.tensors[:5]
-        tensors = []
-        for tensor in (cls_tensor, mean_tensor, maxp_tensor, attn_tensor, y_tensor):
-            if isinstance(tensor, torch.Tensor):
-                tensors.append(tensor.detach().cpu())
-            else:
-                tensors.append(torch.as_tensor(tensor))
-        _, _, _, _, y_tensor = tensors
-        y = y_tensor.numpy().astype(np.float32)
+        label_tensor = base_dataset.tensors[4]
+        if not isinstance(label_tensor, torch.Tensor):
+            label_tensor = torch.as_tensor(label_tensor)
+        label_tensor = label_tensor.detach().cpu()
+        if subset_indices is not None:
+            label_tensor = label_tensor[subset_indices]
+
+        y = label_tensor.numpy().astype(np.float32)
         if int(y.sum()) == 0:
             spinner.stop_and_persist(text="Skipping resampling (only normal samples detected)")
             return train_loader
