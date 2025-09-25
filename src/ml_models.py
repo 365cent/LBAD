@@ -279,13 +279,13 @@ def _build_models(config: BaselineConfig) -> Dict[str, object]:
             max_iter=500,
             tol=1e-3,
             C=1.0,
-            n_jobs=-1,
+            n_jobs=1,
             random_state=config.random_state,
         )
         models["logistic_regression"] = Pipeline(
             steps=[
                 ("scale", StandardScaler()),
-                ("clf", MultiOutputClassifier(logistic, n_jobs=-1)),
+                ("clf", MultiOutputClassifier(logistic, n_jobs=1)),
             ]
         )
 
