@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import math
+import warnings
 
 import halo
 import numpy as np
@@ -14,6 +15,12 @@ import torch.nn as nn
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset, Sampler
+
+warnings.filterwarnings(
+    "ignore",
+    message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
+    category=UserWarning,
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -572,18 +579,24 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     yield int(indices[idx])
 
     try:
-        # Collate tensors from the original loader
-        collected = [[], [], [], [], []]
-        for batch in train_loader:
-            for idx, tensor in enumerate(batch):
-                collected[idx].append(tensor.detach().cpu().numpy())
+        dataset = getattr(train_loader, "dataset", None)
+        if not isinstance(dataset, TensorDataset) or len(dataset.tensors) < 5:
+            spinner.stop_and_persist(text="Streaming resampler requires TensorDataset with targets; using original loader")
+            return train_loader
 
-        cls, mean, maxp, attn, y = [np.vstack(items).astype(np.float32) for items in collected]
+        cls_tensor, mean_tensor, maxp_tensor, attn_tensor, y_tensor = dataset.tensors[:5]
+        tensors = []
+        for tensor in (cls_tensor, mean_tensor, maxp_tensor, attn_tensor, y_tensor):
+            if isinstance(tensor, torch.Tensor):
+                tensors.append(tensor.detach().cpu())
+            else:
+                tensors.append(torch.as_tensor(tensor))
+        _, _, _, _, y_tensor = tensors
+        y = y_tensor.numpy().astype(np.float32)
         if int(y.sum()) == 0:
             spinner.stop_and_persist(text="Skipping resampling (only normal samples detected)")
             return train_loader
 
-        X = np.hstack([cls, mean, maxp, attn]).astype(np.float32)
         node_names = list(flatten_hierarchy(hierarchy))
         if len(node_names) < y.shape[1]:
             node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
@@ -598,112 +611,10 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         if not leaf_indices:
             leaf_indices = list(range(y.shape[1]))
 
-        rng = np.random.default_rng(42)
-
-        def replicate_with_noise(base: np.ndarray, count: int, noise_scale: float = 0.01) -> np.ndarray:
-            if count <= 0 or base.size == 0:
-                return np.empty((0, base.shape[1]), dtype=np.float32)
-            idx = rng.choice(len(base), size=count, replace=True)
-            samples = base[idx].copy()
-            std = np.std(base, axis=0, keepdims=True)
-            std[std < 1e-6] = 1.0
-            noise = rng.normal(0.0, noise_scale, size=samples.shape).astype(np.float32)
-            return samples + noise * std.astype(np.float32)
-
-        def split_features(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-            c1 = cls.shape[1]
-            c2 = c1 + mean.shape[1]
-            c3 = c2 + maxp.shape[1]
-            return (
-                matrix[:, :c1],
-                matrix[:, c1:c2],
-                matrix[:, c2:c3],
-                matrix[:, c3:],
-            )
-
-        def class_counts(labels: np.ndarray) -> np.ndarray:
-            return labels.sum(axis=0)
-
-        original_normal = int((y.sum(axis=1) == 0).sum())
-        original_anomaly = int(len(y) - original_normal)
-        original_class_counts = class_counts(y)
-
-        # Targeted synthetic samples per class for rare attacks
-        synthetic_features: List[np.ndarray] = []
-        synthetic_targets: List[np.ndarray] = []
-        adaptive_threshold = int(0.05 * len(y)) if len(y) > 0 else RARE_CLASS_THRESHOLD
-        rare_threshold = max(MIN_SYNTHETIC_TARGET, min(RARE_CLASS_THRESHOLD, adaptive_threshold))
-
-        global_std = np.std(X, axis=0, keepdims=True)
-        global_std[global_std < 1e-6] = 1.0
-        global_std = global_std.astype(np.float32)
-
-        for c in range(y.shape[1]):
-            pos_idx = np.where(y[:, c] == 1)[0]
-            pos_count = pos_idx.size
-            if pos_count == 0 or pos_count > rare_threshold:
-                continue
-
-            if pos_count < 2:
-                continue
-
-            target_cap = min(
-                max(pos_count + MIN_SYNTHETIC_TARGET, int(pos_count * MAX_SYNTHETIC_MULTIPLIER)),
-                rare_threshold,
-            )
-            synth_needed = max(0, target_cap - pos_count)
-            if synth_needed == 0:
-                continue
-
-            pair_idx = rng.choice(pos_idx, size=(synth_needed, 2), replace=True)
-            base_a = X[pair_idx[:, 0]]
-            base_b = X[pair_idx[:, 1]]
-            lam = rng.random(synth_needed, dtype=np.float32)[:, None]
-
-            class_std = np.std(X[pos_idx], axis=0, keepdims=True)
-            class_std = np.where(class_std < 1e-6, global_std, class_std).astype(np.float32)
-            noise = rng.normal(0.0, 1.0, size=base_a.shape).astype(np.float32)
-            noise *= class_std
-            noise *= 0.02
-            X_new = base_a + lam * (base_b - base_a) + noise
-
-            Y_new = np.maximum(y[pair_idx[:, 0]], y[pair_idx[:, 1]]).astype(np.float32)
-
-            synthetic_features.append(X_new)
-            synthetic_targets.append(Y_new)
-
-            node_name = node_names[c] if c < len(node_names) else None
-            parent_name = parent_lookup.get(node_name) if node_name else None
-            if parent_name and parent_name in node_to_index:
-                parent_idx = node_to_index[parent_name]
-                parent_only = np.where((y[:, parent_idx] == 1) & (y[:, c] == 0))[0]
-                if parent_only.size > 0:
-                    neg_quota = min(parent_only.size, int(synth_needed * HARD_NEGATIVE_MULTIPLIER))
-                    if neg_quota > 0:
-                        neg_idx = rng.choice(parent_only, size=neg_quota, replace=False)
-                        synthetic_features.append(X[neg_idx])
-                        synthetic_targets.append(y[neg_idx].astype(np.float32))
-
-        if synthetic_features:
-            X_aug = np.vstack([X] + synthetic_features).astype(np.float32)
-            y_aug = np.vstack([y] + synthetic_targets).astype(np.float32)
-            cls_aug, mean_aug, maxp_aug, attn_aug = split_features(X_aug)
-        else:
-            cls_aug, mean_aug, maxp_aug, attn_aug = cls, mean, maxp, attn
-            y_aug = y
-
-        normal_mask = y_aug.sum(axis=1) == 0
-        anomaly_mask = ~normal_mask
-        normal_indices = np.where(normal_mask)[0]
-
-        active_leaf_indices = [
-            idx for idx in leaf_indices if idx < y_aug.shape[1] and np.any(y_aug[:, idx] == 1)
-        ]
-
         idx_to_name = {
             node_to_index[name]: name
             for name in node_names
-            if name in node_to_index and node_to_index[name] < y_aug.shape[1]
+            if name in node_to_index and node_to_index[name] < y.shape[1]
         }
 
         index_children: Dict[int, List[int]] = {}
@@ -714,84 +625,88 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             parent_idx = node_to_index.get(parent_name)
             if child_idx is None or parent_idx is None:
                 continue
-            if child_idx >= y_aug.shape[1] or parent_idx >= y_aug.shape[1]:
+            if child_idx >= y.shape[1] or parent_idx >= y.shape[1]:
                 continue
             index_children.setdefault(parent_idx, []).append(child_idx)
+
+        def class_counts(labels: np.ndarray) -> np.ndarray:
+            return labels.sum(axis=0)
+
+        original_normal = int((y.sum(axis=1) == 0).sum())
+        original_anomaly = int(len(y) - original_normal)
+        original_class_counts = class_counts(y)
+
+        normal_mask = y.sum(axis=1) == 0
+        anomaly_mask = ~normal_mask
+        normal_indices = np.where(normal_mask)[0]
 
         leaf_targets: Dict[int, int] = {}
         parent_targets: Dict[int, int] = {}
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
-        desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y_aug)
+        desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y)
         contamination = float(np.clip(TARGET_CONTAMINATION, 0.0, 0.999999))
         normal_target = int(round(desired_total * (1.0 - contamination))) if contamination < 1.0 else 0
         normal_target = max(0, normal_target)
 
         if normal_indices.size == 0:
-            if normal_target > 0:
-                print(
-                    "Warning: Contamination target requests normal samples but none are available; reallocating to attacks"
-                )
             normal_target = 0
         elif normal_target > 0:
             normal_target = max(1, normal_target)
             class_indices["normal"] = normal_indices
             class_targets["normal"] = normal_target
 
-        desired_anomaly_budget = max(0, desired_total - normal_target)
+        desired_anomaly_budget = max(1, desired_total - normal_target)
 
-        per_class_target = None
-        desired_anomaly_target = None
+        active_leaf_indices = [
+            idx for idx in leaf_indices if idx < y.shape[1] and np.any(y[:, idx] == 1)
+        ]
+        leaf_positive_map: Dict[int, np.ndarray] = {}
+        for leaf_idx in active_leaf_indices:
+            positives = np.where(y[:, leaf_idx] == 1)[0]
+            if positives.size:
+                leaf_positive_map[leaf_idx] = positives
 
-        if active_leaf_indices:
-            leaf_positive_map: Dict[int, np.ndarray] = {}
-            for leaf_idx in active_leaf_indices:
-                positives = np.where(y_aug[:, leaf_idx] == 1)[0]
-                if positives.size:
-                    leaf_positive_map[leaf_idx] = positives
-                else:
-                    print(
-                        f"Warning: Leaf '{idx_to_name.get(leaf_idx, leaf_idx)}' has no positive samples; skipping"
-                    )
+        parent_candidate_map: Dict[int, np.ndarray] = {}
+        for parent_idx, children in index_children.items():
+            if parent_idx >= y.shape[1]:
+                continue
+            parent_mask = y[:, parent_idx] == 1
+            child_candidates = [child for child in children if child < y.shape[1]]
+            if child_candidates:
+                parent_mask = np.logical_and(parent_mask, (y[:, child_candidates].sum(axis=1) == 0))
+            candidates = np.where(parent_mask)[0]
+            if candidates.size:
+                parent_candidate_map[parent_idx] = candidates
+            else:
+                fallback_parent = np.where(y[:, parent_idx] == 1)[0]
+                if fallback_parent.size:
+                    parent_candidate_map[parent_idx] = fallback_parent
 
-            leaf_count = len(leaf_positive_map)
-            parent_candidate_map: Dict[int, np.ndarray] = {}
-            for parent_idx, children in index_children.items():
-                if parent_idx >= y_aug.shape[1]:
-                    continue
-                parent_mask = y_aug[:, parent_idx] == 1
-                child_candidates = [child for child in children if child < y_aug.shape[1]]
-                if child_candidates:
-                    parent_mask = np.logical_and(
-                        parent_mask, (y_aug[:, child_candidates].sum(axis=1) == 0)
-                    )
-                candidates = np.where(parent_mask)[0]
-                if candidates.size:
-                    parent_candidate_map[parent_idx] = candidates
-                else:
-                    fallback_parent = np.where(y_aug[:, parent_idx] == 1)[0]
-                    if fallback_parent.size:
-                        parent_candidate_map[parent_idx] = fallback_parent
+        leaf_count = len(leaf_positive_map)
+        parent_count = len(parent_candidate_map) if PARENT_EXTRA_FRACTION > 0 else 0
 
-            parent_count = len(parent_candidate_map)
-
-            attack_target_total = max(1, desired_anomaly_budget)
-            attack_target_total = max(attack_target_total, leaf_count)
-            if PARENT_EXTRA_FRACTION > 0 and parent_count > 0:
-                attack_target_total = max(attack_target_total, leaf_count + parent_count)
-
+        if leaf_count == 0 and parent_count == 0:
+            attack_indices = np.where(anomaly_mask)[0]
+            if attack_indices.size == 0:
+                spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
+                return train_loader
+            class_indices["attack"] = attack_indices
+            class_targets["attack"] = desired_anomaly_budget
+            per_class_target = None
+            desired_anomaly_target = desired_anomaly_budget
+        else:
             effective_classes = leaf_count + parent_count * PARENT_EXTRA_FRACTION
-
             if effective_classes <= 0:
-                leaf_target = attack_target_total
+                leaf_target = desired_anomaly_budget
                 parent_target = 0
             else:
-                leaf_target = max(1, int(attack_target_total / max(effective_classes, 1e-6)))
+                leaf_target = max(1, int(desired_anomaly_budget / max(effective_classes, 1e-6)))
                 while leaf_target > 0:
                     parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
                     allocated = leaf_target * leaf_count + parent_target * parent_count
-                    if allocated <= attack_target_total:
+                    if allocated <= desired_anomaly_budget:
                         break
                     leaf_target -= 1
                 if leaf_target == 0:
@@ -800,12 +715,10 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 allocated = leaf_target * leaf_count + parent_target * parent_count
 
             leaf_targets = {idx: leaf_target for idx in leaf_positive_map.keys()}
-            parent_targets = {
-                idx: parent_target for idx in parent_candidate_map.keys() if parent_target > 0
-            }
+            parent_targets = {idx: parent_target for idx in parent_candidate_map.keys() if parent_target > 0}
 
             allocated = leaf_target * leaf_count + parent_target * parent_count
-            remainder = attack_target_total - allocated
+            remainder = desired_anomaly_budget - allocated
 
             if remainder > 0 and leaf_targets:
                 leaf_keys = list(leaf_targets.keys())
@@ -815,7 +728,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     leaf_targets[leaf_idx] += 1
                     remainder -= 1
                     idx_cycle += 1
-
             if remainder > 0 and parent_targets:
                 parent_keys = list(parent_targets.keys())
                 idx_cycle = 0
@@ -824,6 +736,9 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     parent_targets[parent_idx] += 1
                     remainder -= 1
                     idx_cycle += 1
+
+            per_class_target = leaf_target if leaf_count > 0 else None
+            desired_anomaly_target = desired_anomaly_budget
 
             for leaf_idx, target in leaf_targets.items():
                 positives = leaf_positive_map.get(leaf_idx)
@@ -841,39 +756,20 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 class_indices[key] = candidates
                 class_targets[key] = int(target)
 
-            if class_targets:
-                per_class_target = leaf_target if leaf_targets else None
-                desired_anomaly_target = sum(
-                    count for key, count in class_targets.items() if not key.startswith("normal")
-                )
-        else:
-            desired_anomaly_target = max(1, desired_anomaly_budget) if desired_anomaly_budget else int(anomaly_mask.sum())
-
-        if desired_anomaly_target is None:
-            desired_anomaly_target = max(0, desired_anomaly_budget)
-
         total_targets = sum(class_targets.values())
         if total_targets == 0:
             spinner.stop_and_persist(text="Resampling skipped (no class targets computed)")
             return train_loader
-
-        dataset = TensorDataset(
-            torch.from_numpy(cls_aug).float(),
-            torch.from_numpy(mean_aug).float(),
-            torch.from_numpy(maxp_aug).float(),
-            torch.from_numpy(attn_aug).float(),
-            torch.from_numpy(y_aug).float(),
-        )
 
         batch_size = getattr(train_loader, "batch_size", 128)
         sampler = BalancedBatchSampler(class_indices, class_targets, batch_size=batch_size, seed=42)
 
         print("\nStreaming class targets (per epoch):")
         print(f"  total target samples: {total_targets}")
-        normal_target = class_targets.get("normal", 0)
-        attack_target = total_targets - normal_target
-        print(f"  normal target: {normal_target}")
-        print(f"  attack target: {attack_target}")
+        normal_target_display = class_targets.get("normal", 0)
+        attack_target_display = total_targets - normal_target_display
+        print(f"  normal target: {normal_target_display}")
+        print(f"  attack target: {attack_target_display}")
         if per_class_target is not None:
             print(f"  per-leaf target: {per_class_target}")
         if parent_targets:
@@ -885,7 +781,7 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         print("\nPer-class targets vs originals:")
         adjustments = []
-        adjustments.append(("normal", original_normal, normal_target, normal_target - original_normal))
+        adjustments.append(("normal", original_normal, normal_target_display, normal_target_display - original_normal))
         for leaf_idx, target in leaf_targets.items():
             name = idx_to_name.get(leaf_idx, str(leaf_idx))
             before = int(original_class_counts[leaf_idx])
@@ -894,6 +790,9 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             name = idx_to_name.get(parent_idx, str(parent_idx))
             before = int(original_class_counts[parent_idx])
             adjustments.append((name, before, target, target - before))
+        if "attack" in class_targets:
+            before = int(anomaly_mask.sum())
+            adjustments.append(("attack", before, class_targets["attack"], class_targets["attack"] - before))
 
         adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
         for name, before, after, delta in adjustments:
@@ -903,14 +802,19 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         spin_msg = "Streaming resampler ready"
         spinner.stop_and_persist(text=spin_msg)
 
-        return DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=8,
-            pin_memory=(device.type == "cuda"),
-            persistent_workers=True,
-            prefetch_factor=4,
-        )
+        loader_kwargs = {
+            "batch_sampler": sampler,
+            "num_workers": getattr(train_loader, "num_workers", 0),
+            "pin_memory": getattr(train_loader, "pin_memory", device.type == "cuda"),
+        }
+        if loader_kwargs["num_workers"] > 0:
+            loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", True)
+            loader_kwargs["prefetch_factor"] = getattr(train_loader, "prefetch_factor", 2)
+        collate_fn = getattr(train_loader, "collate_fn", None)
+        if collate_fn is not None:
+            loader_kwargs["collate_fn"] = collate_fn
+
+        return DataLoader(dataset, **loader_kwargs)
 
     except Exception as exc:  # pylint: disable=broad-except
         print(f"Resampling failed: {exc}")
