@@ -727,8 +727,38 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         if per_class_target is not None:
             per_class_target = desired_normal
 
-        X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
-        y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
+        def explode_leaf_labels(X_group: np.ndarray, Y_group: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            samples: List[np.ndarray] = []
+            labels: List[np.ndarray] = []
+            positive = Y_group.sum(axis=1) > 0
+            if not np.any(positive):
+                return X_group, Y_group
+
+            active = [idx for idx in leaf_indices if idx < Y_group.shape[1]]
+            if not active:
+                return X_group, Y_group
+
+            for leaf_idx in active:
+                leaf_rows = np.where(Y_group[:, leaf_idx] == 1)[0]
+                if leaf_rows.size == 0:
+                    continue
+                leaf_features = X_group[leaf_rows]
+                leaf_targets = np.zeros((leaf_rows.size, Y_group.shape[1]), dtype=np.float32)
+                leaf_targets[:, leaf_idx] = 1.0
+                samples.append(leaf_features)
+                labels.append(leaf_targets)
+
+            if not samples:
+                return X_group, Y_group
+
+            exploded_X = np.vstack(samples).astype(np.float32)
+            exploded_y = np.vstack(labels).astype(np.float32)
+            return exploded_X, exploded_y
+
+        expl_X, expl_y = explode_leaf_labels(X_anomalies_bal, Y_anomalies_bal)
+
+        X_balanced = np.vstack([X_normals_bal, expl_X]).astype(np.float32)
+        y_balanced = np.vstack([Y_normals_bal, expl_y]).astype(np.float32)
 
         balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
         balanced_anomaly = int(len(y_balanced) - balanced_normal)
