@@ -757,6 +757,27 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             trend = "++" if delta > 0 else "--" if delta < 0 else "=="
             print(f"  {name:<25} {after:>6} ({trend} {delta:+d})")
 
+        # Fractional view: share each anomaly across its active labels to reveal effective per-class counts
+        positives_per_row = y_balanced.sum(axis=1)
+        attack_mask = positives_per_row > 0
+        if np.any(attack_mask):
+            denom = positives_per_row[attack_mask, None]
+            weights = np.divide(
+                y_balanced[attack_mask],
+                denom,
+                out=np.zeros_like(y_balanced[attack_mask]),
+                where=denom > 0,
+            )
+            weighted_counts = weights.sum(axis=0)
+            avg_cardinality = float(positives_per_row[attack_mask].mean())
+            print("\nWeighted attack contributions (fractional per label):")
+            for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
+                value = weighted_counts[idx]
+                if value > 0:
+                    print(f"  {name:<25} {value:8.1f}")
+            print(f"  normal                    {balanced_normal:8.1f}")
+            print(f"  mean labels per anomaly: {avg_cardinality:.3f}")
+
         cls_bal, mean_bal, maxp_bal, attn_bal = split_features(X_balanced)
         dataset = TensorDataset(
             torch.from_numpy(cls_bal).float(),
