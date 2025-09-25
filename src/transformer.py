@@ -52,7 +52,7 @@ BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
 MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
 TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
-PARENT_EXTRA_FRACTION = 0.25     # Additional parent-only quota relative to leaf share
+PARENT_EXTRA_FRACTION = 1.0      # Additional parent-only quota relative to leaf share
 
 
 @dataclass(frozen=True)
@@ -759,11 +759,11 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         leaf_target = 0
         if desired_anomaly_budget > 0 and leaf_count > 0:
-            effective_classes = leaf_count + PARENT_EXTRA_FRACTION * parent_count
+            effective_classes = leaf_count + parent_count
             if effective_classes > 0:
-                leaf_target = max(1, int(math.floor(desired_anomaly_budget / effective_classes)))
+                leaf_target = max(1, desired_anomaly_budget // effective_classes)
             else:
-                leaf_target = desired_anomaly_budget // max(1, leaf_count)
+                leaf_target = max(1, desired_anomaly_budget // leaf_count)
 
             if leaf_target > 0:
                 while leaf_target > 0:
@@ -808,7 +808,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             leaf_blocks: List[np.ndarray] = []
             leaf_label_blocks: List[np.ndarray] = []
             leaf_positive_map: Dict[int, np.ndarray] = {}
-            leaf_realized: Dict[int, int] = {}
             unsatisfied_leaf_quota = 0
             for leaf_idx in active_leaves:
                 positives = np.where(Y_anomalies_bal[:, leaf_idx] == 1)[0]
@@ -827,7 +826,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 sampled = rng.choice(positives, size=quota, replace=replace)
                 leaf_blocks.append(X_anomalies_bal[sampled])
                 leaf_label_blocks.append(Y_anomalies_bal[sampled])
-                leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + quota
 
             if unsatisfied_leaf_quota > 0 and leaf_positive_map:
                 alloc_leaves = list(leaf_positive_map.keys())
@@ -838,7 +836,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     sampled = rng.choice(positives, size=1, replace=False)
                     leaf_blocks.append(X_anomalies_bal[sampled])
                     leaf_label_blocks.append(Y_anomalies_bal[sampled])
-                    leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + 1
                     unsatisfied_leaf_quota -= 1
                     idx_cycle += 1
 
@@ -879,7 +876,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     sampled = rng.choice(positives, size=1, replace=False)
                     leaf_blocks.append(X_anomalies_bal[sampled])
                     leaf_label_blocks.append(Y_anomalies_bal[sampled])
-                    leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + 1
                     redistributed -= 1
                     idx_cycle += 1
 
@@ -928,27 +924,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         for name, before, after, delta in adjustments:
             trend = "++" if delta > 0 else "--" if delta < 0 else "=="
             print(f"  {name:<25} {after:>6} ({trend} {delta:+d})")
-
-        # Fractional view: share each anomaly across its active labels to reveal effective per-class counts
-        positives_per_row = y_balanced.sum(axis=1)
-        attack_mask = positives_per_row > 0
-        if np.any(attack_mask):
-            denom = positives_per_row[attack_mask, None]
-            weights = np.divide(
-                y_balanced[attack_mask],
-                denom,
-                out=np.zeros_like(y_balanced[attack_mask]),
-                where=denom > 0,
-            )
-            weighted_counts = weights.sum(axis=0)
-            avg_cardinality = float(positives_per_row[attack_mask].mean())
-            print("\nWeighted attack contributions (fractional per label):")
-            for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
-                value = weighted_counts[idx]
-                if value > 0:
-                    print(f"  {name:<25} {value:8.1f}")
-            print(f"  normal                    {balanced_normal:8.1f}")
-            print(f"  mean labels per anomaly: {avg_cardinality:.3f}")
 
         cls_bal, mean_bal, maxp_bal, attn_bal = split_features(X_balanced)
         dataset = TensorDataset(
