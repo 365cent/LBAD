@@ -760,14 +760,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     fallback_parent = np.where(y_aug[:, parent_idx] == 1)[0]
                     if fallback_parent.size:
                         parent_candidate_map[parent_idx] = fallback_parent
-                        if PARENT_EXTRA_FRACTION > 0:
-                            print(
-                                f"Info: Using shared child samples to satisfy parent quota for {idx_to_name.get(parent_idx, parent_idx)}"
-                            )
-                    elif PARENT_EXTRA_FRACTION > 0:
-                        print(
-                            f"Warning: Parent '{idx_to_name.get(parent_idx, parent_idx)}' lacks samples; skipping parent quota"
-                        )
 
             parent_count = len(parent_candidate_map)
 
