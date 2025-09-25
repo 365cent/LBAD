@@ -1,37 +1,22 @@
 #!/usr/bin/env python3
-"""Classical multi-label baselines for log analysis.
-
-This module provides lightweight, high-performance baselines that mirror the
-data handling used by the transformer pipeline. It supports training and
-evaluating multiple traditional ML models on pre-computed embeddings with
-hierarchy-aware SMOTE-style augmentation to improve rare-class recall and
-precision.
-"""
+"""Lightweight classical baselines aligned with the transformer evaluation pipeline."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    f1_score,
-    hamming_loss,
-    jaccard_score,
-    precision_score,
-    recall_score,
-)
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from sklearn.model_selection import train_test_split
-from sklearn.multioutput import MultiOutputClassifier
+from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -44,93 +29,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 
 ###############################################################################
-# Hierarchy definition and helper utilities
-###############################################################################
-
-hierarchy: Mapping[str, Mapping[str, Sequence[str]]] = {
-    "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
-    "escalate": {
-        "escalated_command": ["escalated_sudo_session"],
-        "attacker_change_user": [],
-        "reverse_shell": [],
-    },
-    "attacker_vpn": {},
-    "dnsteal": {
-        "dnsteal-received": [],
-        "dnsteal-dropped": [],
-        "exfiltration-service": [],
-    },
-}
-
-
-@dataclass(frozen=True)
-class BaselineConfig:
-    """Configuration for classical baselines."""
-
-    contamination: float = 0.2
-    min_train_anomalies: int = 512
-    rare_class_threshold: int = 512
-    min_synthetic_target: int = 64
-    max_synthetic_multiplier: float = 2.0
-    hard_negative_multiplier: float = 1.5
-    test_ratio: float = 0.15
-    val_ratio: float = 0.15
-    random_state: int = 42
-    include_logistic: bool = True
-    include_random_forest: bool = True
-    include_xgb: bool = True
-    n_estimators: int = 200
-    max_depth: Optional[int] = None
-    xgb_learning_rate: float = 0.1
-    xgb_estimators: int = 200
-    report_top_k: int = 15
-
-
-@dataclass
-class DatasetBundle:
-    """Container for dataset splits and metadata."""
-
-    X_train: np.ndarray
-    y_train: np.ndarray
-    X_val: np.ndarray
-    y_val: np.ndarray
-    X_test: np.ndarray
-    y_test: np.ndarray
-    label_names: List[str]
-    smote_summary: Dict[str, Dict[str, float]]
-
-
-@dataclass
-class ModelMetrics:
-    """Evaluation metrics for a baseline model."""
-
-    model_name: str
-    micro_f1: float
-    macro_f1: float
-    weighted_f1: float
-    micro_precision: float
-    micro_recall: float
-    macro_precision: float
-    macro_recall: float
-    subset_accuracy: float
-    jaccard_micro: float
-    jaccard_macro: float
-    hamming: float
-    report: str
-
-
-@dataclass
-class RunSummary:
-    """Summary of a full baseline run for a log type and embedding."""
-
-    log_type: str
-    embedding_type: str
-    metrics: List[ModelMetrics] = field(default_factory=list)
-    dataset_stats: Dict[str, float] = field(default_factory=dict)
-
-
-###############################################################################
-# Embedding loading utilities (mirrors transformer.py)
+# Embedding loading utilities (reused by the transformer pipeline)
 ###############################################################################
 
 
@@ -259,241 +158,107 @@ def load_logbert_embeddings(target_log_type: Optional[str] = None):
 
 
 ###############################################################################
-# Dataset preparation
+# Dataset preparation (no hierarchy, SMOTE, or contamination adjustments)
 ###############################################################################
 
 
-def flatten_hierarchy(tree: Mapping[str, Mapping[str, Sequence[str]]]):
-    """Flattens the hierarchy into a generator of node names."""
+@dataclass(frozen=True)
+class BaselineConfig:
+    """Configuration for classical baselines."""
 
-    for node, children in tree.items():
-        yield node
-        if isinstance(children, Mapping):
-            for child, leaves in children.items():
-                yield child
-                for leaf in leaves:
-                    yield leaf
-
-
-def create_multilabel_targets(label_dict: Mapping[str, np.ndarray]) -> Optional[np.ndarray]:
-    """Aligns label vectors with the flattened hierarchy."""
-
-    vectors = label_dict.get("vectors")
-    if vectors is None:
-        return None
-
-    node_list = list(flatten_hierarchy(hierarchy))
-    target = np.zeros((vectors.shape[0], len(node_list)), dtype=np.float32)
-    width = min(vectors.shape[1], target.shape[1])
-    target[:, :width] = vectors[:, :width]
-    return target
+    test_ratio: float = 0.2
+    random_state: int = 42
+    include_logistic: bool = True
+    include_random_forest: bool = True
+    include_xgb: bool = True
+    include_linear: bool = True
+    n_estimators: int = 200
+    max_depth: Optional[int] = None
+    xgb_learning_rate: float = 0.1
+    xgb_estimators: int = 200
+    xgb_max_depth: int = 6
 
 
-def _concatenate_feature_blocks(vectors: np.ndarray) -> np.ndarray:
-    """Returns a flattened feature representation across embedding segments."""
+@dataclass
+class DatasetBundle:
+    """Container for dataset splits and metadata."""
 
-    return vectors.astype(np.float32, copy=False)
-
-
-def build_parent_lookup(tree: Mapping[str, Mapping[str, Sequence[str]]]) -> Dict[str, Optional[str]]:
-    """Creates a lookup from each node to its parent in the hierarchy."""
-
-    parents: Dict[str, Optional[str]] = {}
-
-    def recurse(current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]) -> None:
-        for node, children in current.items():
-            parents.setdefault(node, parent)
-            if isinstance(children, Mapping):
-                recurse(children, node)
-                for intermediate, leaves in children.items():
-                    parents.setdefault(intermediate, node)
-                    for leaf in leaves:
-                        parents.setdefault(str(leaf), intermediate)
-
-    recurse(tree, None)
-    return parents
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_test: np.ndarray
+    y_test: np.ndarray
+    label_names: List[str]
 
 
-def _apply_hierarchy_aware_smote(
-    X: np.ndarray,
-    y: np.ndarray,
-    label_names: List[str],
-    config: BaselineConfig,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[str, float]]]:
-    """Generates synthetic samples to improve minority coverage."""
+@lru_cache(maxsize=128)
+def _memoize_label_names(class_names: Tuple[str, ...]) -> List[str]:
+    """Memoizes label names for repeated use (dynamic programming via caching)."""
 
-    rng = np.random.default_rng(config.random_state)
-    parent_lookup = build_parent_lookup(hierarchy)
-    name_to_index = {name: idx for idx, name in enumerate(label_names)}
-
-    adaptive_threshold = int(0.05 * len(y)) if len(y) > 0 else config.rare_class_threshold
-    rare_threshold = max(config.min_synthetic_target, min(config.rare_class_threshold, adaptive_threshold))
-
-    global_std = np.std(X, axis=0, keepdims=True)
-    global_std[global_std < 1e-6] = 1.0
-    global_std = global_std.astype(np.float32)
-
-    synthetic_features: List[np.ndarray] = []
-    synthetic_targets: List[np.ndarray] = []
-    per_class_stats: Dict[str, Dict[str, float]] = {}
-
-    for idx, name in enumerate(label_names):
-        positives = np.where(y[:, idx] == 1)[0]
-        pos_count = positives.size
-        per_class_stats[name] = {"original": float(pos_count)}
-
-        if pos_count == 0 or pos_count > rare_threshold or pos_count < 2:
-            continue
-
-        target_cap = min(
-            max(pos_count + config.min_synthetic_target, int(pos_count * config.max_synthetic_multiplier)),
-            rare_threshold,
-        )
-        synth_needed = max(0, target_cap - pos_count)
-        if synth_needed == 0:
-            continue
-
-        pair_idx = rng.choice(positives, size=(synth_needed, 2), replace=True)
-        base_a = X[pair_idx[:, 0]]
-        base_b = X[pair_idx[:, 1]]
-        lam = rng.random(synth_needed, dtype=np.float32)[:, None]
-
-        class_std = np.std(X[positives], axis=0, keepdims=True)
-        class_std = np.where(class_std < 1e-6, global_std, class_std).astype(np.float32)
-        noise = rng.normal(0.0, 1.0, size=base_a.shape).astype(np.float32) * class_std * 0.02
-
-        X_new = base_a + lam * (base_b - base_a) + noise
-        Y_new = np.maximum(y[pair_idx[:, 0]], y[pair_idx[:, 1]]).astype(np.float32)
-
-        synthetic_features.append(X_new)
-        synthetic_targets.append(Y_new)
-
-        parent_name = parent_lookup.get(name)
-        if parent_name and parent_name in name_to_index:
-            parent_idx = name_to_index[parent_name]
-            parent_only = np.where((y[:, parent_idx] == 1) & (y[:, idx] == 0))[0]
-            if parent_only.size > 0:
-                neg_quota = min(parent_only.size, int(synth_needed * config.hard_negative_multiplier))
-                if neg_quota > 0:
-                    neg_idx = rng.choice(parent_only, size=neg_quota, replace=False)
-                    synthetic_features.append(X[neg_idx])
-                    synthetic_targets.append(y[neg_idx].astype(np.float32))
-
-        per_class_stats[name]["after_synth"] = per_class_stats[name]["original"] + float(synth_needed)
-
-    if synthetic_features:
-        X_aug = np.vstack([X] + synthetic_features)
-        y_aug = np.vstack([y] + synthetic_targets)
-    else:
-        X_aug, y_aug = X, y
-
-    return X_aug, y_aug, per_class_stats
+    return [str(name) for name in class_names]
 
 
-def _rebalance_contamination(
-    X: np.ndarray,
-    y: np.ndarray,
-    config: BaselineConfig,
-    label_names: List[str],
-    per_class_stats: Dict[str, Dict[str, float]],
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[str, float]]]:
-    """Matches the desired contamination ratio via oversampling/undersampling."""
+def _extract_label_matrix(label_dict: Mapping[str, np.ndarray], num_samples: int) -> Tuple[np.ndarray, List[str]]:
+    """Returns the label matrix and associated names for a log type."""
 
-    rng = np.random.default_rng(config.random_state + 1)
+    vectors = label_dict.get("vectors") if isinstance(label_dict, Mapping) else None
+    classes = label_dict.get("classes") if isinstance(label_dict, Mapping) else None
 
-    normal_mask = y.sum(axis=1) == 0
-    anomaly_mask = ~normal_mask
-    X_normals, Y_normals = X[normal_mask], y[normal_mask]
-    X_anomalies, Y_anomalies = X[anomaly_mask], y[anomaly_mask]
+    if isinstance(vectors, np.ndarray):
+        matrix = vectors.astype(np.float32)
+        if isinstance(classes, Sequence) and classes:
+            label_names = _memoize_label_names(tuple(str(cls) for cls in classes))
+        else:
+            label_names = [f"label_{idx}" for idx in range(matrix.shape[1])]
+        return matrix, label_names
 
-    desired_total = max(len(X), len(X_anomalies) + len(X_normals))
-    desired_anomaly = max(config.min_train_anomalies, int(desired_total * config.contamination))
-    desired_anomaly = min(desired_anomaly, len(X_anomalies)) if len(X_anomalies) > 0 else 0
-    desired_normal = max(1, desired_total - desired_anomaly)
-
-    if len(X_normals) >= desired_normal:
-        idx = rng.choice(len(X_normals), size=desired_normal, replace=False)
-        X_normals_bal, Y_normals_bal = X_normals[idx], Y_normals[idx]
-    else:
-        deficit = desired_normal - len(X_normals)
-        replicated = X_normals[rng.choice(len(X_normals), size=deficit, replace=True)] if len(X_normals) > 0 else np.zeros((0, X.shape[1]), dtype=np.float32)
-        replicated_y = Y_normals[rng.choice(len(Y_normals), size=deficit, replace=True)] if len(Y_normals) > 0 else np.zeros((0, y.shape[1]), dtype=np.float32)
-        X_normals_bal = np.vstack([X_normals, replicated]) if len(X_normals) else replicated
-        Y_normals_bal = np.vstack([Y_normals, replicated_y]) if len(Y_normals) else replicated_y
-
-    if desired_anomaly == 0 or len(X_anomalies) == 0:
-        X_anomalies_bal = np.zeros((0, X.shape[1]), dtype=np.float32)
-        Y_anomalies_bal = np.zeros((0, y.shape[1]), dtype=np.float32)
-    elif len(X_anomalies) <= desired_anomaly:
-        X_anomalies_bal, Y_anomalies_bal = X_anomalies, Y_anomalies
-    else:
-        idx = rng.choice(len(X_anomalies), size=desired_anomaly, replace=False)
-        X_anomalies_bal, Y_anomalies_bal = X_anomalies[idx], Y_anomalies[idx]
-
-    X_balanced = np.vstack([X_normals_bal, X_anomalies_bal]).astype(np.float32)
-    y_balanced = np.vstack([Y_normals_bal, Y_anomalies_bal]).astype(np.float32)
-
-    before_counts = y.sum(axis=0)
-    after_counts = y_balanced.sum(axis=0)
-    for idx, name in enumerate(label_names):
-        stats = per_class_stats.setdefault(name, {})
-        stats.setdefault("original", float(before_counts[idx]))
-        stats["balanced"] = float(after_counts[idx])
-
-    return X_balanced, y_balanced, per_class_stats
+    # Fallback: create a dummy normal label when none are provided
+    return np.zeros((num_samples, 1), dtype=np.float32), ["normal"]
 
 
-def prepare_training_bundle(
+def prepare_dataset(
     vectors: np.ndarray,
-    labels: Optional[np.ndarray],
+    label_dict: Mapping[str, np.ndarray],
     config: BaselineConfig,
+    sample_size: Optional[int] = None,
 ) -> DatasetBundle:
-    """Splits embeddings into train/val/test sets and balances the training set."""
+    """Splits embeddings into train/test sets without additional balancing."""
 
-    features = _concatenate_feature_blocks(vectors)
-    if labels is None:
-        labels = np.zeros((features.shape[0], len(list(flatten_hierarchy(hierarchy)))), dtype=np.float32)
+    features = vectors.astype(np.float32)
+    num_samples = features.shape[0]
 
-    label_names = list(flatten_hierarchy(hierarchy))[: labels.shape[1]]
+    if sample_size and 0 < sample_size < num_samples:
+        rng = np.random.default_rng(config.random_state)
+        indices = rng.choice(num_samples, size=sample_size, replace=False)
+        features = features[indices]
+        label_matrix, label_names = _extract_label_matrix(label_dict, sample_size)
+        label_matrix = label_matrix[indices]
+    else:
+        label_matrix, label_names = _extract_label_matrix(label_dict, num_samples)
 
-    X_temp, X_test, y_temp, y_test = train_test_split(
+    label_matrix = label_matrix.astype(np.float32, copy=False)
+    if label_matrix.shape[0] != features.shape[0]:
+        raise ValueError("Label matrix row count does not match feature matrix")
+
+    stratify_labels = None
+    if label_matrix.size > 0:
+        row_sums = label_matrix.sum(axis=1)
+        if not np.allclose(row_sums, row_sums[0]):  # ensure more than one class state
+            stratify_labels = (row_sums > 0).astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
         features,
-        labels,
+        label_matrix,
         test_size=config.test_ratio,
         random_state=config.random_state,
-        stratify=(labels.sum(axis=1) > 0).astype(int) if labels.sum() > 0 else None,
+        stratify=stratify_labels if stratify_labels is not None and stratify_labels.sum() not in {0, len(stratify_labels)} else None,
     )
-
-    val_size = config.val_ratio / (1.0 - config.test_ratio)
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp,
-        y_temp,
-        test_size=val_size,
-        random_state=config.random_state,
-        stratify=(y_temp.sum(axis=1) > 0).astype(int) if y_temp.sum() > 0 else None,
-    )
-
-    X_aug, y_aug, per_class = _apply_hierarchy_aware_smote(X_train, y_train, label_names, config)
-    X_balanced, y_balanced, per_class = _rebalance_contamination(X_aug, y_aug, config, label_names, per_class)
-
-    smote_summary = {
-        name: {
-            key: float(value)
-            for key, value in stats.items()
-            if value is not None
-        }
-        for name, stats in per_class.items()
-    }
 
     return DatasetBundle(
-        X_train=X_balanced,
-        y_train=y_balanced,
-        X_val=X_val,
-        y_val=y_val,
+        X_train=X_train,
+        y_train=y_train,
         X_test=X_test,
         y_test=y_test,
         label_names=label_names,
-        smote_summary=smote_summary,
     )
 
 
@@ -502,30 +267,42 @@ def prepare_training_bundle(
 ###############################################################################
 
 
-def _build_models(config: BaselineConfig) -> Dict[str, MultiOutputClassifier]:
+def _build_models(config: BaselineConfig) -> Dict[str, object]:
     """Constructs the set of baseline models based on config flags."""
 
-    models: Dict[str, MultiOutputClassifier] = {}
+    models: Dict[str, object] = {}
 
     if config.include_logistic:
-        lr = LogisticRegression(
+        logistic = LogisticRegression(
             penalty="l2",
             solver="saga",
-            max_iter=200,
+            max_iter=500,
             tol=1e-3,
             C=1.0,
             n_jobs=-1,
             random_state=config.random_state,
         )
-        models["logistic"] = MultiOutputClassifier(lr, n_jobs=-1)
+        models["logistic_regression"] = Pipeline(
+            steps=[
+                ("scale", StandardScaler()),
+                ("clf", MultiOutputClassifier(logistic, n_jobs=-1)),
+            ]
+        )
+
+    if config.include_linear:
+        linear = LinearRegression(n_jobs=None) if hasattr(LinearRegression, "n_jobs") else LinearRegression()
+        models["linear_regression"] = Pipeline(
+            steps=[
+                ("scale", StandardScaler()),
+                ("reg", MultiOutputRegressor(linear)),
+            ]
+        )
 
     if config.include_random_forest:
         rf = RandomForestClassifier(
             n_estimators=config.n_estimators,
             max_depth=config.max_depth,
-            min_samples_leaf=2,
             n_jobs=-1,
-            class_weight="balanced_subsample",
             random_state=config.random_state,
         )
         models["random_forest"] = MultiOutputClassifier(rf, n_jobs=-1)
@@ -534,130 +311,184 @@ def _build_models(config: BaselineConfig) -> Dict[str, MultiOutputClassifier]:
         xgb = XGBClassifier(
             learning_rate=config.xgb_learning_rate,
             n_estimators=config.xgb_estimators,
-            max_depth=6,
+            max_depth=config.xgb_max_depth,
             subsample=0.9,
             colsample_bytree=0.9,
             reg_lambda=1.0,
-            reg_alpha=0.5,
+            reg_alpha=0.0,
             tree_method="hist",
             n_jobs=-1,
             random_state=config.random_state,
+            objective="binary:logistic",
+            eval_metric="logloss",
         )
         models["xgboost"] = MultiOutputClassifier(xgb, n_jobs=-1)
 
     return models
 
 
-def _fit_pipeline(model: MultiOutputClassifier, X: np.ndarray, y: np.ndarray) -> Pipeline:
-    """Creates and fits a standardised pipeline wrapping the estimator."""
+def _ensure_binary(predictions: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """Converts real-valued predictions into binary decisions."""
 
-    pipeline = Pipeline(
-        steps=[
-            ("scale", StandardScaler()),
-            ("clf", model),
-        ]
-    )
-    pipeline.fit(X, y)
-    return pipeline
+    if predictions.dtype.kind in {"i", "u", "b"}:
+        return predictions.astype(np.int32, copy=False)
+    return (predictions >= threshold).astype(np.int32)
 
 
-def _evaluate_predictions(
+def _report_metrics(
+    model_name: str,
+    log_type: str,
+    embedding_type: str,
+    label_names: Sequence[str],
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    average: str,
-) -> Tuple[float, float, float]:
-    """Returns precision, recall, f1 for the requested averaging scheme."""
+    output_dir: Path,
+) -> Dict[str, float]:
+    """Prints metrics to console and persists a report mirroring transformer output."""
 
-    precision = precision_score(y_true, y_pred, average=average, zero_division=0)
-    recall = recall_score(y_true, y_pred, average=average, zero_division=0)
-    f1 = f1_score(y_true, y_pred, average=average, zero_division=0)
-    return precision, recall, f1
+    y_true = y_true.astype(np.int32, copy=False)
+    y_pred = _ensure_binary(y_pred)
+
+    print(f"\nModel: {model_name}")
+    print("=== Per-Class Metrics ===")
+    print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+    print("-" * 67)
+
+    class_metrics: List[Tuple[float, float, float]] = []
+    for idx, name in enumerate(label_names):
+        if idx >= y_true.shape[1]:
+            break
+        y_true_col = y_true[:, idx]
+        y_pred_col = y_pred[:, idx]
+        if y_true_col.sum() == 0:
+            continue
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true_col,
+            y_pred_col,
+            average="binary",
+            zero_division=0,
+        )
+        class_metrics.append((prec, rec, f1))
+        support = int(y_true_col.sum())
+        print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}")
+
+    print("\n=== Overall Metrics ===")
+    micro_prec, micro_rec, micro_f1, _ = precision_recall_fscore_support(
+        y_true.ravel(), y_pred.ravel(), average="micro", zero_division=0
+    )
+    print(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}")
+
+    macro_prec, macro_rec, macro_f1 = (0.0, 0.0, 0.0)
+    if class_metrics:
+        macro_prec, macro_rec, macro_f1 = np.mean(class_metrics, axis=0)
+        print(f"Macro-averaged: Precision={macro_prec:.3f}, Recall={macro_rec:.3f}, F1={macro_f1:.3f}")
+
+    jaccard = jaccard_score(y_true, y_pred, average="samples", zero_division=0)
+    print(f"Jaccard Score (samples): {jaccard:.3f}")
+
+    any_attack_true = (y_true.sum(axis=1) > 0).astype(int)
+    any_attack_pred = (y_pred.sum(axis=1) > 0).astype(int)
+    if len(np.unique(any_attack_true)) > 1:
+        anomaly_prec, anomaly_rec, anomaly_f1, _ = precision_recall_fscore_support(
+            any_attack_true, any_attack_pred, average="binary", zero_division=0
+        )
+        print(
+            f"\nAnomaly Detection: Precision={anomaly_prec:.3f}, "
+            f"Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}"
+        )
+    else:
+        anomaly_prec = anomaly_rec = anomaly_f1 = 0.0
+
+    output_dir.mkdir(exist_ok=True, parents=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    embedding_suffix = f"_{embedding_type}" if embedding_type else ""
+    report_path = output_dir / f"baseline_{model_name}_{log_type}{embedding_suffix}_evaluation_{timestamp}.txt"
+
+    with report_path.open("w") as handle:
+        handle.write("Baseline Evaluation Report\n")
+        handle.write(f"Log Type: {log_type}\n")
+        if embedding_type:
+            handle.write(f"Embedding Type: {embedding_type}\n")
+        handle.write(f"Model: {model_name}\n")
+        handle.write(f"Timestamp: {timestamp}\n")
+        handle.write(f"Dataset: {len(y_true)} test samples\n")
+        handle.write("=" * 50 + "\n\n")
+
+        handle.write("Per-Class Metrics:\n")
+        handle.write(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n")
+        handle.write("-" * 67 + "\n")
+        for idx, name in enumerate(label_names):
+            if idx >= y_true.shape[1]:
+                break
+            y_true_col = y_true[:, idx]
+            y_pred_col = y_pred[:, idx]
+            if y_true_col.sum() == 0:
+                continue
+            prec, rec, f1, _ = precision_recall_fscore_support(
+                y_true_col,
+                y_pred_col,
+                average="binary",
+                zero_division=0,
+            )
+            support = int(y_true_col.sum())
+            handle.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}\n")
+
+        handle.write("\nOverall Metrics:\n")
+        handle.write(
+            f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n"
+        )
+        if class_metrics:
+            handle.write(
+                f"Macro-averaged: Precision={macro_prec:.3f}, Recall={macro_rec:.3f}, F1={macro_f1:.3f}\n"
+            )
+        handle.write(f"Jaccard Score: {jaccard:.3f}\n")
+        if len(np.unique(any_attack_true)) > 1:
+            handle.write(
+                f"Anomaly Detection: Precision={anomaly_prec:.3f}, "
+                f"Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}\n"
+            )
+
+    print(f"\nEvaluation report saved: {report_path}")
+
+    return {
+        "micro_precision": float(micro_prec),
+        "micro_recall": float(micro_rec),
+        "micro_f1": float(micro_f1),
+        "macro_precision": float(macro_prec),
+        "macro_recall": float(macro_rec),
+        "macro_f1": float(macro_f1),
+        "jaccard": float(jaccard),
+    }
 
 
-def train_and_evaluate_models(bundle: DatasetBundle, config: BaselineConfig) -> List[ModelMetrics]:
+def train_and_evaluate_models(
+    bundle: DatasetBundle,
+    config: BaselineConfig,
+    log_type: str,
+    embedding_type: str,
+    output_dir: Path,
+) -> Dict[str, Dict[str, float]]:
     """Trains all configured models and returns their evaluation metrics."""
 
     models = _build_models(config)
-    metrics: List[ModelMetrics] = []
+    results: Dict[str, Dict[str, float]] = {}
 
     for name, estimator in models.items():
         print(f"\nTraining {name}...")
-        pipeline = _fit_pipeline(estimator, bundle.X_train, bundle.y_train)
-        y_pred = pipeline.predict(bundle.X_test)
-
-        micro_prec, micro_rec, micro_f1 = _evaluate_predictions(bundle.y_test, y_pred, "micro")
-        macro_prec, macro_rec, macro_f1 = _evaluate_predictions(bundle.y_test, y_pred, "macro")
-        weighted_f1 = f1_score(bundle.y_test, y_pred, average="weighted", zero_division=0)
-
-        report = classification_report(
-            bundle.y_test,
-            y_pred,
-            target_names=bundle.label_names[: bundle.y_test.shape[1]],
-            zero_division=0,
+        estimator.fit(bundle.X_train, bundle.y_train)
+        predictions = estimator.predict(bundle.X_test)
+        metrics = _report_metrics(
+            model_name=name,
+            log_type=log_type,
+            embedding_type=embedding_type,
+            label_names=bundle.label_names,
+            y_true=bundle.y_test,
+            y_pred=predictions,
+            output_dir=output_dir,
         )
+        results[name] = metrics
 
-        metrics.append(
-            ModelMetrics(
-                model_name=name,
-                micro_f1=micro_f1,
-                macro_f1=macro_f1,
-                weighted_f1=weighted_f1,
-                micro_precision=micro_prec,
-                micro_recall=micro_rec,
-                macro_precision=macro_prec,
-                macro_recall=macro_rec,
-                subset_accuracy=accuracy_score(bundle.y_test, y_pred),
-                jaccard_micro=jaccard_score(bundle.y_test, y_pred, average="micro", zero_division=0),
-                jaccard_macro=jaccard_score(bundle.y_test, y_pred, average="macro", zero_division=0),
-                hamming=hamming_loss(bundle.y_test, y_pred),
-                report=report,
-            )
-        )
-
-    return metrics
-
-
-###############################################################################
-# Reporting utilities
-###############################################################################
-
-
-def _write_report(summary: RunSummary, output_dir: Path) -> None:
-    """Persists evaluation metrics to a timestamped report."""
-
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    report_path = output_dir / f"baselines_{summary.log_type}_{summary.embedding_type}_{timestamp}.txt"
-
-    with report_path.open("w") as handle:
-        handle.write(f"Baseline Evaluation Report\n")
-        handle.write(f"Log Type: {summary.log_type}\n")
-        handle.write(f"Embedding: {summary.embedding_type}\n")
-        handle.write(f"Timestamp: {timestamp}\n")
-        handle.write("=" * 60 + "\n\n")
-
-        handle.write("Overall Dataset Statistics:\n")
-        for key, value in summary.dataset_stats.items():
-            handle.write(f"  {key}: {value}\n")
-        handle.write("\n")
-
-        for metric in summary.metrics:
-            handle.write(f"Model: {metric.model_name}\n")
-            handle.write(f"  Micro F1       : {metric.micro_f1:.4f}\n")
-            handle.write(f"  Macro F1       : {metric.macro_f1:.4f}\n")
-            handle.write(f"  Weighted F1    : {metric.weighted_f1:.4f}\n")
-            handle.write(f"  Micro Precision: {metric.micro_precision:.4f}\n")
-            handle.write(f"  Micro Recall   : {metric.micro_recall:.4f}\n")
-            handle.write(f"  Macro Precision: {metric.macro_precision:.4f}\n")
-            handle.write(f"  Macro Recall   : {metric.macro_recall:.4f}\n")
-            handle.write(f"  Subset Accuracy: {metric.subset_accuracy:.4f}\n")
-            handle.write(f"  Jaccard Micro  : {metric.jaccard_micro:.4f}\n")
-            handle.write(f"  Jaccard Macro  : {metric.jaccard_macro:.4f}\n")
-            handle.write(f"  Hamming Loss   : {metric.hamming:.4f}\n\n")
-            handle.write("Per-class report:\n")
-            handle.write(metric.report)
-            handle.write("\n" + "-" * 60 + "\n\n")
-
-    print(f"Saved baseline report: {report_path}")
+    return results
 
 
 ###############################################################################
@@ -672,6 +503,7 @@ def run_baseline(
     config: BaselineConfig,
     output_dir: Path,
     target_log_type: Optional[str] = None,
+    sample_size: Optional[int] = None,
 ) -> None:
     """Executes the baseline workflow for all available log types."""
 
@@ -679,58 +511,30 @@ def run_baseline(
         if target_log_type and log_type != target_log_type:
             continue
 
+        label_dict = labels.get(log_type, {})
+
         print("\n" + "=" * 60)
         print(f"Processing {log_type} with {embedding_type} embeddings")
         print("=" * 60)
 
-        label_target = create_multilabel_targets(labels.get(log_type, {}))
-        bundle = prepare_training_bundle(vectors, label_target, config)
+        bundle = prepare_dataset(vectors, label_dict, config, sample_size=sample_size)
 
         total_samples = vectors.shape[0]
-        anomaly_count = int((label_target.sum(axis=1) > 0).sum()) if label_target is not None else 0
-        normal_count = total_samples - anomaly_count
-
-        dataset_stats = {
-            "original_samples": total_samples,
-            "original_normals": normal_count,
-            "original_anomalies": anomaly_count,
-            "train_samples": int(bundle.X_train.shape[0]),
-            "validation_samples": int(bundle.X_val.shape[0]),
-            "test_samples": int(bundle.X_test.shape[0]),
-        }
-
-        print("Balanced dataset distribution (post-SMOTE):")
+        anomaly_count = int((bundle.y_train.sum(axis=1) > 0).sum() + (bundle.y_test.sum(axis=1) > 0).sum())
+        print("Dataset summary:")
+        print(f"  Total samples : {total_samples}")
         print(f"  Train samples : {bundle.X_train.shape[0]}")
-        print(f"  Validation    : {bundle.X_val.shape[0]}")
-        print(f"  Test          : {bundle.X_test.shape[0]}")
+        print(f"  Test samples  : {bundle.X_test.shape[0]}")
+        print(f"  Label count   : {len(bundle.label_names)}")
+        print(f"  Anomaly rows  : {anomaly_count}")
 
-        top_k = config.report_top_k
-        print("  Per-class adjustments (top changes):")
-        adjustments = []
-        for name, stats in bundle.smote_summary.items():
-            original = stats.get("original", 0.0)
-            balanced = stats.get("balanced", original)
-            delta = balanced - original
-            adjustments.append((name, original, balanced, delta))
-        adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
-        for name, original, balanced, delta in adjustments[:top_k]:
-            trend = "++" if delta > 0 else "--" if delta < 0 else "=="
-            print(f"    {name:<25} {balanced:>6.0f} ({trend} {delta:+.0f})")
-
-        metrics = train_and_evaluate_models(bundle, config)
-        summary = RunSummary(
-            log_type=log_type,
-            embedding_type=embedding_type,
-            metrics=metrics,
-            dataset_stats=dataset_stats,
-        )
-        _write_report(summary, output_dir)
+        train_and_evaluate_models(bundle, config, log_type, embedding_type, output_dir)
 
 
 def parse_arguments() -> argparse.Namespace:
     """Parses CLI arguments."""
 
-    parser = argparse.ArgumentParser(description="Classical multi-label baselines")
+    parser = argparse.ArgumentParser(description="Classical baselines for transformer comparison")
     parser.add_argument(
         "--embedding-type",
         type=str,
@@ -745,6 +549,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Optional log type to restrict evaluation",
     )
     parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Optional subsample size (processes full dataset if not provided)",
+    )
+    parser.add_argument(
         "--skip-xgb",
         action="store_true",
         help="Disable XGBoost baseline",
@@ -755,21 +565,56 @@ def parse_arguments() -> argparse.Namespace:
         help="Disable Random Forest baseline",
     )
     parser.add_argument(
-        "--skip-lr",
+        "--skip-logistic",
         action="store_true",
         help="Disable Logistic Regression baseline",
     )
     parser.add_argument(
-        "--contamination",
-        type=float,
-        default=0.2,
-        help="Target contamination ratio for training set balancing",
+        "--skip-linear",
+        action="store_true",
+        help="Disable Linear Regression baseline",
     )
     parser.add_argument(
         "--random-state",
         type=int,
         default=42,
         help="Random seed",
+    )
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.2,
+        help="Test set ratio (default: 0.2)",
+    )
+    parser.add_argument(
+        "--n-estimators",
+        type=int,
+        default=200,
+        help="Number of estimators for tree-based models",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="Maximum depth for tree-based models",
+    )
+    parser.add_argument(
+        "--xgb-estimators",
+        type=int,
+        default=200,
+        help="Number of trees for XGBoost",
+    )
+    parser.add_argument(
+        "--xgb-learning-rate",
+        type=float,
+        default=0.1,
+        help="Learning rate for XGBoost",
+    )
+    parser.add_argument(
+        "--xgb-max-depth",
+        type=int,
+        default=6,
+        help="Tree depth for XGBoost",
     )
     return parser.parse_args()
 
@@ -778,22 +623,26 @@ def main() -> None:
     args = parse_arguments()
 
     config = BaselineConfig(
-        contamination=args.contamination,
+        test_ratio=args.test_ratio,
+        random_state=args.random_state,
         include_xgb=not args.skip_xgb and HAS_XGB,
         include_random_forest=not args.skip_rf,
-        include_logistic=not args.skip_lr,
-        random_state=args.random_state,
+        include_logistic=not args.skip_logistic,
+        include_linear=not args.skip_linear,
+        n_estimators=args.n_estimators,
+        max_depth=args.max_depth,
+        xgb_estimators=args.xgb_estimators,
+        xgb_learning_rate=args.xgb_learning_rate,
+        xgb_max_depth=args.xgb_max_depth,
     )
 
-    embedding_order = [
-        "fasttext",
-        "word2vec",
-        "logbert",
-    ] if args.embedding_type == "all" else [args.embedding_type]
+    embedding_order = (
+        ["fasttext", "word2vec", "logbert"]
+        if args.embedding_type == "all"
+        else [args.embedding_type]
+    )
 
     results_dir = Path("results")
-    results_dir.mkdir(parents=True, exist_ok=True)
-
     loaders = {
         "fasttext": load_fasttext_embeddings,
         "word2vec": load_word2vec_embeddings,
@@ -823,10 +672,9 @@ def main() -> None:
             config=config,
             output_dir=results_dir,
             target_log_type=args.log_type,
+            sample_size=args.sample_size,
         )
 
 
 if __name__ == "__main__":
-    import pickle  # Local import to avoid unused when module imported
-
     main()

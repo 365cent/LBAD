@@ -52,6 +52,7 @@ BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
 MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
 TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
+PARENT_EXTRA_FRACTION = 0.25     # Additional parent-only quota relative to leaf share
 
 
 @dataclass(frozen=True)
@@ -723,42 +724,178 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         # Align reported targets with achieved class sizes to make balance explicit
         desired_normal = X_normals_bal.shape[0]
-        desired_anomaly = X_anomalies_bal.shape[0]
+        desired_anomaly_budget = max(0, desired_total - desired_normal)
+
+        idx_to_name = {
+            node_to_index[name]: name
+            for name in node_names
+            if name in node_to_index and node_to_index[name] < y.shape[1]
+        }
+
+        index_children: Dict[int, List[int]] = {}
+        for name, parent_name in parent_lookup.items():
+            if parent_name is None:
+                continue
+            child_idx = node_to_index.get(name)
+            parent_idx = node_to_index.get(parent_name)
+            if child_idx is None or parent_idx is None:
+                continue
+            if child_idx >= Y_anomalies_bal.shape[1] or parent_idx >= Y_anomalies_bal.shape[1]:
+                continue
+            index_children.setdefault(parent_idx, []).append(child_idx)
+
+        active_leaves = [
+            idx for idx in active_leaf_indices if idx < Y_anomalies_bal.shape[1] and np.any(Y_anomalies_bal[:, idx] == 1)
+        ]
+        active_parents = [
+            idx for idx, children in index_children.items()
+            if children and np.any(Y_anomalies_bal[:, idx] == 1)
+        ]
+
+        leaf_count = len(active_leaves)
+        parent_count = len(active_parents)
+        leaf_targets: Dict[int, int] = {}
+        parent_targets: Dict[int, int] = {}
+
+        leaf_target = 0
+        if desired_anomaly_budget > 0 and leaf_count > 0:
+            effective_classes = leaf_count + PARENT_EXTRA_FRACTION * parent_count
+            if effective_classes > 0:
+                leaf_target = max(1, int(math.floor(desired_anomaly_budget / effective_classes)))
+            else:
+                leaf_target = desired_anomaly_budget // max(1, leaf_count)
+
+            if leaf_target > 0:
+                while leaf_target > 0:
+                    parent_target_est = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
+                    total_alloc = leaf_target * leaf_count + parent_target_est * parent_count
+                    if total_alloc <= desired_anomaly_budget:
+                        break
+                    leaf_target -= 1
+
+        parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count and leaf_target > 0 else 0
+
+        for idx in active_leaves:
+            leaf_targets[idx] = leaf_target
+        for idx in active_parents:
+            parent_targets[idx] = parent_target
+
         if per_class_target is not None:
-            per_class_target = desired_normal
+            per_class_target = leaf_target
 
-        def explode_leaf_labels(X_group: np.ndarray, Y_group: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            samples: List[np.ndarray] = []
-            labels: List[np.ndarray] = []
-            positive = Y_group.sum(axis=1) > 0
-            if not np.any(positive):
-                return X_group, Y_group
+        allocated = leaf_target * leaf_count + parent_target * parent_count
+        remaining = max(0, desired_anomaly_budget - allocated)
 
-            active = [idx for idx in leaf_indices if idx < Y_group.shape[1]]
-            if not active:
-                return X_group, Y_group
+        if remaining > 0 and leaf_targets:
+            idx_cycle = 0
+            while remaining > 0 and active_leaves:
+                leaf_idx = active_leaves[idx_cycle % len(active_leaves)]
+                leaf_targets[leaf_idx] += 1
+                remaining -= 1
+                idx_cycle += 1
+        if remaining > 0 and parent_targets:
+            idx_cycle = 0
+            while remaining > 0 and active_parents:
+                parent_idx = active_parents[idx_cycle % len(active_parents)]
+                parent_targets[parent_idx] += 1
+                remaining -= 1
+                idx_cycle += 1
 
-            for leaf_idx in active:
-                leaf_rows = np.where(Y_group[:, leaf_idx] == 1)[0]
-                if leaf_rows.size == 0:
+        if desired_anomaly_budget == 0:
+            X_anomaly_struct = np.empty((0, X_anomalies_bal.shape[1]), dtype=np.float32)
+            Y_anomaly_struct = np.empty((0, Y_anomalies_bal.shape[1]), dtype=np.float32)
+        else:
+            leaf_blocks: List[np.ndarray] = []
+            leaf_label_blocks: List[np.ndarray] = []
+            leaf_positive_map: Dict[int, np.ndarray] = {}
+            leaf_realized: Dict[int, int] = {}
+            unsatisfied_leaf_quota = 0
+            for leaf_idx in active_leaves:
+                positives = np.where(Y_anomalies_bal[:, leaf_idx] == 1)[0]
+                if positives.size:
+                    leaf_positive_map[leaf_idx] = positives
+                quota = leaf_targets.get(leaf_idx, 0)
+                if quota <= 0:
                     continue
-                leaf_features = X_group[leaf_rows]
-                leaf_targets = np.zeros((leaf_rows.size, Y_group.shape[1]), dtype=np.float32)
-                leaf_targets[:, leaf_idx] = 1.0
-                samples.append(leaf_features)
-                labels.append(leaf_targets)
+                if positives.size == 0:
+                    unsatisfied_leaf_quota += quota
+                    print(
+                        f"Warning: Unable to satisfy leaf quota for {idx_to_name.get(leaf_idx, str(leaf_idx))}; reallocating"
+                    )
+                    continue
+                replace = positives.size < quota
+                sampled = rng.choice(positives, size=quota, replace=replace)
+                leaf_blocks.append(X_anomalies_bal[sampled])
+                leaf_label_blocks.append(Y_anomalies_bal[sampled])
+                leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + quota
 
-            if not samples:
-                return X_group, Y_group
+            if unsatisfied_leaf_quota > 0 and leaf_positive_map:
+                alloc_leaves = list(leaf_positive_map.keys())
+                idx_cycle = 0
+                while unsatisfied_leaf_quota > 0 and alloc_leaves:
+                    leaf_idx = alloc_leaves[idx_cycle % len(alloc_leaves)]
+                    positives = leaf_positive_map[leaf_idx]
+                    sampled = rng.choice(positives, size=1, replace=False)
+                    leaf_blocks.append(X_anomalies_bal[sampled])
+                    leaf_label_blocks.append(Y_anomalies_bal[sampled])
+                    leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + 1
+                    unsatisfied_leaf_quota -= 1
+                    idx_cycle += 1
 
-            exploded_X = np.vstack(samples).astype(np.float32)
-            exploded_y = np.vstack(labels).astype(np.float32)
-            return exploded_X, exploded_y
+            parent_blocks: List[np.ndarray] = []
+            parent_label_blocks: List[np.ndarray] = []
+            redistributed = 0
+            for parent_idx in active_parents:
+                quota = parent_targets.get(parent_idx, 0)
+                if quota <= 0:
+                    continue
+                child_indices = [
+                    child for child in index_children.get(parent_idx, [])
+                    if child < Y_anomalies_bal.shape[1]
+                ]
+                parent_mask = Y_anomalies_bal[:, parent_idx] == 1
+                if child_indices:
+                    parent_mask = np.logical_and(
+                        parent_mask, (Y_anomalies_bal[:, child_indices].sum(axis=1) == 0)
+                    )
+                candidates = np.where(parent_mask)[0]
+                if candidates.size == 0:
+                    redistributed += quota
+                    print(
+                        f"Warning: Unable to satisfy parent-only quota for {idx_to_name.get(parent_idx, str(parent_idx))}; reallocating"
+                    )
+                    continue
+                replace = candidates.size < quota
+                sampled = rng.choice(candidates, size=quota, replace=replace)
+                parent_blocks.append(X_anomalies_bal[sampled])
+                parent_label_blocks.append(Y_anomalies_bal[sampled])
 
-        expl_X, expl_y = explode_leaf_labels(X_anomalies_bal, Y_anomalies_bal)
+            if redistributed > 0 and leaf_positive_map:
+                alloc_leaves = list(leaf_positive_map.keys())
+                idx_cycle = 0
+                while redistributed > 0 and alloc_leaves:
+                    leaf_idx = alloc_leaves[idx_cycle % len(alloc_leaves)]
+                    positives = leaf_positive_map[leaf_idx]
+                    sampled = rng.choice(positives, size=1, replace=False)
+                    leaf_blocks.append(X_anomalies_bal[sampled])
+                    leaf_label_blocks.append(Y_anomalies_bal[sampled])
+                    leaf_realized[leaf_idx] = leaf_realized.get(leaf_idx, 0) + 1
+                    redistributed -= 1
+                    idx_cycle += 1
 
-        X_balanced = np.vstack([X_normals_bal, expl_X]).astype(np.float32)
-        y_balanced = np.vstack([Y_normals_bal, expl_y]).astype(np.float32)
+            anomaly_blocks = leaf_blocks + parent_blocks
+            anomaly_label_blocks = leaf_label_blocks + parent_label_blocks
+
+            if anomaly_blocks:
+                X_anomaly_struct = np.vstack(anomaly_blocks).astype(np.float32)
+                Y_anomaly_struct = np.vstack(anomaly_label_blocks).astype(np.float32)
+            else:
+                X_anomaly_struct = np.empty((0, X_anomalies_bal.shape[1]), dtype=np.float32)
+                Y_anomaly_struct = np.empty((0, Y_anomalies_bal.shape[1]), dtype=np.float32)
+
+        X_balanced = np.vstack([X_normals_bal, X_anomaly_struct]).astype(np.float32)
+        y_balanced = np.vstack([Y_normals_bal, Y_anomaly_struct]).astype(np.float32)
+        desired_anomaly = X_anomaly_struct.shape[0]
 
         balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
         balanced_anomaly = int(len(y_balanced) - balanced_normal)
@@ -770,7 +907,12 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  normal:  {balanced_normal} (target {desired_normal})")
         print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
         if per_class_target is not None:
-            print(f"  per-class target (normal + leaves): {per_class_target}")
+            print(f"  per-leaf target: {per_class_target}")
+            if parent_targets:
+                parent_quota_values = sorted(set(value for value in parent_targets.values() if value > 0))
+                if parent_quota_values:
+                    quota_display = ", ".join(str(value) for value in parent_quota_values)
+                    print(f"  per-parent extra quota: {quota_display}")
         print("\nPer-class adjustments:")
         adjustments = []
         adjustments.append(("normal", original_normal, balanced_normal, balanced_normal - original_normal))
