@@ -302,10 +302,10 @@ def _build_models(config: BaselineConfig) -> Dict[str, object]:
         rf = RandomForestClassifier(
             n_estimators=config.n_estimators,
             max_depth=config.max_depth,
-            n_jobs=-1,
+            n_jobs=1,
             random_state=config.random_state,
         )
-        models["random_forest"] = MultiOutputClassifier(rf, n_jobs=-1)
+        models["random_forest"] = MultiOutputClassifier(rf, n_jobs=1)
 
     if config.include_xgb and HAS_XGB:
         xgb = XGBClassifier(
