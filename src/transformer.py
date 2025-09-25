@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Sampler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -499,6 +499,78 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
     spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
     spinner.start()
 
+    class BalancedBatchSampler(Sampler[List[int]]):
+        """Sampler that interleaves class indices to satisfy per-class quotas without materializing data."""
+
+        def __init__(
+            self,
+            class_indices: Mapping[str, np.ndarray],
+            class_targets: Mapping[str, int],
+            batch_size: int,
+            seed: int = 42,
+        ) -> None:
+            self.class_indices: Dict[str, np.ndarray] = {
+                key: np.asarray(indices, dtype=np.int64)
+                for key, indices in class_indices.items()
+                if indices.size > 0
+            }
+            self.class_targets: Dict[str, int] = {
+                key: int(class_targets[key])
+                for key in self.class_indices.keys()
+                if class_targets.get(key, 0) > 0
+            }
+            self.batch_size = max(1, int(batch_size))
+            self.seed = int(seed)
+            self.epoch = 0
+            self.total = sum(self.class_targets.values())
+            if self.total == 0:
+                raise ValueError("BalancedBatchSampler requires at least one positive target")
+
+        def __len__(self) -> int:
+            return max(1, math.ceil(self.total / self.batch_size))
+
+        def __iter__(self):
+            rng = np.random.default_rng(self.seed + self.epoch)
+            self.epoch += 1
+            remaining = self.class_targets.copy()
+            active = [key for key, count in remaining.items() if count > 0]
+            iterators: Dict[str, Iterable[int]] = {
+                key: self._cycle(self.class_indices[key], rng)
+                for key in active
+            }
+
+            batch: List[int] = []
+            idx = 0
+            while active:
+                key = active[idx % len(active)]
+                idx += 1
+                if remaining[key] <= 0:
+                    active = [item for item in active if remaining[item] > 0]
+                    continue
+                batch.append(next(iterators[key]))
+                remaining[key] -= 1
+                if remaining[key] == 0:
+                    active = [item for item in active if remaining[item] > 0]
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+            if batch:
+                yield batch
+
+        @staticmethod
+        def _cycle(indices: np.ndarray, rng: np.random.Generator) -> Iterable[int]:
+            if indices.size == 0:
+                raise ValueError("Cannot cycle over an empty index pool")
+            if indices.size == 1:
+                single = int(indices[0])
+                while True:
+                    yield single
+            while True:
+                perm = rng.permutation(len(indices))
+                for idx in perm:
+                    yield int(indices[idx])
+
     try:
         # Collate tensors from the original loader
         collected = [[], [], [], [], []]
@@ -613,123 +685,25 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                         synthetic_targets.append(y[neg_idx].astype(np.float32))
 
         if synthetic_features:
-            X_aug = np.vstack([X] + synthetic_features)
-            y_aug = np.vstack([y] + synthetic_targets)
+            X_aug = np.vstack([X] + synthetic_features).astype(np.float32)
+            y_aug = np.vstack([y] + synthetic_targets).astype(np.float32)
+            cls_aug, mean_aug, maxp_aug, attn_aug = split_features(X_aug)
         else:
-            X_aug, y_aug = X.copy(), y.copy()
+            cls_aug, mean_aug, maxp_aug, attn_aug = cls, mean, maxp, attn
+            y_aug = y
 
         normal_mask = y_aug.sum(axis=1) == 0
         anomaly_mask = ~normal_mask
-        X_normals = X_aug[normal_mask]
-        Y_normals = y_aug[normal_mask]
-        X_anomalies = X_aug[anomaly_mask]
-        Y_anomalies = y_aug[anomaly_mask]
-
-        # Compute desired normal/anomaly counts; keep all normals by default when leaves are balanced separately
-        base_total = len(X_aug)
+        normal_indices = np.where(normal_mask)[0]
 
         active_leaf_indices = [
             idx for idx in leaf_indices if idx < y_aug.shape[1] and np.any(y_aug[:, idx] == 1)
         ]
 
-        per_class_target = None
-        desired_anomaly_target = None
-        desired_normal = len(X_normals)
-        if not active_leaf_indices:
-            desired_total = min(BALANCED_SAMPLE_TARGET, base_total)
-            desired_anomaly_target = max(1, int(round(desired_total * target_contamination)))
-            desired_normal = max(1, desired_total - desired_anomaly_target)
-
-        def balance_anomalies(
-            X_group: np.ndarray,
-            Y_group: np.ndarray,
-            target_count: int,
-            candidate_classes: Sequence[int],
-        ) -> Tuple[np.ndarray, np.ndarray]:
-            if target_count <= 0 or len(X_group) == 0:
-                return np.empty((0, X_group.shape[1]), dtype=np.float32), np.empty(
-                    (0, Y_group.shape[1]), dtype=np.float32
-                )
-
-            # Collect only classes that actually have positive samples in the anomaly pool.
-            class_positive_indices: List[Tuple[int, np.ndarray]] = []
-            seen: set[int] = set()
-            for cls_idx in candidate_classes:
-                if cls_idx >= Y_group.shape[1] or cls_idx in seen:
-                    continue
-                seen.add(cls_idx)
-                positives = np.where(Y_group[:, cls_idx] == 1)[0]
-                if positives.size:
-                    class_positive_indices.append((cls_idx, positives))
-
-            if not class_positive_indices:
-                fallback = np.where(Y_group.sum(axis=1) > 0)[0]
-                if fallback.size == 0:
-                    return np.empty((0, X_group.shape[1]), dtype=np.float32), np.empty(
-                        (0, Y_group.shape[1]), dtype=np.float32
-                    )
-                take = min(target_count, fallback.size)
-                select = rng.choice(fallback, size=take, replace=fallback.size < take)
-                return X_group[select], Y_group[select]
-
-            per_class = max(1, math.ceil(target_count / len(class_positive_indices)))
-            adjusted_target = per_class * len(class_positive_indices)
-
-            sampled_features: List[np.ndarray] = []
-            sampled_targets: List[np.ndarray] = []
-
-            for cls_idx, positives in class_positive_indices:
-                quota = per_class
-                replace = positives.size < quota
-                sampled = rng.choice(positives, size=quota, replace=replace)
-                sampled_features.append(X_group[sampled])
-                sampled_targets.append(Y_group[sampled])
-
-            X_bal = np.vstack(sampled_features).astype(np.float32)
-            y_bal = np.vstack(sampled_targets).astype(np.float32)
-
-            if len(X_bal) > adjusted_target:
-                perm = rng.permutation(len(X_bal))[:adjusted_target]
-                X_bal = X_bal[perm]
-                y_bal = y_bal[perm]
-            elif len(X_bal) < adjusted_target:
-                deficit = adjusted_target - len(X_bal)
-                replen_idx = rng.choice(len(X_group), size=deficit, replace=len(X_group) < deficit)
-                X_bal = np.vstack([X_bal, X_group[replen_idx]]).astype(np.float32)
-                y_bal = np.vstack([y_bal, Y_group[replen_idx]]).astype(np.float32)
-
-            perm = rng.permutation(len(X_bal))
-            return X_bal[perm], y_bal[perm]
-
-        def adjust_normals(X_group: np.ndarray, Y_group: np.ndarray, target_count: int) -> Tuple[np.ndarray, np.ndarray]:
-            if len(X_group) >= target_count:
-                idx = rng.choice(len(X_group), size=target_count, replace=False)
-                return X_group[idx], Y_group[idx]
-            shortfall = target_count - len(X_group)
-            augment = replicate_with_noise(X_group, shortfall)
-            Y_augmented = np.zeros((augment.shape[0], Y_group.shape[1]), dtype=np.float32)
-            return np.vstack([X_group, augment]), np.vstack([Y_group, Y_augmented])
-
-        X_normals_bal, Y_normals_bal = adjust_normals(X_normals, Y_normals, desired_normal)
-
-        if active_leaf_indices:
-            X_anomalies_bal, Y_anomalies_bal = X_anomalies, Y_anomalies
-        else:
-            target_anomaly = desired_anomaly_target if desired_anomaly_target is not None else max(1, len(X_anomalies))
-            X_anomalies_bal, Y_anomalies_bal = balance_anomalies(
-                X_anomalies,
-                Y_anomalies,
-                target_anomaly,
-                leaf_indices,
-            )
-
-        # Align reported targets with achieved class sizes to make balance explicit
-        desired_normal = X_normals_bal.shape[0]
-
         idx_to_name = {
             node_to_index[name]: name
             for name in node_names
-            if name in node_to_index and node_to_index[name] < y.shape[1]
+            if name in node_to_index and node_to_index[name] < y_aug.shape[1]
         }
 
         index_children: Dict[int, List[int]] = {}
@@ -740,176 +714,129 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             parent_idx = node_to_index.get(parent_name)
             if child_idx is None or parent_idx is None:
                 continue
-            if child_idx >= Y_anomalies_bal.shape[1] or parent_idx >= Y_anomalies_bal.shape[1]:
+            if child_idx >= y_aug.shape[1] or parent_idx >= y_aug.shape[1]:
                 continue
             index_children.setdefault(parent_idx, []).append(child_idx)
 
-        active_leaves = [
-            idx for idx in active_leaf_indices if idx < Y_anomalies_bal.shape[1] and np.any(Y_anomalies_bal[:, idx] == 1)
-        ]
-        active_parents = [
-            idx for idx, children in index_children.items()
-            if children and np.any(Y_anomalies_bal[:, idx] == 1)
-        ]
-
+        leaf_targets: Dict[int, int] = {}
         parent_targets: Dict[int, int] = {}
+        class_indices: Dict[str, np.ndarray] = {}
+        class_targets: Dict[str, int] = {}
 
-        if not active_leaves:
-            X_anomaly_struct = X_anomalies_bal.astype(np.float32)
-            Y_anomaly_struct = Y_anomalies_bal.astype(np.float32)
-        else:
-            leaf_counts: Dict[int, int] = {
-                leaf_idx: int((Y_anomalies_bal[:, leaf_idx] == 1).sum())
-                for leaf_idx in active_leaves
+        if normal_indices.size:
+            class_indices["normal"] = normal_indices
+            class_targets["normal"] = int(normal_indices.size)
+
+        per_class_target = None
+        desired_anomaly_target = None
+
+        if active_leaf_indices:
+            leaf_counts = {
+                idx: int((y_aug[:, idx] == 1).sum())
+                for idx in active_leaf_indices
             }
-            leaf_count = len(active_leaves)
-            parent_count = len(active_parents)
-
             leaf_target = max(leaf_counts.values()) if leaf_counts else 0
-            parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count and leaf_target > 0 else 0
+            if leaf_target > 0:
+                per_class_target = leaf_target
+                for leaf_idx in active_leaf_indices:
+                    candidates = np.where(y_aug[:, leaf_idx] == 1)[0]
+                    if candidates.size == 0:
+                        continue
+                    key = f"leaf:{leaf_idx}"
+                    class_indices[key] = candidates
+                    class_targets[key] = leaf_target
+                    leaf_targets[leaf_idx] = leaf_target
 
-            leaf_targets = {idx: leaf_target for idx in active_leaves}
-            parent_targets = {idx: parent_target for idx in active_parents}
+                parent_base = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if PARENT_EXTRA_FRACTION > 0 else 0
+                for parent_idx, children in index_children.items():
+                    if parent_idx >= y_aug.shape[1]:
+                        continue
+                    if not np.any(y_aug[:, parent_idx] == 1):
+                        continue
+                    child_candidates = [child for child in children if child < y_aug.shape[1]]
+                    parent_mask = y_aug[:, parent_idx] == 1
+                    if child_candidates:
+                        parent_mask = np.logical_and(
+                            parent_mask, (y_aug[:, child_candidates].sum(axis=1) == 0)
+                        )
+                    parent_only = np.where(parent_mask)[0]
+                    if parent_only.size == 0:
+                        if parent_base > 0:
+                            print(
+                                f"Warning: Unable to schedule parent-only samples for {idx_to_name.get(parent_idx, str(parent_idx))}"
+                            )
+                        continue
+                    if parent_base <= 0:
+                        continue
+                    key = f"parent:{parent_idx}"
+                    class_indices[key] = parent_only
+                    class_targets[key] = parent_base
+                    parent_targets[parent_idx] = parent_base
 
-            per_class_target = leaf_target if leaf_target > 0 else None
-            desired_anomaly_target = leaf_target * leaf_count + parent_target * parent_count
-
-            leaf_blocks: List[np.ndarray] = []
-            leaf_label_blocks: List[np.ndarray] = []
-            leaf_positive_map: Dict[int, np.ndarray] = {}
-            unsatisfied_leaf_quota = 0
-            for leaf_idx in active_leaves:
-                positives = np.where(Y_anomalies_bal[:, leaf_idx] == 1)[0]
-                if positives.size:
-                    leaf_positive_map[leaf_idx] = positives
-                quota = leaf_targets.get(leaf_idx, 0)
-                if quota <= 0:
-                    continue
-                if positives.size == 0:
-                    unsatisfied_leaf_quota += quota
-                    print(
-                        f"Warning: Unable to satisfy leaf quota for {idx_to_name.get(leaf_idx, str(leaf_idx))}; reallocating"
-                    )
-                    continue
-                replace = positives.size < quota
-                sampled = rng.choice(positives, size=quota, replace=replace)
-                leaf_blocks.append(X_anomalies_bal[sampled])
-                leaf_label_blocks.append(Y_anomalies_bal[sampled])
-
-            if unsatisfied_leaf_quota > 0 and leaf_positive_map:
-                alloc_leaves = list(leaf_positive_map.keys())
-                idx_cycle = 0
-                while unsatisfied_leaf_quota > 0 and alloc_leaves:
-                    leaf_idx = alloc_leaves[idx_cycle % len(alloc_leaves)]
-                    positives = leaf_positive_map[leaf_idx]
-                    sampled = rng.choice(positives, size=1, replace=False)
-                    leaf_blocks.append(X_anomalies_bal[sampled])
-                    leaf_label_blocks.append(Y_anomalies_bal[sampled])
-                    unsatisfied_leaf_quota -= 1
-                    idx_cycle += 1
-
-            parent_blocks: List[np.ndarray] = []
-            parent_label_blocks: List[np.ndarray] = []
-            redistributed = 0
-            for parent_idx in active_parents:
-                quota = parent_targets.get(parent_idx, 0)
-                if quota <= 0:
-                    continue
-                child_indices = [
-                    child for child in index_children.get(parent_idx, [])
-                    if child < Y_anomalies_bal.shape[1]
-                ]
-                parent_mask = Y_anomalies_bal[:, parent_idx] == 1
-                if child_indices:
-                    parent_mask = np.logical_and(
-                        parent_mask, (Y_anomalies_bal[:, child_indices].sum(axis=1) == 0)
-                    )
-                candidates = np.where(parent_mask)[0]
-                if candidates.size == 0:
-                    redistributed += quota
-                    print(
-                        f"Warning: Unable to satisfy parent-only quota for {idx_to_name.get(parent_idx, str(parent_idx))}; reallocating"
-                    )
-                    continue
-                replace = candidates.size < quota
-                sampled = rng.choice(candidates, size=quota, replace=replace)
-                parent_blocks.append(X_anomalies_bal[sampled])
-                parent_label_blocks.append(Y_anomalies_bal[sampled])
-
-            if redistributed > 0 and leaf_positive_map:
-                alloc_leaves = list(leaf_positive_map.keys())
-                idx_cycle = 0
-                while redistributed > 0 and alloc_leaves:
-                    leaf_idx = alloc_leaves[idx_cycle % len(alloc_leaves)]
-                    positives = leaf_positive_map[leaf_idx]
-                    sampled = rng.choice(positives, size=1, replace=False)
-                    leaf_blocks.append(X_anomalies_bal[sampled])
-                    leaf_label_blocks.append(Y_anomalies_bal[sampled])
-                    redistributed -= 1
-                    idx_cycle += 1
-
-            anomaly_blocks = leaf_blocks + parent_blocks
-            anomaly_label_blocks = leaf_label_blocks + parent_label_blocks
-
-            if anomaly_blocks:
-                X_anomaly_struct = np.vstack(anomaly_blocks).astype(np.float32)
-                Y_anomaly_struct = np.vstack(anomaly_label_blocks).astype(np.float32)
+                desired_anomaly_target = sum(
+                    count
+                    for key, count in class_targets.items()
+                    if not key.startswith("normal")
+                )
             else:
-                X_anomaly_struct = np.empty((0, X_anomalies_bal.shape[1]), dtype=np.float32)
-                Y_anomaly_struct = np.empty((0, Y_anomalies_bal.shape[1]), dtype=np.float32)
+                print("Warning: Unable to determine leaf target; falling back to original distribution")
+        else:
+            desired_anomaly_target = int(anomaly_mask.sum())
 
-        X_balanced = np.vstack([X_normals_bal, X_anomaly_struct]).astype(np.float32)
-        y_balanced = np.vstack([Y_normals_bal, Y_anomaly_struct]).astype(np.float32)
-        if desired_anomaly_target is None:
-            desired_anomaly_target = X_anomaly_struct.shape[0]
+        total_targets = sum(class_targets.values())
+        if total_targets == 0:
+            spinner.stop_and_persist(text="Resampling skipped (no class targets computed)")
+            return train_loader
 
-        balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
-        balanced_anomaly = int(len(y_balanced) - balanced_normal)
-        balanced_class_counts = class_counts(y_balanced)
+        dataset = TensorDataset(
+            torch.from_numpy(cls_aug).float(),
+            torch.from_numpy(mean_aug).float(),
+            torch.from_numpy(maxp_aug).float(),
+            torch.from_numpy(attn_aug).float(),
+            torch.from_numpy(y_aug).float(),
+        )
 
-        # Present distribution deltas to assist debugging/tuning
-        print("\nBalanced dataset distribution (after SMOTE & contamination control):")
-        print(f"  total samples: {len(y_balanced)}")
-        print(f"  normal:  {balanced_normal} (target {desired_normal})")
-        print(f"  attack:  {balanced_anomaly} (target {desired_anomaly_target})")
+        batch_size = getattr(train_loader, "batch_size", 128)
+        sampler = BalancedBatchSampler(class_indices, class_targets, batch_size=batch_size, seed=42)
+
+        print("\nStreaming class targets (per epoch):")
+        print(f"  total target samples: {total_targets}")
+        normal_target = class_targets.get("normal", 0)
+        attack_target = total_targets - normal_target
+        print(f"  normal target: {normal_target}")
+        print(f"  attack target: {attack_target}")
         if per_class_target is not None:
             print(f"  per-leaf target: {per_class_target}")
-            if parent_targets:
-                parent_quota_values = sorted(set(value for value in parent_targets.values() if value > 0))
-                if parent_quota_values:
-                    quota_display = ", ".join(str(value) for value in parent_quota_values)
+        if parent_targets:
+            parent_quota_values = sorted(set(parent_targets.values()))
+            if parent_quota_values:
+                quota_display = ", ".join(str(value) for value in parent_quota_values if value > 0)
+                if quota_display:
                     print(f"  per-parent extra quota: {quota_display}")
-        print("\nPer-class adjustments:")
+
+        print("\nPer-class targets vs originals:")
         adjustments = []
-        adjustments.append(("normal", original_normal, balanced_normal, balanced_normal - original_normal))
-        for idx, name in enumerate(node_names[: y_balanced.shape[1]]):
-            before = int(original_class_counts[idx])
-            after = int(balanced_class_counts[idx])
-            if before == 0 and after == 0:
-                continue
-            delta = after - before
-            adjustments.append((name, before, after, delta))
+        adjustments.append(("normal", original_normal, normal_target, normal_target - original_normal))
+        for leaf_idx, target in leaf_targets.items():
+            name = idx_to_name.get(leaf_idx, str(leaf_idx))
+            before = int(original_class_counts[leaf_idx])
+            adjustments.append((name, before, target, target - before))
+        for parent_idx, target in parent_targets.items():
+            name = idx_to_name.get(parent_idx, str(parent_idx))
+            before = int(original_class_counts[parent_idx])
+            adjustments.append((name, before, target, target - before))
 
         adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
         for name, before, after, delta in adjustments:
             trend = "++" if delta > 0 else "--" if delta < 0 else "=="
-            print(f"  {name:<25} {after:>6} ({trend} {delta:+d})")
+            print(f"  {name:<25} {after:>8} ({trend} {delta:+d})")
 
-        cls_bal, mean_bal, maxp_bal, attn_bal = split_features(X_balanced)
-        dataset = TensorDataset(
-            torch.from_numpy(cls_bal).float(),
-            torch.from_numpy(mean_bal).float(),
-            torch.from_numpy(maxp_bal).float(),
-            torch.from_numpy(attn_bal).float(),
-            torch.from_numpy(y_balanced).float(),
-        )
-
-        spin_msg = "Resampling completed"
+        spin_msg = "Streaming resampler ready"
         spinner.stop_and_persist(text=spin_msg)
+
         return DataLoader(
             dataset,
-            batch_size=getattr(train_loader, "batch_size", 128),
-            shuffle=True,
+            batch_sampler=sampler,
             num_workers=8,
             pin_memory=(device.type == "cuda"),
             persistent_workers=True,
