@@ -625,24 +625,20 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         X_anomalies = X_aug[anomaly_mask]
         Y_anomalies = y_aug[anomaly_mask]
 
-        # Compute desired normal/anomaly counts based on contamination rate and dataset size
+        # Compute desired normal/anomaly counts; keep all normals by default when leaves are balanced separately
         base_total = len(X_aug)
-        desired_total = min(BALANCED_SAMPLE_TARGET, base_total)
 
         active_leaf_indices = [
             idx for idx in leaf_indices if idx < y_aug.shape[1] and np.any(y_aug[:, idx] == 1)
         ]
 
         per_class_target = None
-        if active_leaf_indices:
-            total_classes = len(active_leaf_indices) + 1  # include normal class
-            per_class_target = max(1, desired_total // total_classes)
-            desired_total = per_class_target * total_classes
-            desired_normal = per_class_target
-            desired_anomaly = per_class_target * len(active_leaf_indices)
-        else:
-            desired_anomaly = max(1, int(round(desired_total * target_contamination)))
-            desired_normal = max(1, desired_total - desired_anomaly)
+        desired_anomaly_target = None
+        desired_normal = len(X_normals)
+        if not active_leaf_indices:
+            desired_total = min(BALANCED_SAMPLE_TARGET, base_total)
+            desired_anomaly_target = max(1, int(round(desired_total * target_contamination)))
+            desired_normal = max(1, desired_total - desired_anomaly_target)
 
         def balance_anomalies(
             X_group: np.ndarray,
@@ -715,16 +711,20 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             return np.vstack([X_group, augment]), np.vstack([Y_group, Y_augmented])
 
         X_normals_bal, Y_normals_bal = adjust_normals(X_normals, Y_normals, desired_normal)
-        X_anomalies_bal, Y_anomalies_bal = balance_anomalies(
-            X_anomalies,
-            Y_anomalies,
-            desired_anomaly,
-            leaf_indices,
-        )
+
+        if active_leaf_indices:
+            X_anomalies_bal, Y_anomalies_bal = X_anomalies, Y_anomalies
+        else:
+            target_anomaly = desired_anomaly_target if desired_anomaly_target is not None else max(1, len(X_anomalies))
+            X_anomalies_bal, Y_anomalies_bal = balance_anomalies(
+                X_anomalies,
+                Y_anomalies,
+                target_anomaly,
+                leaf_indices,
+            )
 
         # Align reported targets with achieved class sizes to make balance explicit
         desired_normal = X_normals_bal.shape[0]
-        desired_anomaly_budget = max(0, desired_total - desired_normal)
 
         idx_to_name = {
             node_to_index[name]: name
@@ -752,59 +752,28 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             if children and np.any(Y_anomalies_bal[:, idx] == 1)
         ]
 
-        leaf_count = len(active_leaves)
-        parent_count = len(active_parents)
-        leaf_targets: Dict[int, int] = {}
         parent_targets: Dict[int, int] = {}
 
-        leaf_target = 0
-        if desired_anomaly_budget > 0 and leaf_count > 0:
-            effective_classes = leaf_count + parent_count
-            if effective_classes > 0:
-                leaf_target = max(1, desired_anomaly_budget // effective_classes)
-            else:
-                leaf_target = max(1, desired_anomaly_budget // leaf_count)
-
-            if leaf_target > 0:
-                while leaf_target > 0:
-                    parent_target_est = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
-                    total_alloc = leaf_target * leaf_count + parent_target_est * parent_count
-                    if total_alloc <= desired_anomaly_budget:
-                        break
-                    leaf_target -= 1
-
-        parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count and leaf_target > 0 else 0
-
-        for idx in active_leaves:
-            leaf_targets[idx] = leaf_target
-        for idx in active_parents:
-            parent_targets[idx] = parent_target
-
-        if per_class_target is not None:
-            per_class_target = leaf_target
-
-        allocated = leaf_target * leaf_count + parent_target * parent_count
-        remaining = max(0, desired_anomaly_budget - allocated)
-
-        if remaining > 0 and leaf_targets:
-            idx_cycle = 0
-            while remaining > 0 and active_leaves:
-                leaf_idx = active_leaves[idx_cycle % len(active_leaves)]
-                leaf_targets[leaf_idx] += 1
-                remaining -= 1
-                idx_cycle += 1
-        if remaining > 0 and parent_targets:
-            idx_cycle = 0
-            while remaining > 0 and active_parents:
-                parent_idx = active_parents[idx_cycle % len(active_parents)]
-                parent_targets[parent_idx] += 1
-                remaining -= 1
-                idx_cycle += 1
-
-        if desired_anomaly_budget == 0:
-            X_anomaly_struct = np.empty((0, X_anomalies_bal.shape[1]), dtype=np.float32)
-            Y_anomaly_struct = np.empty((0, Y_anomalies_bal.shape[1]), dtype=np.float32)
+        if not active_leaves:
+            X_anomaly_struct = X_anomalies_bal.astype(np.float32)
+            Y_anomaly_struct = Y_anomalies_bal.astype(np.float32)
         else:
+            leaf_counts: Dict[int, int] = {
+                leaf_idx: int((Y_anomalies_bal[:, leaf_idx] == 1).sum())
+                for leaf_idx in active_leaves
+            }
+            leaf_count = len(active_leaves)
+            parent_count = len(active_parents)
+
+            leaf_target = max(leaf_counts.values()) if leaf_counts else 0
+            parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count and leaf_target > 0 else 0
+
+            leaf_targets = {idx: leaf_target for idx in active_leaves}
+            parent_targets = {idx: parent_target for idx in active_parents}
+
+            per_class_target = leaf_target if leaf_target > 0 else None
+            desired_anomaly_target = leaf_target * leaf_count + parent_target * parent_count
+
             leaf_blocks: List[np.ndarray] = []
             leaf_label_blocks: List[np.ndarray] = []
             leaf_positive_map: Dict[int, np.ndarray] = {}
@@ -891,7 +860,8 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         X_balanced = np.vstack([X_normals_bal, X_anomaly_struct]).astype(np.float32)
         y_balanced = np.vstack([Y_normals_bal, Y_anomaly_struct]).astype(np.float32)
-        desired_anomaly = X_anomaly_struct.shape[0]
+        if desired_anomaly_target is None:
+            desired_anomaly_target = X_anomaly_struct.shape[0]
 
         balanced_normal = int((y_balanced.sum(axis=1) == 0).sum())
         balanced_anomaly = int(len(y_balanced) - balanced_normal)
@@ -901,7 +871,7 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print("\nBalanced dataset distribution (after SMOTE & contamination control):")
         print(f"  total samples: {len(y_balanced)}")
         print(f"  normal:  {balanced_normal} (target {desired_normal})")
-        print(f"  attack:  {balanced_anomaly} (target {desired_anomaly})")
+        print(f"  attack:  {balanced_anomaly} (target {desired_anomaly_target})")
         if per_class_target is not None:
             print(f"  per-leaf target: {per_class_target}")
             if parent_targets:
