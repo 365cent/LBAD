@@ -723,10 +723,23 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
-        normal_target = int(normal_indices.size)
-        if normal_target:
+        desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y_aug)
+        contamination = float(np.clip(TARGET_CONTAMINATION, 0.0, 0.999999))
+        normal_target = int(round(desired_total * (1.0 - contamination))) if contamination < 1.0 else 0
+        normal_target = max(0, normal_target)
+
+        if normal_indices.size == 0:
+            if normal_target > 0:
+                print(
+                    "Warning: Contamination target requests normal samples but none are available; reallocating to attacks"
+                )
+            normal_target = 0
+        elif normal_target > 0:
+            normal_target = max(1, normal_target)
             class_indices["normal"] = normal_indices
             class_targets["normal"] = normal_target
+
+        desired_anomaly_budget = max(0, desired_total - normal_target)
 
         per_class_target = None
         desired_anomaly_target = None
@@ -763,14 +776,7 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
             parent_count = len(parent_candidate_map)
 
-            contamination = TARGET_CONTAMINATION
-            if normal_target > 0 and contamination < 1.0:
-                attack_target_total = int(round(
-                    normal_target * contamination / max(1.0 - contamination, 1e-6)
-                ))
-            else:
-                attack_target_total = int(anomaly_mask.sum())
-
+            attack_target_total = max(1, desired_anomaly_budget)
             attack_target_total = max(attack_target_total, leaf_count)
             if PARENT_EXTRA_FRACTION > 0 and parent_count > 0:
                 attack_target_total = max(attack_target_total, leaf_count + parent_count)
@@ -819,13 +825,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     remainder -= 1
                     idx_cycle += 1
 
-            if remainder > 0 and normal_target:
-                class_targets["normal"] += remainder
-                normal_target += remainder
-                print(
-                    f"Warning: Allocated remaining {remainder} samples to normals to satisfy contamination ratio"
-                )
-
             for leaf_idx, target in leaf_targets.items():
                 positives = leaf_positive_map.get(leaf_idx)
                 if target <= 0 or positives is None or positives.size == 0:
@@ -848,7 +847,10 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     count for key, count in class_targets.items() if not key.startswith("normal")
                 )
         else:
-            desired_anomaly_target = int(anomaly_mask.sum())
+            desired_anomaly_target = max(1, desired_anomaly_budget) if desired_anomaly_budget else int(anomaly_mask.sum())
+
+        if desired_anomaly_target is None:
+            desired_anomaly_target = max(0, desired_anomaly_budget)
 
         total_targets = sum(class_targets.values())
         if total_targets == 0:
