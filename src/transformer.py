@@ -723,63 +723,130 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
-        if normal_indices.size:
+        normal_target = int(normal_indices.size)
+        if normal_target:
             class_indices["normal"] = normal_indices
-            class_targets["normal"] = int(normal_indices.size)
+            class_targets["normal"] = normal_target
 
         per_class_target = None
         desired_anomaly_target = None
 
         if active_leaf_indices:
-            leaf_counts = {
-                idx: int((y_aug[:, idx] == 1).sum())
-                for idx in active_leaf_indices
-            }
-            leaf_target = max(leaf_counts.values()) if leaf_counts else 0
-            if leaf_target > 0:
-                per_class_target = leaf_target
-                for leaf_idx in active_leaf_indices:
-                    candidates = np.where(y_aug[:, leaf_idx] == 1)[0]
-                    if candidates.size == 0:
-                        continue
-                    key = f"leaf:{leaf_idx}"
-                    class_indices[key] = candidates
-                    class_targets[key] = leaf_target
-                    leaf_targets[leaf_idx] = leaf_target
+            leaf_positive_map: Dict[int, np.ndarray] = {}
+            for leaf_idx in active_leaf_indices:
+                positives = np.where(y_aug[:, leaf_idx] == 1)[0]
+                if positives.size:
+                    leaf_positive_map[leaf_idx] = positives
+                else:
+                    print(
+                        f"Warning: Leaf '{idx_to_name.get(leaf_idx, leaf_idx)}' has no positive samples; skipping"
+                    )
 
-                parent_base = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if PARENT_EXTRA_FRACTION > 0 else 0
-                for parent_idx, children in index_children.items():
-                    if parent_idx >= y_aug.shape[1]:
-                        continue
-                    if not np.any(y_aug[:, parent_idx] == 1):
-                        continue
-                    child_candidates = [child for child in children if child < y_aug.shape[1]]
-                    parent_mask = y_aug[:, parent_idx] == 1
-                    if child_candidates:
-                        parent_mask = np.logical_and(
-                            parent_mask, (y_aug[:, child_candidates].sum(axis=1) == 0)
-                        )
-                    parent_only = np.where(parent_mask)[0]
-                    if parent_only.size == 0:
-                        if parent_base > 0:
-                            print(
-                                f"Warning: Unable to schedule parent-only samples for {idx_to_name.get(parent_idx, str(parent_idx))}"
-                            )
-                        continue
-                    if parent_base <= 0:
-                        continue
-                    key = f"parent:{parent_idx}"
-                    class_indices[key] = parent_only
-                    class_targets[key] = parent_base
-                    parent_targets[parent_idx] = parent_base
+            leaf_count = len(leaf_positive_map)
+            parent_candidate_map: Dict[int, np.ndarray] = {}
+            for parent_idx, children in index_children.items():
+                if parent_idx >= y_aug.shape[1]:
+                    continue
+                parent_mask = y_aug[:, parent_idx] == 1
+                child_candidates = [child for child in children if child < y_aug.shape[1]]
+                if child_candidates:
+                    parent_mask = np.logical_and(
+                        parent_mask, (y_aug[:, child_candidates].sum(axis=1) == 0)
+                    )
+                candidates = np.where(parent_mask)[0]
+                if candidates.size:
+                    parent_candidate_map[parent_idx] = candidates
+                elif PARENT_EXTRA_FRACTION > 0:
+                    print(
+                        f"Warning: Parent '{idx_to_name.get(parent_idx, parent_idx)}' lacks exclusive samples; skipping parent quota"
+                    )
 
-                desired_anomaly_target = sum(
-                    count
-                    for key, count in class_targets.items()
-                    if not key.startswith("normal")
-                )
+            parent_count = len(parent_candidate_map)
+
+            contamination = TARGET_CONTAMINATION
+            if normal_target > 0 and contamination < 1.0:
+                attack_target_total = int(round(
+                    normal_target * contamination / max(1.0 - contamination, 1e-6)
+                ))
             else:
-                print("Warning: Unable to determine leaf target; falling back to original distribution")
+                attack_target_total = int(anomaly_mask.sum())
+
+            attack_target_total = max(attack_target_total, leaf_count)
+            if PARENT_EXTRA_FRACTION > 0 and parent_count > 0:
+                attack_target_total = max(attack_target_total, leaf_count + parent_count)
+
+            effective_classes = leaf_count + parent_count * PARENT_EXTRA_FRACTION
+
+            if effective_classes <= 0:
+                leaf_target = attack_target_total
+                parent_target = 0
+            else:
+                leaf_target = max(1, int(attack_target_total / max(effective_classes, 1e-6)))
+                while leaf_target > 0:
+                    parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
+                    allocated = leaf_target * leaf_count + parent_target * parent_count
+                    if allocated <= attack_target_total:
+                        break
+                    leaf_target -= 1
+                if leaf_target == 0:
+                    leaf_target = 1
+                parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
+                allocated = leaf_target * leaf_count + parent_target * parent_count
+
+            leaf_targets = {idx: leaf_target for idx in leaf_positive_map.keys()}
+            parent_targets = {
+                idx: parent_target for idx in parent_candidate_map.keys() if parent_target > 0
+            }
+
+            allocated = leaf_target * leaf_count + parent_target * parent_count
+            remainder = attack_target_total - allocated
+
+            if remainder > 0 and leaf_targets:
+                leaf_keys = list(leaf_targets.keys())
+                idx_cycle = 0
+                while remainder > 0 and leaf_keys:
+                    leaf_idx = leaf_keys[idx_cycle % len(leaf_keys)]
+                    leaf_targets[leaf_idx] += 1
+                    remainder -= 1
+                    idx_cycle += 1
+
+            if remainder > 0 and parent_targets:
+                parent_keys = list(parent_targets.keys())
+                idx_cycle = 0
+                while remainder > 0 and parent_keys:
+                    parent_idx = parent_keys[idx_cycle % len(parent_keys)]
+                    parent_targets[parent_idx] += 1
+                    remainder -= 1
+                    idx_cycle += 1
+
+            if remainder > 0 and normal_target:
+                class_targets["normal"] += remainder
+                normal_target += remainder
+                print(
+                    f"Warning: Allocated remaining {remainder} samples to normals to satisfy contamination ratio"
+                )
+
+            for leaf_idx, target in leaf_targets.items():
+                positives = leaf_positive_map.get(leaf_idx)
+                if target <= 0 or positives is None or positives.size == 0:
+                    continue
+                key = f"leaf:{leaf_idx}"
+                class_indices[key] = positives
+                class_targets[key] = int(target)
+
+            for parent_idx, target in parent_targets.items():
+                candidates = parent_candidate_map.get(parent_idx)
+                if target <= 0 or candidates is None or candidates.size == 0:
+                    continue
+                key = f"parent:{parent_idx}"
+                class_indices[key] = candidates
+                class_targets[key] = int(target)
+
+            if class_targets:
+                per_class_target = leaf_target if leaf_targets else None
+                desired_anomaly_target = sum(
+                    count for key, count in class_targets.items() if not key.startswith("normal")
+                )
         else:
             desired_anomaly_target = int(anomaly_mask.sum())
 
