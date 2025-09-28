@@ -645,24 +645,17 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         anomaly_mask = ~normal_mask
         normal_indices = np.where(normal_mask)[0]
 
-        leaf_targets: Dict[int, int] = {}
-        parent_targets: Dict[int, int] = {}
+        leaf_quota = int(BALANCED_SAMPLE_TARGET)
+        if leaf_quota <= 0:
+            spinner.stop_and_persist(text="Resampling skipped (BALANCED_SAMPLE_TARGET must be positive)")
+            return train_loader
+
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
-        desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y)
-        contamination = float(np.clip(TARGET_CONTAMINATION, 0.0, 0.999999))
-        normal_target = int(round(desired_total * (1.0 - contamination))) if contamination < 1.0 else 0
-        normal_target = max(0, normal_target)
-
-        if normal_indices.size == 0:
-            normal_target = 0
-        elif normal_target > 0:
-            normal_target = max(1, normal_target)
+        if normal_indices.size > 0:
             class_indices["normal"] = normal_indices
-            class_targets["normal"] = normal_target
-
-        desired_anomaly_budget = max(1, desired_total - normal_target)
+            class_targets["normal"] = leaf_quota
 
         active_leaf_indices = [
             idx for idx in leaf_indices if idx < y.shape[1] and np.any(y[:, idx] == 1)
@@ -689,77 +682,57 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 if fallback_parent.size:
                     parent_candidate_map[parent_idx] = fallback_parent
 
-        leaf_count = len(leaf_positive_map)
-        parent_count = len(parent_candidate_map) if PARENT_EXTRA_FRACTION > 0 else 0
+        available_nodes = set(leaf_positive_map.keys()) | set(parent_candidate_map.keys())
+        node_target_cache: Dict[int, int] = {}
 
-        if leaf_count == 0 and parent_count == 0:
+        def compute_node_target(node_idx: int) -> int:
+            if node_idx in node_target_cache:
+                return node_target_cache[node_idx]
+
+            is_leaf = node_idx in leaf_positive_map
+            is_parent_node = node_idx in parent_candidate_map
+            if not (is_leaf or is_parent_node):
+                node_target_cache[node_idx] = 0
+                return 0
+
+            child_total = 0
+            for child_idx in index_children.get(node_idx, []):
+                if child_idx not in available_nodes:
+                    continue
+                child_total += compute_node_target(child_idx)
+
+            base = leaf_quota
+            total = base + child_total if child_total > 0 else base
+            node_target_cache[node_idx] = int(total)
+            return int(total)
+
+        leaf_target_map: Dict[int, int] = {}
+        for leaf_idx, positives in leaf_positive_map.items():
+            target = compute_node_target(leaf_idx)
+            if target <= 0 or positives is None or positives.size == 0:
+                continue
+            key = f"leaf:{leaf_idx}"
+            class_indices[key] = positives
+            class_targets[key] = target
+            leaf_target_map[leaf_idx] = target
+
+        parent_target_map: Dict[int, int] = {}
+        for parent_idx, candidates in parent_candidate_map.items():
+            target = compute_node_target(parent_idx)
+            if target <= 0 or candidates is None or candidates.size == 0:
+                continue
+            key = f"parent:{parent_idx}"
+            class_indices[key] = candidates
+            class_targets[key] = target
+            parent_target_map[parent_idx] = target
+
+        if not leaf_target_map and not parent_target_map:
             attack_indices = np.where(anomaly_mask)[0]
             if attack_indices.size == 0:
                 spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
                 return train_loader
-            class_indices["attack"] = attack_indices
-            class_targets["attack"] = desired_anomaly_budget
-            per_class_target = None
-            desired_anomaly_target = desired_anomaly_budget
-        else:
-            effective_classes = leaf_count + parent_count * PARENT_EXTRA_FRACTION
-            if effective_classes <= 0:
-                leaf_target = desired_anomaly_budget
-                parent_target = 0
-            else:
-                leaf_target = max(1, int(desired_anomaly_budget / max(effective_classes, 1e-6)))
-                while leaf_target > 0:
-                    parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
-                    allocated = leaf_target * leaf_count + parent_target * parent_count
-                    if allocated <= desired_anomaly_budget:
-                        break
-                    leaf_target -= 1
-                if leaf_target == 0:
-                    leaf_target = 1
-                parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
-                allocated = leaf_target * leaf_count + parent_target * parent_count
-
-            leaf_targets = {idx: leaf_target for idx in leaf_positive_map.keys()}
-            parent_targets = {idx: parent_target for idx in parent_candidate_map.keys() if parent_target > 0}
-
-            allocated = leaf_target * leaf_count + parent_target * parent_count
-            remainder = desired_anomaly_budget - allocated
-
-            if remainder > 0 and leaf_targets:
-                leaf_keys = list(leaf_targets.keys())
-                idx_cycle = 0
-                while remainder > 0 and leaf_keys:
-                    leaf_idx = leaf_keys[idx_cycle % len(leaf_keys)]
-                    leaf_targets[leaf_idx] += 1
-                    remainder -= 1
-                    idx_cycle += 1
-            if remainder > 0 and parent_targets:
-                parent_keys = list(parent_targets.keys())
-                idx_cycle = 0
-                while remainder > 0 and parent_keys:
-                    parent_idx = parent_keys[idx_cycle % len(parent_keys)]
-                    parent_targets[parent_idx] += 1
-                    remainder -= 1
-                    idx_cycle += 1
-
-            per_class_target = leaf_target if leaf_count > 0 else None
-            desired_anomaly_target = desired_anomaly_budget
-
-            for leaf_idx, target in leaf_targets.items():
-                positives = leaf_positive_map.get(leaf_idx)
-                if target <= 0 or positives is None or positives.size == 0:
-                    continue
-                key = f"leaf:{leaf_idx}"
-                class_indices[key] = positives
-                class_targets[key] = int(target)
-
-            for parent_idx, target in parent_targets.items():
-                candidates = parent_candidate_map.get(parent_idx)
-                if target <= 0 or candidates is None or candidates.size == 0:
-                    continue
-                key = f"parent:{parent_idx}"
-                class_indices[key] = candidates
-                class_targets[key] = int(target)
+            class_indices["anomaly"] = attack_indices
+            class_targets["anomaly"] = leaf_quota
 
         total_targets = sum(class_targets.values())
         if total_targets == 0:
@@ -770,34 +743,30 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         sampler = BalancedBatchSampler(class_indices, class_targets, batch_size=batch_size, seed=42)
 
         print("\nStreaming class targets (per epoch):")
+        print(f"  leaf quota: {leaf_quota}")
         print(f"  total target samples: {total_targets}")
-        normal_target_display = class_targets.get("normal", 0)
-        attack_target_display = total_targets - normal_target_display
-        print(f"  normal target: {normal_target_display}")
-        print(f"  attack target: {attack_target_display}")
-        if per_class_target is not None:
-            print(f"  per-leaf target: {per_class_target}")
-        if parent_targets:
-            parent_quota_values = sorted(set(parent_targets.values()))
-            if parent_quota_values:
-                quota_display = ", ".join(str(value) for value in parent_quota_values if value > 0)
-                if quota_display:
-                    print(f"  per-parent extra quota: {quota_display}")
+        if "normal" in class_targets:
+            print(f"  normal target: {class_targets['normal']}")
+        if leaf_target_map:
+            print(f"  leaf classes: {len(leaf_target_map)}")
+        if parent_target_map:
+            print(f"  parent classes: {len(parent_target_map)}")
 
         print("\nPer-class targets vs originals:")
         adjustments = []
+        normal_target_display = class_targets.get("normal", 0)
         adjustments.append(("normal", original_normal, normal_target_display, normal_target_display - original_normal))
-        for leaf_idx, target in leaf_targets.items():
+        for leaf_idx, target in leaf_target_map.items():
             name = idx_to_name.get(leaf_idx, str(leaf_idx))
             before = int(original_class_counts[leaf_idx])
             adjustments.append((name, before, target, target - before))
-        for parent_idx, target in parent_targets.items():
+        for parent_idx, target in parent_target_map.items():
             name = idx_to_name.get(parent_idx, str(parent_idx))
             before = int(original_class_counts[parent_idx])
             adjustments.append((name, before, target, target - before))
-        if "attack" in class_targets:
+        if "anomaly" in class_targets:
             before = int(anomaly_mask.sum())
-            adjustments.append(("attack", before, class_targets["attack"], class_targets["attack"] - before))
+            adjustments.append(("anomaly", before, class_targets["anomaly"], class_targets["anomaly"] - before))
 
         adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
         for name, before, after, delta in adjustments:
@@ -933,7 +902,7 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
                 self.gamma = gamma
 
             def forward(self, input, target):
-                bce_loss = super().forward(input, target)
+                bce_loss = super().forward(input, target) # TODO: change to class entropy
                 pt = torch.exp(-bce_loss)
                 focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
                 return focal_loss
