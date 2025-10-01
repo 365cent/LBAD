@@ -1,14 +1,14 @@
 # LBAD - Log-Based Anomaly Detection Pipeline
 
-An end-to-end pipeline for log-based anomaly detection with resumeable embedding generation, multi-label transformer training, and comprehensive evaluation. Optimized for Apple Silicon (M2/MPS) and supports CUDA/CPU.
+An end-to-end pipeline for log-based anomaly detection with resumeable embedding generation, hierarchical multi-label transformer training, and comprehensive evaluation. Optimized for Apple Silicon (M2/MPS) and supports CUDA/CPU.
 
 ## Highlights
 
 - Preprocessing to TFRecords per log type
-- Embeddings: LogBERT (2314D enhanced), FastText (300D), Word2Vec (200D)
-- Resumeable, memory-mapped LogBERT extraction with 5% progress checkpoints
-- One-vs-Rest multi-label transformer training with SMOTE on train-only
-- Baseline multi-label ML (RF, LR, KNN, XGBoost) for comparison
+- Embeddings: FastText (300D), Word2Vec (300D), LogBERT (2314D enhanced)
+- Streaming balanced resampling for handling class imbalance
+- Hierarchical transformer with parent-child label propagation
+- Baseline multi-label ML (Logistic Regression, Linear Regression, Random Forest, XGBoost) for comparison
 - Clear artifacts: `embeddings/`, `models/`, `results/`, `checkpoints/`
 
 ## Pipeline Architecture
@@ -25,7 +25,7 @@ flowchart TD
         D --> E1["Load TFRecord data"]
         E1 --> F1["Tokenize log entries"]
         F1 --> G1["Generate FastText embeddings (300D)"]
-        F1 --> G2["Generate Word2Vec embeddings (200D)"]
+        F1 --> G2["Generate Word2Vec embeddings (300D)"]
         F1 --> G3["Generate LogBERT embeddings (2314D enhanced)"]
         G1 --> H1["Save embeddings & binary label matrices"]
         G2 --> H1
@@ -36,7 +36,7 @@ flowchart TD
 
     subgraph Transformer_Training
         H1 --> V1["Split data 80/20 (stratified)"]
-        V1 --> V2["SMOTE on train: StdScale → PCA (per block) → KMeansSMOTE + Tomek + RUS → inverse PCA/scale"]
+        V1 --> V2["Balanced sampling: per-class quotas with streaming resampler"]
         V2 --> V3["Train Hierarchical Transformer"]
         V3 --> V4["Hierarchy consistency loss + reconstruction loss + focal BCE"]
         V4 --> Y1["Multi-label predictions with parent→child propagation"]
@@ -44,7 +44,7 @@ flowchart TD
 
     subgraph Baseline_ML_Evaluation
         H1 --> I1["Load embeddings & labels"]
-        I1 --> J1["Train MultiOutputClassifiers (RF, XGBoost, LR, KNN)"]
+        I1 --> J1["Train MultiOutputClassifiers (RF, XGBoost, Logistic Reg, Linear Reg)"]
         J1 --> K1["Multi-label attack predictions"]
         K1 --> L1["Evaluate & record metrics"]
     end
@@ -168,34 +168,36 @@ Script: `src/fasttext_embedding.py`
 ```bash
 python src/fasttext_embedding.py [--log-type <type>] [--output-subdir fasttext]
 ```
-Outputs mirror LogBERT format under `embeddings/fasttext/<type>/`.
+- Uses pre-trained fasttext-wiki-news-subwords-300 model
+- Outputs mirror LogBERT format under `embeddings/fasttext/<type>/`
 
-### Word2Vec (200D)
+### Word2Vec (300D)
 
-Script: `src/word2vec_embedding_thesis.py`
+Script: `src/word2vec_embedding.py`
 ```bash
-python src/word2vec_embedding_thesis.py [--log-type <type>] [--output-subdir word2vec]
+python src/word2vec_embedding.py [--log-type <type>] [--output-subdir word2vec]
 ```
-Outputs mirror LogBERT format under `embeddings/word2vec/<type>/`.
+- Uses pre-trained word2vec-google-news-300 model
+- Outputs mirror LogBERT format under `embeddings/word2vec/<type>/`
 
-## Transformer Training (Hierarchical + SMOTE)
+## Transformer Training (Hierarchical + Balanced Sampling)
 
 Script: `src/transformer.py`
-- Auto-detects device (cuda/mps/cpu)
-- Splits data 80/20 (stratified)
-- Applies SMOTE on the training split only (details below)
+- Auto-detects device (cuda/mps/cpu) with optimized backend selection
+- Splits data 80/20 (stratified by anomaly presence)
+- Applies streaming balanced resampling with per-class quotas on the training split
 - Trains a single Hierarchical Transformer with per-node heads and parent→child propagation
-- Uses focal BCE with bounded class weights, hierarchy consistency loss, and a light reconstruction loss
-- AMP mixed precision, OneCycleLR, gradient clipping, and stability clamping
+- Uses focal BCE with bounded class weights, hierarchy consistency loss, and reconstruction loss
+- AMP mixed precision (CUDA/MPS), OneCycleLR scheduler, gradient clipping, and stability clamping
 
 CLI:
 ```bash
-python src/transformer.py
+python src/transformer.py [--embedding-type {fasttext,word2vec,logbert,all}] [--log-type <type>] [--sample-size N]
 ```
 
 Artifacts:
-- `results/hierarchical_<type>_evaluation_<timestamp>.txt` (per-class + overall metrics)
-- `models/hierarchical_<type>.pth` (trained model)
+- `results/hierarchical_<type>_<embedding>_evaluation_<timestamp>.txt` (per-class + overall metrics)
+- `models/hierarchical_<type>_<embedding>.pth` (trained model)
 
 ## Evaluation
 
@@ -210,9 +212,11 @@ Behavior
 
 Baselines: `src/ml_models.py`
 ```bash
-python src/ml_models.py --log-type wp-error --model all
+python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--log-type <type>]
 ```
-Generates reports and visualizations under `results/`.
+- Trains classical ML models: Logistic Regression, Linear Regression, Random Forest, XGBoost
+- Uses MultiOutputClassifier/MultiOutputRegressor wrappers for multi-label support
+- Generates detailed reports under `results/baseline_<model>_<type>_<embedding>_evaluation_<timestamp>.txt`
 
 ## Performance & Caching
 
@@ -231,21 +235,21 @@ Generates reports and visualizations under `results/`.
 ### Repository Structure
 - **Main Components**: logs/, labels/, processed/, embeddings/, models/, results/, checkpoints/, src/
 - **Key Scripts**: 
-  - preprocessing.py - TFRecord generation
-  - logbert_embeddings.py - Enhanced 2314D embeddings
-  - fasttext_embedding.py - 300D embeddings  
-  - word2vec_embedding_thesis.py - 200D embeddings
-  - transformer.py - One-vs-Rest multi-label training with SMOTE
-  - evaluate_models.py - Comprehensive evaluation
-  - ml_models.py - Traditional ML baselines
+  - preprocessing.py - TFRecord generation with log type classification
+  - logbert_embeddings.py - Enhanced 2314D embeddings with checkpointing
+  - fasttext_embedding.py - 300D pre-trained FastText embeddings
+  - word2vec_embedding.py - 300D pre-trained Word2Vec embeddings
+  - transformer.py - Hierarchical multi-label transformer with balanced sampling
+  - evaluate_models.py - Comprehensive evaluation with threshold optimization
+  - ml_models.py - Classical ML baselines (LR, Linear, RF, XGBoost)
 
 ### Embedding Specifications
 - **LogBERT**: 2314D (CLS(768) + Mean(768) + Max(768) + Attention top-10)
-- **FastText**: 300D subword-aware embeddings
-- **Word2Vec**: 200D semantic vector representations
-- **Hardware Support**: Apple Silicon (M2/MPS), CUDA, CPU
-- **Training**: One-vs-Rest with SMOTE on training split only
-- **Evaluation**: Micro/macro F1, precision, recall with threshold optimization
+- **FastText**: 300D pre-trained subword-aware embeddings (fasttext-wiki-news-subwords-300)
+- **Word2Vec**: 300D pre-trained semantic vectors (word2vec-google-news-300)
+- **Hardware Support**: Apple Silicon (M2/MPS), CUDA, CPU with automatic device detection
+- **Training**: Hierarchical transformer with streaming balanced resampling
+- **Evaluation**: Micro/macro F1, precision, recall, Jaccard score, anomaly detection metrics
 
 ### Dataset Information
 - **auth**: ~450 entries (small)
@@ -266,28 +270,40 @@ Generates reports and visualizations under `results/`.
 
 ### Hierarchical Transformer: Architecture & Training
 
-- Projections: CLS/Mean/Max (768→512), Attn (10→512); stack and encode with TransformerEncoder
-- Bottleneck + Decoder: latent reconstruction supports representation regularization
-- Heads: one linear head per hierarchy node; outputs logits (BCEWithLogits)
-- Label Propagation: parent activations propagate to children at inference
+**Architecture** (TransformerConfig defaults: hidden_dim=384, bottleneck_dim=192, num_heads=4, dropout=0.1)
+- Projections: CLS/Mean/Max (768→384), Attn (10→384); stack and encode with single-layer TransformerEncoder
+- Bottleneck + Decoder: 384→192→384→2314 latent reconstruction for representation regularization
+- Heads: one linear head (192→1) per hierarchy node; outputs logits for BCEWithLogits
+- Label Propagation: parent probabilities propagate to children via dynamic programming at inference
 
-Losses
-- Focal BCE with bounded class weights (per-label weights ∈ [1, 10])
-- Hierarchy consistency penalty: penalize child > parent probabilities
-- Reconstruction MSE on concatenated features (small weight)
+**Losses**
+- Focal BCE with bounded class weights (per-label weights ∈ [1, 10], alpha=1.0, gamma=1.0)
+- Hierarchy consistency penalty: smooth L1 loss between base and propagated probabilities
+- Reconstruction MSE on concatenated features (lambda=0.05)
+- Total loss = 0.05×recon + BCE + 0.02×hierarchy
 
-Optimization & Stability
-- AdamW, OneCycleLR, AMP mixed precision (MPS/CUDA), gradient clipping
-- Logit and loss clamping to avoid numerical issues; Xavier init for Linear layers
+**Optimization & Stability**
+- AdamW optimizer with weight_decay=1e-4, fused kernels on CUDA
+- OneCycleLR scheduler (max_lr=1e-4)
+- AMP mixed precision (CUDA/MPS), gradient clipping (max_norm=5.0)
+- Logit clamping [-10, 10] and loss clamping to avoid numerical issues
+- Xavier uniform initialization for all Linear layers
 
-### SMOTE Implementation (Train-only)
+### Balanced Sampling Implementation
 
-Pipeline (per class, binary target):
-- Standardize each block separately (CLS, MEAN, MAX, ATTN)
-- PCA per block (dims up to 128; attn up to 10); concatenate reduced features
-- KMeansSMOTE with adaptive k_neighbors, followed by SMOTETomek cleaning and RandomUnderSampler (0.8)
-- Inverse PCA and inverse scaling to reconstruct original feature blocks
-- Build augmented DataLoader with synthetic samples; falls back to original loader if SMOTE fails
+**Streaming Resampler** (`BalancedBatchSampler`):
+- Computes per-class quotas based on leaf and parent node targets
+- Leaf quota: `BALANCED_SAMPLE_TARGET` (20,000 by default)
+- Parent nodes get additional quota: base + sum of children's targets
+- Normal samples matched to leaf quota for balance
+- Cycles through class indices with shuffling to satisfy quotas without materializing synthetic data
+- Falls back to original loader if resampling configuration is invalid
+
+**Key Parameters**:
+- `BALANCED_SAMPLE_TARGET = 20000`: Maximum samples per leaf class per epoch
+- `TARGET_CONTAMINATION = 0.2`: Desired anomaly ratio (not strictly enforced)
+- `TRAIN_SPLIT_RATIO = 0.8`: Train/test split ratio with stratification
+- `MAX_CLASS_TRAIN_FRACTION = 0.8`: Maximum proportion of any class allocated to training
 
 ## License
 
