@@ -49,17 +49,15 @@ hierarchy = {
     "dnsteal": {"dnsteal-received": [], "dnsteal-dropped": [], "exfiltration-service": []}
 }
 
-TARGET_CONTAMINATION = 0.2  # Desired attack proportion in the balanced training set
-MIN_TRAIN_ANOMALIES = 400   # Ensure sufficient anomaly diversity during SMOTE
-RARE_CLASS_THRESHOLD = 512  # Upper bound for rare-class synthetic targets
-MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
-MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
-HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
-BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
-MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
-MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
-TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
-PARENT_EXTRA_FRACTION = 1.0      # Additional parent-only quota relative to leaf share
+# Training configuration
+TRAIN_SPLIT = 0.8           # Train/test split ratio
+MAX_CLASS_TRAIN = 0.8       # Max proportion of any class in training
+
+# Balanced sampling configuration  
+LEAF_QUOTA = 20000          # Base samples per leaf class per epoch
+RARE_THRESHOLD = 100        # Classes with fewer samples considered rare
+RARE_BOOST = 10.0           # Quota multiplier for rare classes
+HARD_NEG_RATIO = 0.3        # Hard negatives from siblings for rare classes
 
 
 @dataclass(frozen=True)
@@ -251,6 +249,50 @@ class HierarchicalTransformer(nn.Module):
             target = aggregated[name]
             losses.append(F.smooth_l1_loss(base, target, beta=0.05, reduction="mean"))
         return torch.stack(losses).mean()
+    
+    def contrastive_sibling_loss(self, z: torch.Tensor, targets: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+        """Contrastive loss to separate sibling classes in latent space (unsupervised)."""
+        
+        if targets.size(0) < 2:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Build sibling pairs
+        sibling_pairs = []
+        for parent_name, children in self.children_map.items():
+            if len(children) > 1:
+                child_indices = [self.node_to_index[c] for c in children if c in self.node_to_index]
+                sibling_pairs.extend([(i, j) for i in child_indices for j in child_indices if i < j])
+        
+        if not sibling_pairs:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Normalize embeddings for contrastive learning
+        z_norm = F.normalize(z, p=2, dim=1)
+        
+        losses = []
+        for idx1, idx2 in sibling_pairs:
+            if idx1 >= targets.size(1) or idx2 >= targets.size(1):
+                continue
+            
+            # Find samples with class1 but not class2 and vice versa
+            mask1 = (targets[:, idx1] == 1) & (targets[:, idx2] == 0)
+            mask2 = (targets[:, idx2] == 1) & (targets[:, idx1] == 0)
+            
+            if mask1.sum() > 0 and mask2.sum() > 0:
+                emb1 = z_norm[mask1]
+                emb2 = z_norm[mask2]
+                
+                # Compute similarity matrix
+                sim_matrix = torch.matmul(emb1, emb2.t()) / temperature
+                
+                # We want low similarity between siblings (push apart)
+                # Use negative samples from sibling class as contrastive target
+                contrastive_loss = torch.logsumexp(sim_matrix, dim=1).mean()
+                losses.append(contrastive_loss)
+        
+        if losses:
+            return torch.stack(losses).mean()
+        return torch.tensor(0.0, device=self.device)
 
     def propagate_labels(self, outputs: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Returns hierarchy-consistent probabilities for inference."""
@@ -500,8 +542,8 @@ def load_datasets(embeddings, labels, batch_size=128):
     
     return datasets
 
-def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2):
-    """Generates a balanced training loader with controllable contamination ratio."""
+def smote_data(train_loader, val_loader=None):
+    """Generates a balanced training loader with per-class quotas."""
 
     spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
     spinner.start()
@@ -642,20 +684,15 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         original_class_counts = class_counts(y)
 
         normal_mask = y.sum(axis=1) == 0
-        anomaly_mask = ~normal_mask
         normal_indices = np.where(normal_mask)[0]
-
-        leaf_quota = int(BALANCED_SAMPLE_TARGET)
-        if leaf_quota <= 0:
-            spinner.stop_and_persist(text="Resampling skipped (BALANCED_SAMPLE_TARGET must be positive)")
-            return train_loader
 
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
+        # Normal samples matched to leaf quota
         if normal_indices.size > 0:
             class_indices["normal"] = normal_indices
-            class_targets["normal"] = leaf_quota
+            class_targets["normal"] = LEAF_QUOTA
 
         active_leaf_indices = [
             idx for idx in leaf_indices if idx < y.shape[1] and np.any(y[:, idx] == 1)
@@ -682,57 +719,80 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 if fallback_parent.size:
                     parent_candidate_map[parent_idx] = fallback_parent
 
-        available_nodes = set(leaf_positive_map.keys()) | set(parent_candidate_map.keys())
-        node_target_cache: Dict[int, int] = {}
+        # Build sibling map for hard negative mining
+        sibling_map: Dict[int, List[int]] = {}
+        for parent_idx, children in index_children.items():
+            if len(children) > 1:
+                for child in children:
+                    siblings = [c for c in children if c != child]
+                    if siblings:
+                        sibling_map[child] = siblings
 
-        def compute_node_target(node_idx: int) -> int:
-            if node_idx in node_target_cache:
-                return node_target_cache[node_idx]
-
-            is_leaf = node_idx in leaf_positive_map
-            is_parent_node = node_idx in parent_candidate_map
-            if not (is_leaf or is_parent_node):
-                node_target_cache[node_idx] = 0
-                return 0
-
-            child_total = 0
-            for child_idx in index_children.get(node_idx, []):
-                if child_idx not in available_nodes:
-                    continue
-                child_total += compute_node_target(child_idx)
-
-            base = leaf_quota
-            total = base + child_total if child_total > 0 else base
-            node_target_cache[node_idx] = int(total)
-            return int(total)
-
+        # Process leaf classes with simplified quota logic
         leaf_target_map: Dict[int, int] = {}
+        rare_classes: List[int] = []
+        
         for leaf_idx, positives in leaf_positive_map.items():
-            target = compute_node_target(leaf_idx)
-            if target <= 0 or positives is None or positives.size == 0:
+            if positives is None or positives.size == 0:
                 continue
-            key = f"leaf:{leaf_idx}"
-            class_indices[key] = positives
-            class_targets[key] = target
-            leaf_target_map[leaf_idx] = target
+            
+            original_count = int(original_class_counts[leaf_idx]) if leaf_idx < len(original_class_counts) else 0
+            is_rare = original_count < RARE_THRESHOLD
+            
+            # Simple quota: base quota with boost for rare classes
+            quota = LEAF_QUOTA
+            if is_rare:
+                rare_classes.append(leaf_idx)
+                quota = int(min(quota * RARE_BOOST, quota * 2))
+            
+            # Add hard negatives from siblings for rare classes
+            indices = positives
+            if is_rare and leaf_idx in sibling_map:
+                combined = list(positives)
+                for sibling_idx in sibling_map[leaf_idx]:
+                    if sibling_idx in leaf_positive_map:
+                        n_hard = int(len(positives) * HARD_NEG_RATIO)
+                        if n_hard > 0:
+                            sibling_samples = leaf_positive_map[sibling_idx]
+                            if sibling_samples.size > 0:
+                                sampled = np.random.choice(
+                                    sibling_samples, 
+                                    size=min(n_hard, sibling_samples.size),
+                                    replace=False
+                                )
+                                combined.extend(sampled)
+                indices = np.array(combined, dtype=np.int64)
+            
+            class_indices[f"leaf:{leaf_idx}"] = indices
+            class_targets[f"leaf:{leaf_idx}"] = quota
+            leaf_target_map[leaf_idx] = quota
 
+        # Process parent-only samples (parent label but no children)
         parent_target_map: Dict[int, int] = {}
         for parent_idx, candidates in parent_candidate_map.items():
-            target = compute_node_target(parent_idx)
-            if target <= 0 or candidates is None or candidates.size == 0:
+            if candidates is None or candidates.size == 0:
                 continue
-            key = f"parent:{parent_idx}"
-            class_indices[key] = candidates
-            class_targets[key] = target
-            parent_target_map[parent_idx] = target
+            
+            # Parent quota: same as leaf quota (don't sum children)
+            quota = LEAF_QUOTA
+            has_rare_child = any(child in rare_classes for child in index_children.get(parent_idx, []))
+            if has_rare_child:
+                quota = int(quota * 1.5)
+            
+            class_indices[f"parent:{parent_idx}"] = candidates
+            class_targets[f"parent:{parent_idx}"] = quota
+            parent_target_map[parent_idx] = quota
 
+        # Fallback if no specific classes found
         if not leaf_target_map and not parent_target_map:
+            anomaly_mask = ~normal_mask
             attack_indices = np.where(anomaly_mask)[0]
-            if attack_indices.size == 0:
-                spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
+            if attack_indices.size > 0:
+                class_indices["anomaly"] = attack_indices
+                class_targets["anomaly"] = LEAF_QUOTA
+            else:
+                spinner.stop_and_persist(text="Resampling skipped (no attack samples)")
                 return train_loader
-            class_indices["anomaly"] = attack_indices
-            class_targets["anomaly"] = leaf_quota
 
         total_targets = sum(class_targets.values())
         if total_targets == 0:
@@ -742,15 +802,12 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         batch_size = getattr(train_loader, "batch_size", 128)
         sampler = BalancedBatchSampler(class_indices, class_targets, batch_size=batch_size, seed=42)
 
-        print("\nStreaming class targets (per epoch):")
-        print(f"  leaf quota: {leaf_quota}")
-        print(f"  total target samples: {total_targets}")
-        if "normal" in class_targets:
-            print(f"  normal target: {class_targets['normal']}")
-        if leaf_target_map:
-            print(f"  leaf classes: {len(leaf_target_map)}")
-        if parent_target_map:
-            print(f"  parent classes: {len(parent_target_map)}")
+        print(f"\nBalanced sampling: {total_targets} samples/epoch")
+        print(f"  Base quota: {LEAF_QUOTA} | Rare boost: {RARE_BOOST}x")
+        print(f"  Classes: {len(leaf_target_map)} leaves, {len(parent_target_map)} parents")
+        if rare_classes:
+            rare_names = [idx_to_name.get(idx, str(idx)) for idx in rare_classes]
+            print(f"  Rare (boosted): {', '.join(rare_names)}")
 
         print("\nPer-class targets vs originals:")
         adjustments = []
@@ -829,7 +886,10 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
     probs = np.vstack(all_probs)
     targets = np.vstack(all_targets)
     thresholds = np.full(probs.shape[1], 0.5, dtype=np.float32)
-    candidate_thresholds = np.linspace(0.1, 0.95, 18)
+    
+    # More granular threshold search for rare classes
+    standard_thresholds = np.linspace(0.1, 0.95, 18)
+    fine_thresholds = np.linspace(0.05, 0.95, 50)  # Finer granularity for rare classes
 
     for idx in range(probs.shape[1]):
         y_true = targets[:, idx]
@@ -838,28 +898,52 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
             thresholds[idx] = 0.99
             continue
 
+        # Use finer threshold search for rare classes
+        is_rare = pos_count < RARE_THRESHOLD
+        candidate_thresholds = fine_thresholds if is_rare else standard_thresholds
+        
         best_f1 = -1.0
         best_threshold = 0.5
         p = probs[:, idx]
+        
         for thr in candidate_thresholds:
             y_pred = (p >= thr).astype(np.int32)
             tp = np.logical_and(y_pred == 1, y_true == 1).sum()
             fp = np.logical_and(y_pred == 1, y_true == 0).sum()
             fn = np.logical_and(y_pred == 0, y_true == 1).sum()
-            precision = tp / max(tp + fp, 1)
-            recall = tp / max(tp + fn, 1)
-            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
-            if f1 > best_f1 or (f1 == best_f1 and thr > best_threshold):
-                best_f1 = f1
+            
+            # For rare classes, prioritize recall while maintaining reasonable precision
+            if is_rare and tp > 0:
+                precision = tp / max(tp + fp, 1)
+                recall = tp / max(tp + fn, 1)
+                # Weight recall more heavily for rare classes (F2 score)
+                beta = 2.0 if is_rare else 1.0
+                f_score = (1 + beta**2) * precision * recall / max(beta**2 * precision + recall, 1e-10)
+            else:
+                precision = tp / max(tp + fp, 1)
+                recall = tp / max(tp + fn, 1)
+                f_score = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+            
+            if f_score > best_f1:
+                best_f1 = f_score
                 best_threshold = thr
+            elif f_score == best_f1 and is_rare and recall > 0:
+                # For rare classes with equal F-score, prefer lower threshold (higher recall)
+                best_threshold = min(best_threshold, thr)
+        
         thresholds[idx] = best_threshold
+        
+        # Print threshold info for rare classes
+        if is_rare:
+            name = node_names[idx] if idx < len(node_names) else f"class_{idx}"
+            print(f"  Rare class '{name}': threshold={best_threshold:.3f}, samples={int(pos_count)}")
 
     return thresholds
 
 
-def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
+def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.05, lambda_hier=0.02, lambda_contrastive=0.01):
     """Trains the transformer with reconstruction and hierarchy regularizers."""
-    train = smote_data(train_loader, val_loader, target_contamination=TARGET_CONTAMINATION)
+    train = smote_data(train_loader, val_loader)
     if len(train) == 0:
         train = train_loader
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
@@ -956,8 +1040,12 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
 
                 hier_loss = model.hierarchy_consistency_loss(outputs)
                 hier_loss = torch.clamp(hier_loss, 0, 10.0)
+                
+                # Add contrastive loss to separate sibling classes
+                contrastive_loss = model.contrastive_sibling_loss(z, targets)
+                contrastive_loss = torch.clamp(contrastive_loss, 0, 10.0)
 
-                total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss + lambda_contrastive * contrastive_loss
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
@@ -1011,8 +1099,11 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
 
                         hier_loss = model.hierarchy_consistency_loss(outputs)
                         hier_loss = torch.clamp(hier_loss, 0, 10.0)
+                        
+                        contrastive_loss = model.contrastive_sibling_loss(z, targets)
+                        contrastive_loss = torch.clamp(contrastive_loss, 0, 10.0)
 
-                        total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                        total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss + lambda_contrastive * contrastive_loss
 
                         val_losses.append(total_loss.item())
 
@@ -1226,7 +1317,7 @@ def main():
             normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
             anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
 
-            def stratified_split(indices: torch.Tensor, train_ratio: float = TRAIN_SPLIT_RATIO):
+            def stratified_split(indices: torch.Tensor, train_ratio: float = TRAIN_SPLIT):
                 n = len(indices)
                 if n == 0:
                     empty = torch.tensor([], dtype=torch.long)
@@ -1257,7 +1348,7 @@ def main():
 
             if len(anomaly_idx) > 0:
                 anomaly_total = len(anomaly_idx)
-                anomaly_train_target = int(round(TRAIN_SPLIT_RATIO * anomaly_total))
+                anomaly_train_target = int(round(TRAIN_SPLIT * anomaly_total))
                 if anomaly_total > 1:
                     anomaly_train_target = max(1, min(anomaly_train_target, anomaly_total - 1))
                 else:
@@ -1277,8 +1368,8 @@ def main():
                         total_class = class_anomalies.size
                         if total_class == 0:
                             continue
-                        max_fractional = int(total_class * MAX_CLASS_TRAIN_FRACTION)
-                        quota_target = int(round(TRAIN_SPLIT_RATIO * total_class))
+                        max_fractional = int(total_class * MAX_CLASS_TRAIN)
+                        quota_target = int(round(TRAIN_SPLIT * total_class))
                         train_quota = min(total_class, max(1, min(quota_target, max_fractional)))
                         train_quota = min(train_quota, total_class)
                         sampled = coverage_rng.choice(class_anomalies, size=train_quota, replace=False)
