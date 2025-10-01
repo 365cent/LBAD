@@ -77,12 +77,14 @@ Thumbs.db
 # Data and model outputs (temporary)
 processed/
 embedding/
-embeddings/
+embeddings*/
 models/
 results/
 output/
 augmented/
 augmentation/
+gensim_data/
+hf_cache/
 
 # Data files
 *.tfrecord
