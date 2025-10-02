@@ -651,18 +651,12 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         class_targets: Dict[str, int] = {}
 
         desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y)
-        contamination = float(np.clip(TARGET_CONTAMINATION, 0.0, 0.999999))
-        normal_target = int(round(desired_total * (1.0 - contamination))) if contamination < 1.0 else 0
-        normal_target = max(0, normal_target)
+        desired_total = max(1, int(desired_total))
 
-        if normal_indices.size == 0:
-            normal_target = 0
-        elif normal_target > 0:
-            normal_target = max(1, normal_target)
-            class_indices["normal"] = normal_indices
-            class_targets["normal"] = normal_target
-
-        desired_anomaly_budget = max(1, desired_total - normal_target)
+        normal_target = 0
+        class_entries: List[Tuple[str, Optional[int], np.ndarray]] = []
+        if normal_indices.size > 0:
+            class_entries.append(("normal", None, normal_indices))
 
         active_leaf_indices = [
             idx for idx in leaf_indices if idx < y.shape[1] and np.any(y[:, idx] == 1)
@@ -691,66 +685,60 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         leaf_count = len(leaf_positive_map)
         parent_count = len(parent_candidate_map) if PARENT_EXTRA_FRACTION > 0 else 0
-        extra_allocation = 0
 
-        if leaf_count == 0 and parent_count == 0:
-            attack_indices = np.where(anomaly_mask)[0]
-            if attack_indices.size == 0:
-                spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
-                return train_loader
-            class_indices["attack"] = attack_indices
-            class_targets["attack"] = desired_anomaly_budget
-            per_class_target = None
-            desired_anomaly_target = desired_anomaly_budget
-        else:
-            include_parents = parent_count > 0 and PARENT_EXTRA_FRACTION > 0
-            anomaly_entries: List[Tuple[str, int, np.ndarray]] = []
+        include_parents = parent_count > 0 and PARENT_EXTRA_FRACTION > 0
+        anomaly_entries: List[Tuple[str, int, np.ndarray]] = []
 
-            for leaf_idx in sorted(leaf_positive_map.keys()):
-                positives = leaf_positive_map.get(leaf_idx)
-                if positives is None or positives.size == 0:
+        for leaf_idx in sorted(leaf_positive_map.keys()):
+            positives = leaf_positive_map.get(leaf_idx)
+            if positives is None or positives.size == 0:
+                continue
+            anomaly_entries.append(("leaf", leaf_idx, positives))
+
+        if include_parents:
+            for parent_idx in sorted(parent_candidate_map.keys()):
+                candidates = parent_candidate_map.get(parent_idx)
+                if candidates is None or candidates.size == 0:
                     continue
-                anomaly_entries.append(("leaf", leaf_idx, positives))
+                anomaly_entries.append(("parent", parent_idx, candidates))
 
-            if include_parents:
-                for parent_idx in sorted(parent_candidate_map.keys()):
-                    candidates = parent_candidate_map.get(parent_idx)
-                    if candidates is None or candidates.size == 0:
-                        continue
-                    anomaly_entries.append(("parent", parent_idx, candidates))
+        if not anomaly_entries:
+            attack_indices = np.where(anomaly_mask)[0]
+            if attack_indices.size > 0:
+                class_entries.append(("attack", None, attack_indices))
+        else:
+            class_entries.extend(anomaly_entries)
 
-            if not anomaly_entries:
-                attack_indices = np.where(anomaly_mask)[0]
-                if attack_indices.size == 0:
-                    spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
-                    return train_loader
-                class_indices["attack"] = attack_indices
-                class_targets["attack"] = desired_anomaly_budget
-                per_class_target = None
-                desired_anomaly_target = desired_anomaly_budget
+        if not class_entries:
+            spinner.stop_and_persist(text="Resampling skipped (no eligible classes detected)")
+            return train_loader
+
+        class_count = len(class_entries)
+        effective_total = max(desired_total, class_count)
+        base_target = max(1, effective_total // class_count)
+        per_class_target = base_target
+        dropped_samples = max(effective_total - base_target * class_count, 0)
+
+        for kind, class_idx, pool in class_entries:
+            target = base_target
+
+            if kind == "normal":
+                normal_target = int(target)
+                class_indices["normal"] = pool
+                class_targets["normal"] = normal_target
+            elif kind == "leaf":
+                leaf_targets[class_idx] = int(target)
+                key = f"leaf:{class_idx}"
+                class_indices[key] = pool
+                class_targets[key] = int(target)
+            elif kind == "parent":
+                parent_targets[class_idx] = int(target)
+                key = f"parent:{class_idx}"
+                class_indices[key] = pool
+                class_targets[key] = int(target)
             else:
-                base_target = max(1, desired_anomaly_budget // len(anomaly_entries))
-                extra_allocation = desired_anomaly_budget - base_target * len(anomaly_entries)
-                remainder = extra_allocation
-
-                for kind, class_idx, pool in anomaly_entries:
-                    target = base_target
-                    if remainder > 0:
-                        target += 1
-                        remainder -= 1
-
-                    if kind == "leaf":
-                        leaf_targets[class_idx] = int(target)
-                        key = f"leaf:{class_idx}"
-                    else:
-                        parent_targets[class_idx] = int(target)
-                        key = f"parent:{class_idx}"
-
-                    class_indices[key] = pool
-                    class_targets[key] = int(target)
-
-                per_class_target = base_target
-                desired_anomaly_target = desired_anomaly_budget
+                class_indices[kind] = pool
+                class_targets[kind] = int(target)
 
         total_targets = sum(class_targets.values())
         if total_targets == 0:
@@ -768,12 +756,13 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  attack target: {attack_target_display}")
         if per_class_target is not None:
             print(f"  per-class base target: {per_class_target}")
-            if extra_allocation > 0:
-                print(f"  +{extra_allocation} remainder sample(s) distributed")
+            if dropped_samples > 0:
+                print(f"  -{dropped_samples} sample(s) skipped to keep classes equal")
 
         print("\nPer-class targets vs originals:")
         adjustments = []
-        adjustments.append(("normal", original_normal, normal_target_display, normal_target_display - original_normal))
+        if "normal" in class_targets:
+            adjustments.append(("normal", original_normal, normal_target_display, normal_target_display - original_normal))
         for leaf_idx, target in leaf_targets.items():
             name = idx_to_name.get(leaf_idx, str(leaf_idx))
             before = int(original_class_counts[leaf_idx])
