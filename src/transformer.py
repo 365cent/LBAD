@@ -691,6 +691,7 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         leaf_count = len(leaf_positive_map)
         parent_count = len(parent_candidate_map) if PARENT_EXTRA_FRACTION > 0 else 0
+        extra_allocation = 0
 
         if leaf_count == 0 and parent_count == 0:
             attack_indices = np.where(anomaly_mask)[0]
@@ -702,64 +703,54 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             per_class_target = None
             desired_anomaly_target = desired_anomaly_budget
         else:
-            effective_classes = leaf_count + parent_count * PARENT_EXTRA_FRACTION
-            if effective_classes <= 0:
-                leaf_target = desired_anomaly_budget
-                parent_target = 0
-            else:
-                leaf_target = max(1, int(desired_anomaly_budget / max(effective_classes, 1e-6)))
-                while leaf_target > 0:
-                    parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
-                    allocated = leaf_target * leaf_count + parent_target * parent_count
-                    if allocated <= desired_anomaly_budget:
-                        break
-                    leaf_target -= 1
-                if leaf_target == 0:
-                    leaf_target = 1
-                parent_target = int(round(leaf_target * PARENT_EXTRA_FRACTION)) if parent_count else 0
-                allocated = leaf_target * leaf_count + parent_target * parent_count
+            include_parents = parent_count > 0 and PARENT_EXTRA_FRACTION > 0
+            anomaly_entries: List[Tuple[str, int, np.ndarray]] = []
 
-            leaf_targets = {idx: leaf_target for idx in leaf_positive_map.keys()}
-            parent_targets = {idx: parent_target for idx in parent_candidate_map.keys() if parent_target > 0}
-
-            allocated = leaf_target * leaf_count + parent_target * parent_count
-            remainder = desired_anomaly_budget - allocated
-
-            if remainder > 0 and leaf_targets:
-                leaf_keys = list(leaf_targets.keys())
-                idx_cycle = 0
-                while remainder > 0 and leaf_keys:
-                    leaf_idx = leaf_keys[idx_cycle % len(leaf_keys)]
-                    leaf_targets[leaf_idx] += 1
-                    remainder -= 1
-                    idx_cycle += 1
-            if remainder > 0 and parent_targets:
-                parent_keys = list(parent_targets.keys())
-                idx_cycle = 0
-                while remainder > 0 and parent_keys:
-                    parent_idx = parent_keys[idx_cycle % len(parent_keys)]
-                    parent_targets[parent_idx] += 1
-                    remainder -= 1
-                    idx_cycle += 1
-
-            per_class_target = leaf_target if leaf_count > 0 else None
-            desired_anomaly_target = desired_anomaly_budget
-
-            for leaf_idx, target in leaf_targets.items():
+            for leaf_idx in sorted(leaf_positive_map.keys()):
                 positives = leaf_positive_map.get(leaf_idx)
-                if target <= 0 or positives is None or positives.size == 0:
+                if positives is None or positives.size == 0:
                     continue
-                key = f"leaf:{leaf_idx}"
-                class_indices[key] = positives
-                class_targets[key] = int(target)
+                anomaly_entries.append(("leaf", leaf_idx, positives))
 
-            for parent_idx, target in parent_targets.items():
-                candidates = parent_candidate_map.get(parent_idx)
-                if target <= 0 or candidates is None or candidates.size == 0:
-                    continue
-                key = f"parent:{parent_idx}"
-                class_indices[key] = candidates
-                class_targets[key] = int(target)
+            if include_parents:
+                for parent_idx in sorted(parent_candidate_map.keys()):
+                    candidates = parent_candidate_map.get(parent_idx)
+                    if candidates is None or candidates.size == 0:
+                        continue
+                    anomaly_entries.append(("parent", parent_idx, candidates))
+
+            if not anomaly_entries:
+                attack_indices = np.where(anomaly_mask)[0]
+                if attack_indices.size == 0:
+                    spinner.stop_and_persist(text="Resampling skipped (no attack samples detected)")
+                    return train_loader
+                class_indices["attack"] = attack_indices
+                class_targets["attack"] = desired_anomaly_budget
+                per_class_target = None
+                desired_anomaly_target = desired_anomaly_budget
+            else:
+                base_target = max(1, desired_anomaly_budget // len(anomaly_entries))
+                extra_allocation = desired_anomaly_budget - base_target * len(anomaly_entries)
+                remainder = extra_allocation
+
+                for kind, class_idx, pool in anomaly_entries:
+                    target = base_target
+                    if remainder > 0:
+                        target += 1
+                        remainder -= 1
+
+                    if kind == "leaf":
+                        leaf_targets[class_idx] = int(target)
+                        key = f"leaf:{class_idx}"
+                    else:
+                        parent_targets[class_idx] = int(target)
+                        key = f"parent:{class_idx}"
+
+                    class_indices[key] = pool
+                    class_targets[key] = int(target)
+
+                per_class_target = base_target
+                desired_anomaly_target = desired_anomaly_budget
 
         total_targets = sum(class_targets.values())
         if total_targets == 0:
@@ -776,13 +767,9 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  normal target: {normal_target_display}")
         print(f"  attack target: {attack_target_display}")
         if per_class_target is not None:
-            print(f"  per-leaf target: {per_class_target}")
-        if parent_targets:
-            parent_quota_values = sorted(set(parent_targets.values()))
-            if parent_quota_values:
-                quota_display = ", ".join(str(value) for value in parent_quota_values if value > 0)
-                if quota_display:
-                    print(f"  per-parent extra quota: {quota_display}")
+            print(f"  per-class base target: {per_class_target}")
+            if extra_allocation > 0:
+                print(f"  +{extra_allocation} remainder sample(s) distributed")
 
         print("\nPer-class targets vs originals:")
         adjustments = []
