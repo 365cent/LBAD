@@ -59,6 +59,7 @@ MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in
 MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
 TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
 PARENT_EXTRA_FRACTION = 1.0      # Additional parent-only quota relative to leaf share
+BALANCE_TARGET_GROWTH = 1.5      # Modest scaling factor for adaptive per-class quotas
 
 
 @dataclass(frozen=True)
@@ -709,9 +710,17 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             spinner.stop_and_persist(text="Resampling skipped (no eligible classes detected)")
             return train_loader
 
-        class_count = len(class_entries)
-        base_target = max(len(pool) for _, _, pool in class_entries)
-        base_target = max(1, int(base_target))
+        pool_lengths = np.array([max(1, len(pool)) for _, _, pool in class_entries], dtype=np.float64)
+        median_count = float(np.median(pool_lengths))
+        geometric_mean = float(np.exp(np.mean(np.log(pool_lengths))))
+        baseline_target = max(geometric_mean, median_count, float(MIN_SYNTHETIC_TARGET))
+        scaled_target = baseline_target * BALANCE_TARGET_GROWTH
+        median_cap = median_count * MAX_SYNTHETIC_MULTIPLIER
+        max_available = float(pool_lengths.max())
+        upper_bound = min(max_available, median_cap if median_cap > 0 else max_available)
+        candidate = min(scaled_target, upper_bound)
+        base_target = int(max(MIN_SYNTHETIC_TARGET, round(candidate)))
+        base_target = min(base_target, int(max_available))
         per_class_target = base_target
 
         for kind, class_idx, pool in class_entries:
@@ -882,32 +891,47 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
             all_targets.append(targets.cpu())
         Y = torch.cat(all_targets)
 
-        # Compute balanced class weights with proper bounds
-        pos_weights = []
-        for j in range(len(label_names)):
-            cnt = int(Y[:, j].sum().item())
-            if cnt > 0:
-                # Balanced weight: inverse frequency with reasonable bounds
-                weight = (Y.shape[0] - cnt) / max(cnt, 1)
-                weight = min(max(weight, 1.0), 10.0)
-            else:
-                weight = 1.0  # Default weight for classes with no samples
-            pos_weights.append(weight)
+        class_counts = torch.clamp(Y.sum(dim=0), min=1.0)
 
-        # Use focal loss for better stability with imbalanced data
-        class FocalBCEWithLogitsLoss(nn.BCEWithLogitsLoss):
-            def __init__(self, alpha=1.0, gamma=2.0, **kwargs):
-                super().__init__(**kwargs)
-                self.alpha = alpha
-                self.gamma = gamma
+        class ClassBalancedEntropyLoss(nn.Module):
+            """Class-balanced entropy loss with focal modulation for multi-label targets."""
 
-            def forward(self, input, target):
-                bce_loss = super().forward(input, target) # TODO: change to class entropy loss
-                pt = torch.exp(-bce_loss)
-                focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
-                return focal_loss
+            def __init__(
+                self,
+                samples_per_class: torch.Tensor,
+                beta: float = 0.999,
+                gamma: float = 1.0,
+                eps: float = 1e-6,
+            ) -> None:
+                super().__init__()
+                samples = torch.as_tensor(samples_per_class, dtype=torch.float32)
+                self.register_buffer("class_weights", self._compute_weights(samples, beta, eps))
+                self.gamma = float(gamma)
+                self.eps = float(eps)
 
-        bce_loss = FocalBCEWithLogitsLoss(alpha=1.0, gamma=1.0, pos_weight=torch.tensor(pos_weights, device=device))
+            @staticmethod
+            def _compute_weights(samples: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
+                samples = torch.clamp(samples, min=1.0)
+                effective_num = 1.0 - torch.pow(beta, samples)
+                weights = (1.0 - beta) / torch.clamp(effective_num, min=eps)
+                weights = weights / torch.clamp(weights.mean(), min=eps)
+                return weights.view(1, -1)
+
+            def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                logits = logits.float()
+                targets = targets.float()
+                ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+                if self.gamma > 0.0:
+                    pt = torch.exp(-ce_loss)
+                    ce_loss = ce_loss * torch.pow(1.0 - pt, self.gamma)
+                weighted = ce_loss * self.class_weights
+                return weighted.mean()
+
+        bce_loss = ClassBalancedEntropyLoss(
+            samples_per_class=class_counts.to(device),
+            beta=0.999,
+            gamma=1.0,
+        )
 
     # Initialize model weights properly
     def init_weights(m):
