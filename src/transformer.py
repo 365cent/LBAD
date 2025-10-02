@@ -55,7 +55,6 @@ RARE_CLASS_THRESHOLD = 512  # Upper bound for rare-class synthetic targets
 MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
 MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
 HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
-BALANCED_SAMPLE_TARGET = 20000   # Maximum total samples after balancing
 MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
 MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
 TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
@@ -650,9 +649,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         class_indices: Dict[str, np.ndarray] = {}
         class_targets: Dict[str, int] = {}
 
-        desired_total = BALANCED_SAMPLE_TARGET if BALANCED_SAMPLE_TARGET > 0 else len(y)
-        desired_total = max(1, int(desired_total))
-
         normal_target = 0
         class_entries: List[Tuple[str, Optional[int], np.ndarray]] = []
         if normal_indices.size > 0:
@@ -714,10 +710,9 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             return train_loader
 
         class_count = len(class_entries)
-        effective_total = max(desired_total, class_count)
-        base_target = max(1, effective_total // class_count)
+        base_target = max(len(pool) for _, _, pool in class_entries)
+        base_target = max(1, int(base_target))
         per_class_target = base_target
-        dropped_samples = max(effective_total - base_target * class_count, 0)
 
         for kind, class_idx, pool in class_entries:
             target = base_target
@@ -756,8 +751,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         print(f"  attack target: {attack_target_display}")
         if per_class_target is not None:
             print(f"  per-class base target: {per_class_target}")
-            if dropped_samples > 0:
-                print(f"  -{dropped_samples} sample(s) skipped to keep classes equal")
 
         print("\nPer-class targets vs originals:")
         adjustments = []
