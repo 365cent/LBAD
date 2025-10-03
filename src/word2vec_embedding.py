@@ -45,6 +45,17 @@ from itertools import repeat
 from pathlib import Path
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+try:
+    mpl_dir = _BASE_DIR / ".mplconfig"
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+    gensim_dir = _BASE_DIR / "gensim_data"
+    gensim_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["GENSIM_DATA_DIR"] = str(gensim_dir)
+except Exception:  # pragma: no cover - best effort only
+    pass
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -59,23 +70,6 @@ except ImportError:  # pragma: no cover - environment fallback
     api = None  # type: ignore
     HAS_GENSIM = False
     print("Warning: gensim library not available, Word2Vec embeddings disabled")
-"""
-Best-effort setup of writable cache/config dirs when $HOME is restricted.
-- Matplotlib: use ./\.mplconfig
-- Gensim downloader: use ./gensim_data
-This must happen before importing matplotlib or gensim.downloader.
-"""
-_BASE_DIR = Path(__file__).resolve().parent.parent
-try:
-    if "MPLCONFIGDIR" not in os.environ:
-        _mpl_dir = _BASE_DIR / ".mplconfig"
-        _mpl_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
-    _gensim_dir = _BASE_DIR / "gensim_data"
-    _gensim_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("GENSIM_DATA_DIR", str(_gensim_dir))
-except Exception:
-    pass
 import matplotlib.pyplot as plt
 import seaborn as sns
 from halo import Halo
