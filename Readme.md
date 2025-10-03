@@ -4,11 +4,12 @@ An end-to-end pipeline for log-based anomaly detection with resumeable embedding
 
 ## Highlights
 
-- Preprocessing to TFRecords per log type
-- Embeddings: FastText (300D), Word2Vec (300D), LogBERT (2314D enhanced)
-- Streaming balanced resampling for handling class imbalance
-- Hierarchical transformer with parent-child label propagation
+- Deterministic preprocessing → TFRecords per log type
+- Embeddings: FastText (300D), Word2Vec (300D), LogBERT CLS (768D) with auto-layout detection in the trainer
+- Adaptive SMOTE-style streaming resampler that equalises class quotas using percentile-aware targets
+- Single-layer hierarchical transformer with parent→child propagation and class-balanced entropy loss (CB Focal BCE)
 - Baseline multi-label ML (Logistic Regression, Linear Regression, Random Forest, XGBoost) for comparison
+- Project-local caches (`./gensim_data`, `./.mplconfig`, `./hf_cache`) keep cluster home directories clean
 - Clear artifacts: `embeddings/`, `models/`, `results/`, `checkpoints/`
 
 ## Pipeline Architecture
@@ -26,7 +27,7 @@ flowchart TD
         E1 --> F1["Tokenize log entries"]
         F1 --> G1["Generate FastText embeddings (300D)"]
         F1 --> G2["Generate Word2Vec embeddings (300D)"]
-        F1 --> G3["Generate LogBERT embeddings (2314D enhanced)"]
+        F1 --> G3["Generate LogBERT embeddings (CLS 768D)"]
         G1 --> H1["Save embeddings & binary label matrices"]
         G2 --> H1
         G3 --> H1
@@ -37,8 +38,8 @@ flowchart TD
     subgraph Transformer_Training
         H1 --> V1["Split data 80/20 (stratified)"]
         V1 --> V2["Balanced sampling: per-class quotas with streaming resampler"]
-        V2 --> V3["Train Hierarchical Transformer"]
-        V3 --> V4["Hierarchy consistency loss + reconstruction loss + focal BCE"]
+        V2 --> V3["Train single-layer Hierarchical Transformer"]
+        V3 --> V4["Hierarchy consistency loss + reconstruction + CB focal BCE"]
         V4 --> Y1["Multi-label predictions with parent→child propagation"]
     end
 
@@ -94,6 +95,8 @@ Tip: Run `make help` for a full command reference.
 ├── results/                  # predictions, metrics, visualizations
 ├── checkpoints/              # logbert resumeable checkpoints
 ├── hf_cache/ .cache/torch/   # local HF/torch caches (auto by Makefile)
+├── .mplconfig/               # matplotlib cache (auto)
+├── gensim_data/              # gensim downloader cache (auto)
 └── src/                      # source code
 ```
 
@@ -136,13 +139,13 @@ python src/preprocessing.py --log-type wp-error
 
 ## Embeddings
 
-### LogBERT (Enhanced 2314D)
+### LogBERT CLS (768D)
 
 Script: `src/logbert_embeddings.py`
-- Components: CLS(768) + Mean(768) + Max(768) + Attention top-10 (2314D)
-- Device: auto (MPS→CUDA→CPU), optimized for M2/MPS
-- Resumeable: writes lightweight progress every ~5% and supports restart
-- Streams to disk via numpy.memmap to avoid OOM
+- Components: single CLS embedding (768D) straight from `bert-base-uncased`
+- Device: auto (MPS→CUDA→CPU)
+- Checkpointing: optional progress snapshots for long runs
+- Local caches: honours `./hf_cache` and `./.mplconfig`
 
 CLI:
 ```bash
@@ -155,7 +158,7 @@ python src/logbert_embeddings.py \
 ```
 
 Outputs (per log type under `embeddings/logbert/<type>/`):
-- `log_<type>.pkl`: pickled memmap-backed matrix (2314D)
+- `log_<type>.pkl`: float32 matrix of CLS embeddings (N × 768)
 - `label_<type>.pkl`: dict with `vectors` (multi-label int8) and `classes`
 - `attack_types_<type>.txt`: mapping and examples
 - `visualization.png`: t-SNE (balanced sampling, all classes shown)
@@ -186,8 +189,8 @@ Script: `src/transformer.py`
 - Auto-detects device (cuda/mps/cpu) with optimized backend selection
 - Splits data 80/20 (stratified by anomaly presence)
 - Applies streaming balanced resampling with per-class quotas on the training split
-- Trains a single Hierarchical Transformer with per-node heads and parent→child propagation
-- Uses focal BCE with bounded class weights, hierarchy consistency loss, and reconstruction loss
+- Trains a single-layer Hierarchical Transformer with per-node heads and parent→child propagation
+- Uses class-balanced focal BCE (CB Entropy), hierarchy consistency loss, and reconstruction loss
 - AMP mixed precision (CUDA/MPS), OneCycleLR scheduler, gradient clipping, and stability clamping
 
 CLI:
@@ -198,6 +201,12 @@ python src/transformer.py [--embedding-type {fasttext,word2vec,logbert,all}] [--
 Artifacts:
 - `results/hierarchical_<type>_<embedding>_evaluation_<timestamp>.txt` (per-class + overall metrics)
 - `models/hierarchical_<type>_<embedding>.pth` (trained model)
+
+### Adaptive SMOTE-Style Resampling
+- Builds per-class index pools (normal + anomalies) without materialising augmented tensors
+- Chooses a shared class quota using anomaly percentiles (median / 75th / 90th) with safety caps
+- Guarantees identical sample counts for every class while respecting `MIN_SYNTHETIC_TARGET`
+- Console output marks adjustments with arrow indicators (↑ / ↓ / →) for quick audits
 
 ## Evaluation
 
@@ -220,9 +229,9 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
 
 ## Performance & Caching
 
-- Hugging Face/torch cache redirected to `hf_cache/` and `.cache/torch/` (see Makefile `HF_ENV`)
+- Hugging Face/torch cache redirected to `hf_cache/` and `.cache/torch/`; gensim/matplotlib use `./gensim_data` and `./.mplconfig`
 - MPS (Apple Silicon) and CUDA supported; batch sizes auto-tuned
-- LogBERT extractor uses memmaps and 5% checkpoints for safe restarts
+- LogBERT extractor emits CLS-only vectors and can checkpoint progress for long runs
 
 ## Troubleshooting
 
@@ -236,7 +245,7 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
 - **Main Components**: logs/, labels/, processed/, embeddings/, models/, results/, checkpoints/, src/
 - **Key Scripts**: 
   - preprocessing.py - TFRecord generation with log type classification
-  - logbert_embeddings.py - Enhanced 2314D embeddings with checkpointing
+  - logbert_embeddings.py - CLS-based BERT embeddings with optional checkpointing
   - fasttext_embedding.py - 300D pre-trained FastText embeddings
   - word2vec_embedding.py - 300D pre-trained Word2Vec embeddings
   - transformer.py - Hierarchical multi-label transformer with balanced sampling
@@ -244,7 +253,7 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
   - ml_models.py - Classical ML baselines (LR, Linear, RF, XGBoost)
 
 ### Embedding Specifications
-- **LogBERT**: 2314D (CLS(768) + Mean(768) + Max(768) + Attention top-10)
+- **LogBERT**: 768D CLS vectors (replicated into mean/max streams inside the transformer)
 - **FastText**: 300D pre-trained subword-aware embeddings (fasttext-wiki-news-subwords-300)
 - **Word2Vec**: 300D pre-trained semantic vectors (word2vec-google-news-300)
 - **Hardware Support**: Apple Silicon (M2/MPS), CUDA, CPU with automatic device detection
@@ -262,18 +271,18 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
 - **dns**: ~521,563 entries (very large)
 
 ### Pipeline Features
-- Resumeable processing with 5% checkpoints
-- Memory-mapped operations to avoid OOM
-- Auto device detection and batch size tuning
+- Resumeable processing with optional checkpoints
+- Project-local caches for matplotlib, gensim, Hugging Face
+- Auto device detection and batch-size tuning
 - Comprehensive artifact management
 - Full reproducibility with Makefile orchestration
 
 ### Hierarchical Transformer: Architecture & Training
 
 **Architecture** (TransformerConfig defaults: hidden_dim=384, bottleneck_dim=192, num_heads=4, dropout=0.1)
-- Projections: CLS/Mean/Max (768→384), Attn (10→384); stack and encode with single-layer TransformerEncoder
-- Bottleneck + Decoder: 384→192→384→2314 latent reconstruction for representation regularization
-- Heads: one linear head (192→1) per hierarchy node; outputs logits for BCEWithLogits
+- Projections: CLS/Mean/Max (768→384), Attn (10→384); non-LogBERT embeddings are padded/replicated automatically so the transformer sees a uniform layout
+- Bottleneck + Decoder: 384→192→384→(3×768 + 10) reconstruction for representation regularization
+- Heads: one linear head (192→1) per hierarchy node; logits consumed by class-balanced focal BCE
 - Label Propagation: parent probabilities propagate to children via dynamic programming at inference
 
 **Losses**
