@@ -5,7 +5,7 @@
 Word2Vec Embedding for Log Analysis - Using Pre-trained Models
 
 Key Improvements:
-- Uses pre-trained Word2Vec models instead of training from scratch
+- Uses the pre-trained GoogleNews Word2Vec model for consistent embeddings
 - Embeds logs as Word2Vec vectors for better semantic representation
 - Creates binary multi-label vectors with clear column mapping
 - Removed randomness for consistent results
@@ -48,8 +48,17 @@ from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set,
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from gensim.models import KeyedVectors
-from gensim.utils import simple_preprocess
+try:
+    from gensim.models import KeyedVectors
+    from gensim.utils import simple_preprocess
+    import gensim.downloader as api
+    HAS_GENSIM = True
+except ImportError:  # pragma: no cover - environment fallback
+    KeyedVectors = None  # type: ignore
+    simple_preprocess = None  # type: ignore
+    api = None  # type: ignore
+    HAS_GENSIM = False
+    print("Warning: gensim library not available, Word2Vec embeddings disabled")
 """
 Best-effort setup of writable cache/config dirs when $HOME is restricted.
 - Matplotlib: use ./\.mplconfig
@@ -73,15 +82,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from halo import Halo
 from sklearn.manifold import TSNE
-try:
-    import gensim.downloader as api
-    HAS_GENSIM = True
-except ImportError:
-    HAS_GENSIM = False
-    print("Warning: gensim library not available, Word2Vec embeddings disabled")
-
 # Configuration
-OUTPUT_DIR = Path("embeddings")
+OUTPUT_DIR = Path("embeddings") / "word2vec"
 PROCESSED_DIR = Path("processed")
 VECTOR_SIZE = 300  # Standard Word2Vec vector size
 
@@ -211,6 +213,9 @@ def collect_unique_labels_from_data(
 
 def load_pretrained_word2vec() -> Optional[KeyedVectors]:
     """Load pre-trained Word2Vec model."""
+    if not HAS_GENSIM or api is None:
+        return None
+
     spinner = Halo(text='Loading pre-trained Word2Vec model', spinner='dots')
     spinner.start()
 
@@ -246,7 +251,7 @@ def embed_text(
     tokens: Sequence[str],
     vector_cache: Optional[MutableMapping[str, np.ndarray]] = None,
 ) -> np.ndarray:
-    """Generate embedding for tokenized text using pre-trained Word2Vec."""
+    """Generate embedding for tokenized text using Word2Vec vectors."""
     if not tokens:
         return np.zeros(model.vector_size, dtype=np.float32)
 
@@ -258,11 +263,12 @@ def embed_text(
 
     for token in tokens:
         vector = cache.get(token)
-        if vector is None and token in model:
-            vector = np.asarray(model[token], dtype=np.float32)
-            cache[token] = vector
         if vector is None:
-            continue
+            try:
+                vector = np.asarray(model.get_vector(token), dtype=np.float32)
+                cache[token] = vector
+            except KeyError:
+                continue
         accumulator += vector
         count += 1
 
@@ -691,7 +697,7 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
         spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Word2Vec embeddings for log data using pre-trained models")
+    parser = argparse.ArgumentParser(description="Generate Word2Vec embeddings for log data using pre-trained vectors")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'word2vec')")
     args = parser.parse_args()
@@ -709,8 +715,7 @@ def main():
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Load pre-trained Word2Vec model
+
     model = load_pretrained_word2vec()
     if model is None:
         print("Failed to load pre-trained Word2Vec model. Exiting.")
@@ -762,8 +767,18 @@ def main():
             # Display data distribution
             display_data_distribution(df, log_type)
 
+            vector_model = model
+            if vector_model is None:
+                print(f"Skipping '{log_type}' due to missing Word2Vec vectors")
+                continue
+
+            vector_model = model
+            if vector_model is None:
+                print(f"Skipping '{log_type}' due to missing Word2Vec vectors")
+                continue
+
             # Process embeddings
-            df = process_embeddings(df, model, use_global_attack_list=False)
+            df = process_embeddings(df, vector_model, use_global_attack_list=False)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
@@ -801,16 +816,20 @@ def main():
                 print("No data found for combined log types")
             else:
                 display_data_distribution(df_all, "all combined")
-                df_all = process_embeddings(df_all, model, use_global_attack_list=True)
-                
-                # Save combined outputs
-                save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
-                
-                # Create visualization
-                visualize_embeddings(
-                    df_all,
-                    output_file=OUTPUT_DIR / "visualization_all_combined.png"
-                )
+                combined_vector_model = model
+                if combined_vector_model is None:
+                    print("Skipping combined processing due to missing Word2Vec vectors")
+                else:
+                    df_all = process_embeddings(df_all, combined_vector_model, use_global_attack_list=True)
+
+                    # Save combined outputs
+                    save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
+
+                    # Create visualization
+                    visualize_embeddings(
+                        df_all,
+                        output_file=OUTPUT_DIR / "visualization_all_combined.png"
+                    )
         
         except Exception as e:
             print(f"Error processing combined log types: {e}")

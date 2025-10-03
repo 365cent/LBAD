@@ -59,7 +59,7 @@ MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in
 MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
 TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
 PARENT_EXTRA_FRACTION = 1.0      # Additional parent-only quota relative to leaf share
-BALANCE_TARGET_GROWTH = 1.5      # Modest scaling factor for adaptive per-class quotas
+BALANCE_TARGET_GROWTH = 1.2      # Modest scaling factor for adaptive per-class quotas
 
 
 @dataclass(frozen=True)
@@ -368,7 +368,7 @@ def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]
         searched = ", ".join(str(path.resolve()) if path.exists() else str(path) for path in search_order)
         generate_hint = {
             "fasttext": "python src/fasttext_embedding.py --output-subdir fasttext",
-            "word2vec": "python src/word2vec_embedding_thesis.py --output-subdir word2vec",
+            "word2vec": "python src/word2vec_embedding.py --output-subdir word2vec",
             "logbert": "python src/logbert_embeddings.py --output-subdir logbert",
         }.get(embedding_type, "<embedding script>")
         raise FileNotFoundError(
@@ -451,27 +451,54 @@ def _slice_and_pad(
     return np.hstack([chunk, padding])
 
 
-def load_datasets(embeddings, labels, batch_size=128):
+def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[str] = None):
     datasets = {}
     base_config = TransformerConfig()
     cls_dim = 768
     mean_dim = 768
     max_dim = 768
     attn_dim = base_config.attn_input_dim
+    node_names = list(flatten_hierarchy(hierarchy))
+    num_nodes = len(node_names)
 
     for log_type, log_vectors in embeddings.items():
+        feature_dim = log_vectors.shape[1] if log_vectors.ndim == 2 else 0
+
         cls_tokens = _slice_and_pad(log_vectors, 0, cls_dim)
-        mean_pooling = _slice_and_pad(log_vectors, cls_dim, mean_dim)
-        max_pooling = _slice_and_pad(log_vectors, cls_dim + mean_dim, max_dim)
-        attn = _slice_and_pad(log_vectors, cls_dim + mean_dim + max_dim, attn_dim)
+
+        has_mean = feature_dim > cls_dim
+        has_max = feature_dim > cls_dim + mean_dim
+        has_attn = feature_dim >= cls_dim + mean_dim + max_dim + attn_dim
+
+        if has_mean:
+            mean_pooling = _slice_and_pad(log_vectors, cls_dim, mean_dim)
+        else:
+            mean_pooling = cls_tokens.copy()
+
+        if has_max:
+            max_pooling = _slice_and_pad(log_vectors, cls_dim + mean_dim, max_dim)
+        elif has_mean:
+            max_pooling = mean_pooling.copy()
+        else:
+            max_pooling = cls_tokens.copy()
+
+        if has_attn:
+            attn = _slice_and_pad(log_vectors, cls_dim + mean_dim + max_dim, attn_dim)
+        else:
+            attn = np.zeros((log_vectors.shape[0], attn_dim), dtype=log_vectors.dtype if log_vectors.size else np.float32)
+
+        detected = embedding_type or (
+            "logbert" if has_mean and has_max and has_attn else "fasttext/word2vec"
+        )
+        print(f"Detected {detected} embedding layout for '{log_type}' (dim={feature_dim})")
 
         if log_type in labels:
             targets = create_multilabel_targets(labels[log_type], hierarchy)
         else:
-            targets = np.zeros((log_vectors.shape[0], len(list(flatten_hierarchy(hierarchy)))))
-        
+            targets = np.zeros((log_vectors.shape[0], num_nodes))
+
         if targets is None:
-            targets = np.zeros((log_vectors.shape[0], len(list(flatten_hierarchy(hierarchy)))))
+            targets = np.zeros((log_vectors.shape[0], num_nodes))
         
         dataset = TensorDataset(
             torch.from_numpy(cls_tokens).float(),
@@ -488,7 +515,6 @@ def load_datasets(embeddings, labels, batch_size=128):
         anomalies = (targets.sum(axis=1) > 0).sum()
         print(f"[{log_type}] {total} samples | anomalies: {anomalies} ({anomalies/total:.2%})")
         
-        node_names = list(flatten_hierarchy(hierarchy))
         normal_count = total - anomalies
         print("Per-class distribution:")
         print(f"  normal: {normal_count} ({normal_count/total:.2%})")
@@ -711,15 +737,31 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             return train_loader
 
         pool_lengths = np.array([max(1, len(pool)) for _, _, pool in class_entries], dtype=np.float64)
-        median_count = float(np.median(pool_lengths))
-        geometric_mean = float(np.exp(np.mean(np.log(pool_lengths))))
-        baseline_target = max(geometric_mean, median_count, float(MIN_SYNTHETIC_TARGET))
-        scaled_target = baseline_target * BALANCE_TARGET_GROWTH
-        median_cap = median_count * MAX_SYNTHETIC_MULTIPLIER
-        max_available = float(pool_lengths.max())
-        upper_bound = min(max_available, median_cap if median_cap > 0 else max_available)
-        candidate = min(scaled_target, upper_bound)
-        base_target = int(max(MIN_SYNTHETIC_TARGET, round(candidate)))
+        anomaly_lengths = np.array(
+            [max(1, len(pool)) for kind, _, pool in class_entries if kind != "normal"],
+            dtype=np.float64,
+        )
+
+        if anomaly_lengths.size == 0:
+            baseline_target = max(float(np.median(pool_lengths)), float(MIN_SYNTHETIC_TARGET))
+            max_available = float(pool_lengths.max()) if pool_lengths.size else float(MIN_SYNTHETIC_TARGET)
+        else:
+            median_count = float(np.median(anomaly_lengths))
+            perc_75 = float(np.percentile(anomaly_lengths, 75)) if anomaly_lengths.size > 1 else median_count
+            geometric_mean = float(np.exp(np.mean(np.log(anomaly_lengths))))
+            baseline_target = max(median_count, perc_75, geometric_mean, float(MIN_SYNTHETIC_TARGET))
+            scaled_target = baseline_target * BALANCE_TARGET_GROWTH
+            max_available = float(anomaly_lengths.max())
+            perc_90 = float(np.percentile(anomaly_lengths, 90)) if anomaly_lengths.size > 1 else max_available
+            median_cap = median_count * MAX_SYNTHETIC_MULTIPLIER
+            upper_bound = max(
+                baseline_target,
+                min(max_available, perc_90, median_cap if median_cap > 0 else max_available),
+            )
+            candidate = min(scaled_target, upper_bound)
+            baseline_target = max(baseline_target, candidate)
+
+        base_target = int(max(MIN_SYNTHETIC_TARGET, round(baseline_target)))
         base_target = min(base_target, int(max_available))
         per_class_target = base_target
 
@@ -779,8 +821,15 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
         for name, before, after, delta in adjustments:
-            trend = "++" if delta > 0 else "--" if delta < 0 else "=="
-            print(f"  {name:<25} {after:>8} ({trend} {delta:+d})")
+            if delta > 0:
+                trend = "↑"
+            elif delta < 0:
+                trend = "↓"
+            else:
+                trend = "→"
+            change = abs(delta)
+            change_display = "0" if change == 0 else str(change)
+            print(f"  {name:<25} {after:>8} ({trend} {change_display})")
 
         spin_msg = "Streaming resampler ready"
         spinner.stop_and_persist(text=spin_msg)
@@ -1186,7 +1235,7 @@ def main():
     print("Note: This script requires pre-generated embeddings.")
     print("If you see 'Embeddings not found' errors, please generate embeddings first:")
     print("  - FastText: python src/fasttext_embedding.py --output-subdir fasttext")
-    print("  - Word2Vec: python src/word2vec_embedding_thesis.py --output-subdir word2vec") 
+    print("  - Word2Vec: python src/word2vec_embedding.py --output-subdir word2vec") 
     print("  - LogBERT: python src/logbert_embeddings.py --output-subdir logbert")
     print("=" * 50)
     
@@ -1229,7 +1278,7 @@ def main():
             print(f"Log type '{args.log_type}' not found in {embedding_type} embeddings: {list(embeddings.keys())}")
             continue
         
-        datasets = load_datasets(embeddings, labels)
+        datasets = load_datasets(embeddings, labels, embedding_type=embedding_type)
         
         for log_type, data in datasets.items():
             print(f"\n{'='*50}")

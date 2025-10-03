@@ -5,7 +5,7 @@
 FastText Embedding for Log Analysis - Using Pre-trained Models
 
 Key Improvements:
-- Uses pre-trained FastText models instead of training from scratch
+- Uses the pre-trained FastText wiki-news vectors for immediate embeddings
 - Embeds logs as FastText vectors for better semantic representation
 - Creates binary multi-label vectors with clear column mapping
 - Removed randomness for consistent results
@@ -48,8 +48,17 @@ from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set,
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from gensim.models import KeyedVectors
-from gensim.utils import simple_preprocess
+try:
+    from gensim.models import KeyedVectors
+    from gensim.utils import simple_preprocess
+    import gensim.downloader as api
+    HAS_GENSIM = True
+except ImportError:  # pragma: no cover - environment fallback
+    KeyedVectors = None  # type: ignore
+    simple_preprocess = None  # type: ignore
+    api = None  # type: ignore
+    HAS_GENSIM = False
+    print("Warning: gensim library not available, FastText embeddings disabled")
 """
 Best-effort setup of writable cache/config dirs when $HOME is restricted.
 - Matplotlib: use ./\.mplconfig
@@ -73,15 +82,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from halo import Halo
 from sklearn.manifold import TSNE
-try:
-    import gensim.downloader as api
-    HAS_GENSIM = True
-except ImportError:
-    HAS_GENSIM = False
-    print("Warning: gensim library not available, FastText embeddings disabled")
 
 # Configuration
-OUTPUT_DIR = Path("embeddings")
+OUTPUT_DIR = Path("embeddings") / "fasttext"
 PROCESSED_DIR = Path("processed")
 VECTOR_SIZE = 300  # Standard FastText vector size
 
@@ -209,34 +212,6 @@ def collect_unique_labels_from_data(
 
     return sorted(all_unique_labels)
 
-def load_pretrained_fasttext() -> Optional[KeyedVectors]:
-    """Load pre-trained FastText model."""
-    spinner = Halo(text='Loading pre-trained FastText model', spinner='dots')
-    spinner.start()
-    
-    try:
-        # Try to load from local cache first
-        model = api.load("fasttext-wiki-news-subwords-300")
-        spinner.succeed("Loaded pre-trained FastText model (fasttext-wiki-news-subwords-300)")
-        return model
-    except Exception as e:
-        spinner.text = "Downloading pre-trained FastText model (this may take a while)"
-        try:
-            model = api.load("fasttext-wiki-news-subwords-300")
-            spinner.succeed("Downloaded and loaded pre-trained FastText model")
-            return model
-        except Exception as e2:
-            # Try alternative smaller model if main one fails
-            spinner.text = "Trying alternative word2vec model"
-            try:
-                model = api.load("word2vec-google-news-300")
-                spinner.succeed("Loaded alternative word2vec model (word2vec-google-news-300)")
-                return model
-            except Exception as e3:
-                spinner.fail(f"Failed to load any pre-trained model: {e3}")
-                print("Consider installing fasttext manually or check internet connection")
-                return None
-
 @lru_cache(maxsize=50000)
 def _cached_preprocess(text: str) -> Tuple[str, ...]:
     """Tokenize text with caching to avoid repeated preprocessing."""
@@ -249,12 +224,29 @@ def preprocess_text(text: str) -> Tuple[str, ...]:
         return tuple()
     return _cached_preprocess(text)
 
+def load_pretrained_fasttext() -> Optional[KeyedVectors]:
+    """Load the pre-trained FastText model via gensim."""
+
+    if not HAS_GENSIM or api is None:
+        return None
+
+    spinner = Halo(text='Loading pre-trained FastText model', spinner='dots')
+    spinner.start()
+
+    try:
+        model = api.load("fasttext-wiki-news-subwords-300")
+        spinner.succeed("Loaded pre-trained FastText model (fasttext-wiki-news-subwords-300)")
+        return model
+    except Exception as exc:
+        spinner.fail(f"Failed to load fasttext-wiki-news-subwords-300: {exc}")
+        return None
+
 def embed_text(
     model: KeyedVectors,
     tokens: Sequence[str],
     vector_cache: Optional[MutableMapping[str, np.ndarray]] = None,
 ) -> np.ndarray:
-    """Generate embedding for tokenized text using pre-trained FastText."""
+    """Generate embedding for tokenized text using FastText vectors."""
     if not tokens:
         return np.zeros(model.vector_size, dtype=np.float32)
 
@@ -266,11 +258,12 @@ def embed_text(
 
     for token in tokens:
         vector = cache.get(token)
-        if vector is None and token in model:
-            vector = np.asarray(model[token], dtype=np.float32)
-            cache[token] = vector
         if vector is None:
-            continue
+            try:
+                vector = np.asarray(model.get_vector(token), dtype=np.float32)
+                cache[token] = vector
+            except KeyError:
+                continue
         accumulator += vector
         count += 1
 
@@ -699,7 +692,7 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
         spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained models")
+    parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained vectors")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'fasttext')")
     args = parser.parse_args()
@@ -717,8 +710,7 @@ def main():
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Load pre-trained FastText model
+
     model = load_pretrained_fasttext()
     if model is None:
         print("Failed to load pre-trained FastText model. Exiting.")
@@ -770,8 +762,13 @@ def main():
             # Display data distribution
             display_data_distribution(df, log_type)
 
+            vector_model = model
+            if vector_model is None:
+                print(f"Skipping '{log_type}' due to missing FastText vectors")
+                continue
+
             # Process embeddings
-            df = process_embeddings(df, model, use_global_attack_list=False)
+            df = process_embeddings(df, vector_model, use_global_attack_list=False)
             
             # Save outputs
             output_dir = OUTPUT_DIR / log_type
@@ -809,16 +806,20 @@ def main():
                 print("No data found for combined log types")
             else:
                 display_data_distribution(df_all, "all combined")
-                df_all = process_embeddings(df_all, model, use_global_attack_list=True)
-                
-                # Save combined outputs
-                save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
-                
-                # Create visualization
-                visualize_embeddings(
-                    df_all,
-                    output_file=OUTPUT_DIR / "visualization_all_combined.png"
-                )
+                combined_vector_model = model
+                if combined_vector_model is None:
+                    print("Skipping combined processing due to missing FastText vectors")
+                else:
+                    df_all = process_embeddings(df_all, combined_vector_model, use_global_attack_list=True)
+
+                    # Save combined outputs
+                    save_embeddings_and_labels(df_all, OUTPUT_DIR, "all_combined")
+
+                    # Create visualization
+                    visualize_embeddings(
+                        df_all,
+                        output_file=OUTPUT_DIR / "visualization_all_combined.png"
+                    )
         
         except Exception as e:
             print(f"Error processing combined log types: {e}")
