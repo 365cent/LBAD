@@ -1,4 +1,5 @@
 import argparse
+import os
 import pickle
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -21,6 +22,18 @@ warnings.filterwarnings(
     message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
     category=UserWarning,
 )
+
+_BASE_DIR = Path(__file__).resolve().parent.parent
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        _mpl_dir = _BASE_DIR / ".mplconfig"
+        _mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
+    _gensim_dir = _BASE_DIR / "gensim_data"
+    _gensim_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("GENSIM_DATA_DIR", str(_gensim_dir))
+except Exception:  # pragma: no cover - best effort only
+    pass
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")

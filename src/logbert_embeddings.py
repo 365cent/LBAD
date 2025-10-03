@@ -41,6 +41,26 @@ except ImportError:  # pragma: no cover - environment fallback
     HAS_TRANSFORMERS = False
 
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+try:
+    if "MPLCONFIGDIR" not in os.environ:
+        mpl_dir = _BASE_DIR / ".mplconfig"
+        mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+except Exception:  # pragma: no cover - best effort only
+    pass
+
+HF_CACHE_DIR = _BASE_DIR / "hf_cache"
+try:
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    resolved = str(HF_CACHE_DIR.resolve())
+    os.environ.setdefault("HF_HOME", resolved)
+    os.environ.setdefault("TRANSFORMERS_CACHE", resolved)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", resolved)
+except Exception:  # pragma: no cover - best effort only
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -411,4 +431,3 @@ def main() -> None:
 if __name__ == "__main__":
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()
-

@@ -65,18 +65,16 @@ Best-effort setup of writable cache/config dirs when $HOME is restricted.
 - Gensim downloader: use ./gensim_data
 This must happen before importing matplotlib or gensim.downloader.
 """
+_BASE_DIR = Path(__file__).resolve().parent.parent
 try:
-    # Matplotlib cache/config directory
     if "MPLCONFIGDIR" not in os.environ:
-        _mpl_dir = Path.cwd() / ".mplconfig"
+        _mpl_dir = _BASE_DIR / ".mplconfig"
         _mpl_dir.mkdir(parents=True, exist_ok=True)
         os.environ["MPLCONFIGDIR"] = str(_mpl_dir)
-    # Gensim downloader data directory
-    _gensim_dir = Path.cwd() / "gensim_data"
+    _gensim_dir = _BASE_DIR / "gensim_data"
     _gensim_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("GENSIM_DATA_DIR", str(_gensim_dir))
 except Exception:
-    # If creation fails (e.g., read-only FS), fall back silently
     pass
 import matplotlib.pyplot as plt
 import seaborn as sns
