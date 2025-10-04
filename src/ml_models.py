@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Any
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -80,6 +80,32 @@ def _iter_embedding_dirs(candidate_roots: Iterable[Path]) -> Iterable[Path]:
                 yield child
 
 
+def _coerce_array(data: Any, *, dtype: Any) -> Optional[np.ndarray]:
+    """Best-effort conversion of arbitrary array-likes to the requested dtype."""
+
+    if data is None:
+        return None
+
+    if isinstance(data, np.ndarray):
+        array = data
+    else:
+        try:
+            array = np.asarray(data)
+        except Exception:
+            return None
+
+    if array.size == 0:
+        return None
+
+    try:
+        return array.astype(dtype, copy=False)
+    except (TypeError, ValueError):
+        try:
+            return array.astype(dtype)
+        except Exception:
+            return None
+
+
 def _load_embeddings_from_roots(
     embedding_type: str,
     candidate_roots: Iterable[Path],
@@ -91,16 +117,31 @@ def _load_embeddings_from_roots(
     def load_single(directory: Path, logical_name: str) -> None:
         if logical_name in embeddings:
             return
+
         log_pkl = directory / f"log_{logical_name}.pkl"
         label_pkl = directory / f"label_{logical_name}.pkl"
         if not (log_pkl.exists() and label_pkl.exists()):
             return
+
         print(f"Loading {logical_name} ({embedding_type})...", end=" ")
-        log_array = safe_load(log_pkl)
-        label_obj = safe_load(label_pkl)
-        if isinstance(log_array, np.ndarray) and isinstance(label_obj, dict):
-            embeddings[logical_name] = log_array.astype(np.float32)
-            labels[logical_name] = label_obj
+        raw_embeddings = safe_load(log_pkl)
+        raw_labels = safe_load(label_pkl)
+
+        embedding_array = _coerce_array(raw_embeddings, dtype=np.float32)
+        label_payload: Optional[dict]
+
+        if isinstance(raw_labels, Mapping):
+            label_payload = dict(raw_labels)
+            vectors = label_payload.get("vectors")
+            coerced_vectors = _coerce_array(vectors, dtype=np.float32)
+            if coerced_vectors is not None:
+                label_payload["vectors"] = coerced_vectors
+        else:
+            label_payload = None
+
+        if embedding_array is not None and label_payload is not None:
+            embeddings[logical_name] = embedding_array
+            labels[logical_name] = label_payload
             print("✓")
         else:
             print("✗")
@@ -133,7 +174,7 @@ def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]
         searched = ", ".join(str(path.resolve()) if path.exists() else str(path) for path in search_order)
         hint = {
             "fasttext": "python src/fasttext_embedding.py --output-subdir fasttext",
-            "word2vec": "python src/word2vec_embedding_thesis.py --output-subdir word2vec",
+            "word2vec": "python src/word2vec_embedding.py --output-subdir word2vec",
             "logbert": "python src/logbert_embeddings.py --output-subdir logbert",
         }.get(embedding_type, "<embedding script>")
         raise FileNotFoundError(
