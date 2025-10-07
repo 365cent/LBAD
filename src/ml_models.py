@@ -209,6 +209,7 @@ class BaselineConfig:
 
     test_ratio: float = 0.2
     random_state: int = 42
+    rf_n_jobs: int = 1
     include_logistic: bool = True
     include_random_forest: bool = True
     include_xgb: bool = True
@@ -343,7 +344,7 @@ def _build_models(config: BaselineConfig) -> Dict[str, object]:
         rf = RandomForestClassifier(
             n_estimators=config.n_estimators,
             max_depth=config.max_depth,
-            n_jobs=-1,
+            n_jobs=config.rf_n_jobs,
             random_state=config.random_state,
         )
         models["random_forest"] = rf
@@ -634,6 +635,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of estimators for tree-based models",
     )
     parser.add_argument(
+        "--rf-n-jobs",
+        type=int,
+        default=1,
+        help="Parallel job count for the Random Forest baseline (higher values increase memory usage)",
+    )
+    parser.add_argument(
         "--max-depth",
         type=int,
         default=None,
@@ -666,6 +673,7 @@ def main() -> None:
     config = BaselineConfig(
         test_ratio=args.test_ratio,
         random_state=args.random_state,
+        rf_n_jobs=args.rf_n_jobs,
         include_xgb=not args.skip_xgb and HAS_XGB,
         include_random_forest=not args.skip_rf,
         include_logistic=not args.skip_logistic,
