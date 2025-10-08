@@ -596,73 +596,32 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Optional subsample size (processes full dataset if not provided)",
     )
-    parser.add_argument(
-        "--skip-xgb",
+    model_group = parser.add_argument_group("baselines", "Select baseline models to evaluate")
+    model_group.add_argument(
+        "--xgb",
         action="store_true",
-        help="Disable XGBoost baseline",
+        help="Run the XGBoost baseline (requires the xgboost package)",
     )
-    parser.add_argument(
-        "--skip-rf",
+    model_group.add_argument(
+        "--rf",
+        "--random-forest",
+        dest="random_forest",
         action="store_true",
-        help="Disable Random Forest baseline",
+        help="Run the Random Forest baseline",
     )
-    parser.add_argument(
-        "--skip-logistic",
+    model_group.add_argument(
+        "--logistic",
+        "--logistic-regression",
+        dest="logistic",
         action="store_true",
-        help="Disable Logistic Regression baseline",
+        help="Run the Logistic Regression baseline",
     )
-    parser.add_argument(
-        "--skip-linear",
+    model_group.add_argument(
+        "--linear",
+        "--linear-regression",
+        dest="linear",
         action="store_true",
-        help="Disable Linear Regression baseline",
-    )
-    parser.add_argument(
-        "--random-state",
-        type=int,
-        default=42,
-        help="Random seed",
-    )
-    parser.add_argument(
-        "--test-ratio",
-        type=float,
-        default=0.2,
-        help="Test set ratio (default: 0.2)",
-    )
-    parser.add_argument(
-        "--n-estimators",
-        type=int,
-        default=200,
-        help="Number of estimators for tree-based models",
-    )
-    parser.add_argument(
-        "--rf-n-jobs",
-        type=int,
-        default=1,
-        help="Parallel job count for the Random Forest baseline (higher values increase memory usage)",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=None,
-        help="Maximum depth for tree-based models",
-    )
-    parser.add_argument(
-        "--xgb-estimators",
-        type=int,
-        default=200,
-        help="Number of trees for XGBoost",
-    )
-    parser.add_argument(
-        "--xgb-learning-rate",
-        type=float,
-        default=0.1,
-        help="Learning rate for XGBoost",
-    )
-    parser.add_argument(
-        "--xgb-max-depth",
-        type=int,
-        default=6,
-        help="Tree depth for XGBoost",
+        help="Run the Linear Regression baseline",
     )
     return parser.parse_args()
 
@@ -670,19 +629,29 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     args = parse_arguments()
 
+    any_requested = any(
+        [args.xgb, args.random_forest, args.logistic, args.linear]
+    )
+
+    include_random_forest = args.random_forest or not any_requested
+    include_logistic = args.logistic or not any_requested
+    include_linear = args.linear or not any_requested
+
+    include_xgb_requested = args.xgb or not any_requested
+    include_xgb = include_xgb_requested and HAS_XGB
+    if args.xgb and not HAS_XGB:
+        print("Warning: XGBoost baseline requested but the 'xgboost' package is not installed. Skipping.")
+    elif include_xgb_requested and not HAS_XGB and not args.xgb:
+        print("Info: XGBoost baseline unavailable because the 'xgboost' package is not installed.")
+
+    if not any([include_xgb, include_random_forest, include_logistic, include_linear]):
+        raise SystemExit("No baselines selected. Enable at least one model flag.")
+
     config = BaselineConfig(
-        test_ratio=args.test_ratio,
-        random_state=args.random_state,
-        rf_n_jobs=args.rf_n_jobs,
-        include_xgb=not args.skip_xgb and HAS_XGB,
-        include_random_forest=not args.skip_rf,
-        include_logistic=not args.skip_logistic,
-        include_linear=not args.skip_linear,
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth,
-        xgb_estimators=args.xgb_estimators,
-        xgb_learning_rate=args.xgb_learning_rate,
-        xgb_max_depth=args.xgb_max_depth,
+        include_xgb=include_xgb,
+        include_random_forest=include_random_forest,
+        include_logistic=include_logistic,
+        include_linear=include_linear,
     )
 
     embedding_order = (
