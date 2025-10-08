@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import pickle
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Any
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -209,7 +210,7 @@ class BaselineConfig:
 
     test_ratio: float = 0.2
     random_state: int = 42
-    rf_n_jobs: int = 1
+    rf_n_jobs: int = -1
     include_logistic: bool = True
     include_random_forest: bool = True
     include_xgb: bool = True
@@ -346,6 +347,7 @@ def _build_models(config: BaselineConfig) -> Dict[str, object]:
             max_depth=config.max_depth,
             n_jobs=config.rf_n_jobs,
             random_state=config.random_state,
+            verbose=1,
         )
         models["random_forest"] = rf
 
@@ -517,7 +519,10 @@ def train_and_evaluate_models(
 
     for name, estimator in models.items():
         print(f"\nTraining {name}...")
+        start_time = time.perf_counter()
         estimator.fit(bundle.X_train, bundle.y_train)
+        elapsed = time.perf_counter() - start_time
+        print(f"{name} training completed in {elapsed:.2f}s")
         predictions = estimator.predict(bundle.X_test)
         metrics = _report_metrics(
             model_name=name,
@@ -569,6 +574,15 @@ def run_baseline(
         print(f"  Test samples  : {bundle.X_test.shape[0]}")
         print(f"  Label count   : {len(bundle.label_names)}")
         print(f"  Anomaly rows  : {anomaly_count}")
+        if (
+            config.include_random_forest
+            and sample_size is None
+            and total_samples > 200_000
+        ):
+            print(
+                "  Note: Random Forest is training on the full dataset; this may take a long time.\n"
+                "        Consider passing --sample-size to subsample before fitting."
+            )
 
         train_and_evaluate_models(bundle, config, log_type, embedding_type, output_dir)
 
