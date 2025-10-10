@@ -17,6 +17,13 @@ from sklearn.metrics import precision_recall_fscore_support, jaccard_score
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset, Sampler, Subset
 
+# SMOTE imports
+try:
+    from skmultilearn.adapt import MLSMOTE
+    MLSMOTE_AVAILABLE = True
+except ImportError:
+    MLSMOTE_AVAILABLE = False
+
 warnings.filterwarnings(
     "ignore",
     message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
@@ -540,82 +547,15 @@ def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[s
     return datasets
 
 def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2):
-    """Generates a balanced training loader with controllable contamination ratio."""
+    """Applies multi-label SMOTE to generate synthetic samples and returns augmented dataset."""
 
-    spinner = halo.Halo(text="Applying balanced resampling", spinner="dots")
+    spinner = halo.Halo(text="Applying MLSMOTE oversampling", spinner="dots")
     spinner.start()
-
-    class BalancedBatchSampler(Sampler[List[int]]):
-        """Sampler that interleaves class indices to satisfy per-class quotas without materializing data."""
-
-        def __init__(
-            self,
-            class_indices: Mapping[str, np.ndarray],
-            class_targets: Mapping[str, int],
-            batch_size: int,
-            seed: int = 42,
-        ) -> None:
-            self.class_indices: Dict[str, np.ndarray] = {
-                key: np.asarray(indices, dtype=np.int64)
-                for key, indices in class_indices.items()
-                if indices.size > 0
-            }
-            self.class_targets: Dict[str, int] = {
-                key: int(class_targets[key])
-                for key in self.class_indices.keys()
-                if class_targets.get(key, 0) > 0
-            }
-            self.batch_size = max(1, int(batch_size))
-            self.seed = int(seed)
-            self.epoch = 0
-            self.total = sum(self.class_targets.values())
-            if self.total == 0:
-                raise ValueError("BalancedBatchSampler requires at least one positive target")
-
-        def __len__(self) -> int:
-            return max(1, math.ceil(self.total / self.batch_size))
-
-        def __iter__(self):
-            rng = np.random.default_rng(self.seed + self.epoch)
-            self.epoch += 1
-            remaining = self.class_targets.copy()
-            active = [key for key, count in remaining.items() if count > 0]
-            iterators: Dict[str, Iterable[int]] = {
-                key: self._cycle(self.class_indices[key], rng)
-                for key in active
-            }
-
-            batch: List[int] = []
-            idx = 0
-            while active:
-                key = active[idx % len(active)]
-                idx += 1
-                if remaining[key] <= 0:
-                    active = [item for item in active if remaining[item] > 0]
-                    continue
-                batch.append(next(iterators[key]))
-                remaining[key] -= 1
-                if remaining[key] == 0:
-                    active = [item for item in active if remaining[item] > 0]
-                if len(batch) == self.batch_size:
-                    yield batch
-                    batch = []
-
-            if batch:
-                yield batch
-
-        @staticmethod
-        def _cycle(indices: np.ndarray, rng: np.random.Generator) -> Iterable[int]:
-            if indices.size == 0:
-                raise ValueError("Cannot cycle over an empty index pool")
-            if indices.size == 1:
-                single = int(indices[0])
-                while True:
-                    yield single
-            while True:
-                perm = rng.permutation(len(indices))
-                for idx in perm:
-                    yield int(indices[idx])
+    
+    # Debug: Check MLSMOTE availability
+    if not MLSMOTE_AVAILABLE:
+        print("\n  Note: scikit-multilearn not available, will use fallback SMOTE")
+        print("  Install with: pip install scikit-multilearn==0.2.0")
 
     try:
         dataset = getattr(train_loader, "dataset", None)
@@ -626,245 +566,267 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             subset_indices = np.asarray(dataset.indices, dtype=np.int64)
 
         if not isinstance(base_dataset, TensorDataset) or len(base_dataset.tensors) < 5:
-            spinner.stop_and_persist(text="Streaming resampler requires TensorDataset with targets; using original loader")
+            spinner.stop_and_persist(text="SMOTE requires TensorDataset with 5 tensors; using original loader")
             return train_loader
 
-        label_tensor = base_dataset.tensors[4]
-        if not isinstance(label_tensor, torch.Tensor):
-            label_tensor = torch.as_tensor(label_tensor)
-        label_tensor = label_tensor.detach().cpu()
+        # Extract all tensors
+        cls_tensor = base_dataset.tensors[0].detach().cpu()
+        mean_tensor = base_dataset.tensors[1].detach().cpu()
+        max_tensor = base_dataset.tensors[2].detach().cpu()
+        attn_tensor = base_dataset.tensors[3].detach().cpu()
+        label_tensor = base_dataset.tensors[4].detach().cpu()
+
         if subset_indices is not None:
+            cls_tensor = cls_tensor[subset_indices]
+            mean_tensor = mean_tensor[subset_indices]
+            max_tensor = max_tensor[subset_indices]
+            attn_tensor = attn_tensor[subset_indices]
             label_tensor = label_tensor[subset_indices]
 
-        y = label_tensor.numpy().astype(np.float32)
+        # Convert to numpy
+        cls_np = cls_tensor.numpy().astype(np.float32)
+        mean_np = mean_tensor.numpy().astype(np.float32)
+        max_np = max_tensor.numpy().astype(np.float32)
+        attn_np = attn_tensor.numpy().astype(np.float32)
+        y = label_tensor.numpy().astype(np.int32)
+
         if int(y.sum()) == 0:
-            spinner.stop_and_persist(text="Skipping resampling (only normal samples detected)")
+            spinner.stop_and_persist(text="Skipping SMOTE (only normal samples detected)")
             return train_loader
 
+        # Concatenate all embeddings: X = concat(cls, mean, max, attn)
+        X = np.hstack([cls_np, mean_np, max_np, attn_np])
+        
+        n_samples, n_features = X.shape
+        n_labels = y.shape[1]
+        
+        print(f"\nOriginal dataset: {n_samples} samples, {n_features} features, {n_labels} labels")
+        original_anomaly_count = int((y.sum(axis=1) > 0).sum())
+        print(f"  Normal: {n_samples - original_anomaly_count}, Anomaly: {original_anomaly_count}")
+        
+        # Per-class counts before SMOTE
+        class_counts_before = y.sum(axis=0)
+        print(f"  Per-class counts (before): min={class_counts_before[class_counts_before > 0].min() if (class_counts_before > 0).any() else 0}, "
+              f"max={class_counts_before.max()}, mean={class_counts_before[class_counts_before > 0].mean() if (class_counts_before > 0).any() else 0:.1f}")
+
+        # Apply MLSMOTE if available, otherwise use fallback
+        if MLSMOTE_AVAILABLE:
+            try:
+                # Convert to sparse format for MLSMOTE
+                from scipy.sparse import csr_matrix, lil_matrix
+                
+                # Determine k based on minority class size
+                min_minority_samples = class_counts_before[class_counts_before > 0].min() if (class_counts_before > 0).any() else 5
+                k = min(5, max(1, int(min_minority_samples) - 1))
+                
+                print(f"  Applying MLSMOTE with k={k}...")
+                
+                # MLSMOTE performs iterative balancing - run multiple passes for full balancing
+                X_current = X.copy()
+                y_current = y.copy()
+                
+                max_iterations = 5
+                for iteration in range(max_iterations):
+                    current_counts = y_current.sum(axis=0)
+                    max_count = current_counts.max()
+                    min_count = current_counts[current_counts > 0].min() if (current_counts > 0).any() else max_count
+                    
+                    # Stop if already balanced
+                    if min_count >= max_count * 0.95:
+                        print(f"    Converged after {iteration} iterations")
+                        break
+                    
+                    # Apply MLSMOTE
+                    X_sparse = csr_matrix(X_current)
+                    y_sparse = lil_matrix(y_current)
+                    
+                    mlsmote = MLSMOTE(k=k)
+                    X_resampled, y_resampled = mlsmote.fit_resample(X_sparse, y_sparse)
+                    
+                    X_current = X_resampled.toarray().astype(np.float32)
+                    y_current = y_resampled.toarray().astype(np.int32)
+                    
+                    new_counts = y_current.sum(axis=0)
+                    print(f"    Iteration {iteration + 1}: min={new_counts[new_counts > 0].min():.0f}, max={new_counts.max():.0f}")
+                
+                X_synth = X_current
+                y_synth = y_current
+                
+            except Exception as e:
+                print(f"  MLSMOTE failed ({e}), using fallback method...")
+                import traceback
+                traceback.print_exc()
+                X_synth, y_synth = _fallback_smote(X, y, target_contamination)
+        else:
+            print("  MLSMOTE not available, using fallback method...")
+            X_synth, y_synth = _fallback_smote(X, y, target_contamination)
+
+        n_synth = X_synth.shape[0]
+        n_synthetic_new = n_synth - n_samples
+        print(f"\nAugmented dataset: {n_synth} samples (+{n_synthetic_new} synthetic)")
+        
+        # Per-class counts after SMOTE
+        class_counts_after = y_synth.sum(axis=0)
+        
+        # Get node names for display
         node_names = list(flatten_hierarchy(hierarchy))
-        if len(node_names) < y.shape[1]:
-            node_names.extend([f"label_{i}" for i in range(len(node_names), y.shape[1])])
-        node_to_index = {name: idx for idx, name in enumerate(node_names)}
-        parent_lookup = build_parent_lookup(hierarchy)
-        parent_nodes = {name for name in parent_lookup.values() if name is not None}
-        leaf_indices = [
-            node_to_index[name]
-            for name in node_names
-            if name in node_to_index and name not in parent_nodes and node_to_index[name] < y.shape[1]
-        ]
-        if not leaf_indices:
-            leaf_indices = list(range(y.shape[1]))
-
-        idx_to_name = {
-            node_to_index[name]: name
-            for name in node_names
-            if name in node_to_index and node_to_index[name] < y.shape[1]
-        }
-
-        index_children: Dict[int, List[int]] = {}
-        for name, parent_name in parent_lookup.items():
-            if parent_name is None:
-                continue
-            child_idx = node_to_index.get(name)
-            parent_idx = node_to_index.get(parent_name)
-            if child_idx is None or parent_idx is None:
-                continue
-            if child_idx >= y.shape[1] or parent_idx >= y.shape[1]:
-                continue
-            index_children.setdefault(parent_idx, []).append(child_idx)
-
-        def class_counts(labels: np.ndarray) -> np.ndarray:
-            return labels.sum(axis=0)
-
-        original_normal = int((y.sum(axis=1) == 0).sum())
-        original_anomaly = int(len(y) - original_normal)
-        original_class_counts = class_counts(y)
-
-        normal_mask = y.sum(axis=1) == 0
-        anomaly_mask = ~normal_mask
-        normal_indices = np.where(normal_mask)[0]
-
-        leaf_targets: Dict[int, int] = {}
-        parent_targets: Dict[int, int] = {}
-        class_indices: Dict[str, np.ndarray] = {}
-        class_targets: Dict[str, int] = {}
-
-        normal_target = 0
-        class_entries: List[Tuple[str, Optional[int], np.ndarray]] = []
-        if normal_indices.size > 0:
-            class_entries.append(("normal", None, normal_indices))
-
-        active_leaf_indices = [
-            idx for idx in leaf_indices if idx < y.shape[1] and np.any(y[:, idx] == 1)
-        ]
-        leaf_positive_map: Dict[int, np.ndarray] = {}
-        for leaf_idx in active_leaf_indices:
-            positives = np.where(y[:, leaf_idx] == 1)[0]
-            if positives.size:
-                leaf_positive_map[leaf_idx] = positives
-
-        parent_candidate_map: Dict[int, np.ndarray] = {}
-        for parent_idx, children in index_children.items():
-            if parent_idx >= y.shape[1]:
-                continue
-            parent_mask = y[:, parent_idx] == 1
-            child_candidates = [child for child in children if child < y.shape[1]]
-            if child_candidates:
-                parent_mask = np.logical_and(parent_mask, (y[:, child_candidates].sum(axis=1) == 0))
-            candidates = np.where(parent_mask)[0]
-            if candidates.size:
-                parent_candidate_map[parent_idx] = candidates
-            else:
-                fallback_parent = np.where(y[:, parent_idx] == 1)[0]
-                if fallback_parent.size:
-                    parent_candidate_map[parent_idx] = fallback_parent
-
-        leaf_count = len(leaf_positive_map)
-        parent_count = len(parent_candidate_map) if PARENT_EXTRA_FRACTION > 0 else 0
-
-        include_parents = parent_count > 0 and PARENT_EXTRA_FRACTION > 0
-        anomaly_entries: List[Tuple[str, int, np.ndarray]] = []
-
-        for leaf_idx in sorted(leaf_positive_map.keys()):
-            positives = leaf_positive_map.get(leaf_idx)
-            if positives is None or positives.size == 0:
-                continue
-            anomaly_entries.append(("leaf", leaf_idx, positives))
-
-        if include_parents:
-            for parent_idx in sorted(parent_candidate_map.keys()):
-                candidates = parent_candidate_map.get(parent_idx)
-                if candidates is None or candidates.size == 0:
-                    continue
-                anomaly_entries.append(("parent", parent_idx, candidates))
-
-        if not anomaly_entries:
-            attack_indices = np.where(anomaly_mask)[0]
-            if attack_indices.size > 0:
-                class_entries.append(("attack", None, attack_indices))
-        else:
-            class_entries.extend(anomaly_entries)
-
-        if not class_entries:
-            spinner.stop_and_persist(text="Resampling skipped (no eligible classes detected)")
-            return train_loader
-
-        pool_lengths = np.array([max(1, len(pool)) for _, _, pool in class_entries], dtype=np.float64)
-        anomaly_lengths = np.array(
-            [max(1, len(pool)) for kind, _, pool in class_entries if kind != "normal"],
-            dtype=np.float64,
-        )
-
-        if anomaly_lengths.size == 0:
-            baseline_target = max(float(np.median(pool_lengths)), float(MIN_SYNTHETIC_TARGET))
-            max_available = float(pool_lengths.max()) if pool_lengths.size else float(MIN_SYNTHETIC_TARGET)
-        else:
-            median_count = float(np.median(anomaly_lengths))
-            perc_75 = float(np.percentile(anomaly_lengths, 75)) if anomaly_lengths.size > 1 else median_count
-            geometric_mean = float(np.exp(np.mean(np.log(anomaly_lengths))))
-            baseline_target = max(median_count, perc_75, geometric_mean, float(MIN_SYNTHETIC_TARGET))
-            scaled_target = baseline_target * BALANCE_TARGET_GROWTH
-            max_available = float(anomaly_lengths.max())
-            perc_90 = float(np.percentile(anomaly_lengths, 90)) if anomaly_lengths.size > 1 else max_available
-            median_cap = median_count * MAX_SYNTHETIC_MULTIPLIER
-            upper_bound = max(
-                baseline_target,
-                min(max_available, perc_90, median_cap if median_cap > 0 else max_available),
-            )
-            candidate = min(scaled_target, upper_bound)
-            baseline_target = max(baseline_target, candidate)
-
-        base_target = int(max(MIN_SYNTHETIC_TARGET, round(baseline_target)))
-        base_target = min(base_target, int(max_available))
-        per_class_target = base_target
-
-        for kind, class_idx, pool in class_entries:
-            target = base_target
-
-            if kind == "normal":
-                normal_target = int(target)
-                class_indices["normal"] = pool
-                class_targets["normal"] = normal_target
-            elif kind == "leaf":
-                leaf_targets[class_idx] = int(target)
-                key = f"leaf:{class_idx}"
-                class_indices[key] = pool
-                class_targets[key] = int(target)
-            elif kind == "parent":
-                parent_targets[class_idx] = int(target)
-                key = f"parent:{class_idx}"
-                class_indices[key] = pool
-                class_targets[key] = int(target)
-            else:
-                class_indices[kind] = pool
-                class_targets[kind] = int(target)
-
-        total_targets = sum(class_targets.values())
-        if total_targets == 0:
-            spinner.stop_and_persist(text="Resampling skipped (no class targets computed)")
-            return train_loader
-
-        batch_size = getattr(train_loader, "batch_size", 128)
-        sampler = BalancedBatchSampler(class_indices, class_targets, batch_size=batch_size, seed=42)
-
-        print("\nStreaming class targets (per epoch):")
-        print(f"  total target samples: {total_targets}")
-        normal_target_display = class_targets.get("normal", 0)
-        attack_target_display = total_targets - normal_target_display
-        print(f"  normal target: {normal_target_display}")
-        print(f"  attack target: {attack_target_display}")
-        if per_class_target is not None:
-            print(f"  per-class base target: {per_class_target}")
-
-        print("\nPer-class targets vs originals:")
-        adjustments = []
-        if "normal" in class_targets:
-            adjustments.append(("normal", original_normal, normal_target_display, normal_target_display - original_normal))
-        for leaf_idx, target in leaf_targets.items():
-            name = idx_to_name.get(leaf_idx, str(leaf_idx))
-            before = int(original_class_counts[leaf_idx])
-            adjustments.append((name, before, target, target - before))
-        for parent_idx, target in parent_targets.items():
-            name = idx_to_name.get(parent_idx, str(parent_idx))
-            before = int(original_class_counts[parent_idx])
-            adjustments.append((name, before, target, target - before))
-        if "attack" in class_targets:
-            before = int(anomaly_mask.sum())
-            adjustments.append(("attack", before, class_targets["attack"], class_targets["attack"] - before))
-
-        adjustments.sort(key=lambda item: abs(item[3]), reverse=True)
-        for name, before, after, delta in adjustments:
+        
+        # Calculate normal class (samples with no labels)
+        normal_before = int((y.sum(axis=1) == 0).sum())
+        normal_after = int((y_synth.sum(axis=1) == 0).sum())
+        normal_delta = normal_after - normal_before
+        
+        # Build per-class comparison
+        print("\nPer-class distribution (before → after SMOTE):")
+        class_changes = []
+        
+        # Add attack classes
+        for i in range(min(len(node_names), len(class_counts_before))):
+            before = int(class_counts_before[i])
+            after = int(class_counts_after[i])
+            delta = after - before
+            if before > 0 or after > 0:  # Only show classes that have samples
+                class_changes.append((node_names[i], before, after, delta))
+        
+        # Add normal class
+        class_changes.append(("normal", normal_before, normal_after, normal_delta))
+        
+        # Sort by delta (descending absolute value) to show biggest changes first
+        class_changes.sort(key=lambda x: abs(x[3]), reverse=True)
+        
+        for name, before, after, delta in class_changes:
             if delta > 0:
-                trend = "↑"
+                trend = "++"
+                sign = "+"
             elif delta < 0:
-                trend = "↓"
+                trend = "--"
+                sign = ""
             else:
                 trend = "→"
-            change = abs(delta)
-            change_display = "0" if change == 0 else str(change)
-            print(f"  {name:<25} {after:>8} ({trend} {change_display})")
+                sign = ""
+            print(f"  {name:<25} {after:>8} ({trend} {sign}{delta})")
 
-        spin_msg = "Streaming resampler ready"
-        spinner.stop_and_persist(text=spin_msg)
+        # Split X_synth back into 4 components
+        cls_dim = cls_np.shape[1]
+        mean_dim = mean_np.shape[1]
+        max_dim = max_np.shape[1]
+        attn_dim = attn_np.shape[1]
+        
+        offset = 0
+        cls_synth = X_synth[:, offset:offset + cls_dim]
+        offset += cls_dim
+        mean_synth = X_synth[:, offset:offset + mean_dim]
+        offset += mean_dim
+        max_synth = X_synth[:, offset:offset + max_dim]
+        offset += max_dim
+        attn_synth = X_synth[:, offset:offset + attn_dim]
 
+        # Create new augmented dataset
+        augmented_dataset = TensorDataset(
+            torch.from_numpy(cls_synth).float(),
+            torch.from_numpy(mean_synth).float(),
+            torch.from_numpy(max_synth).float(),
+            torch.from_numpy(attn_synth).float(),
+            torch.from_numpy(y_synth).float()
+        )
+
+        # Create new loader with same settings
+        batch_size = getattr(train_loader, "batch_size", 128)
         loader_kwargs = {
-            "batch_sampler": sampler,
+            "batch_size": batch_size,
+            "shuffle": True,
             "num_workers": getattr(train_loader, "num_workers", 0),
             "pin_memory": getattr(train_loader, "pin_memory", device.type == "cuda"),
         }
         if loader_kwargs["num_workers"] > 0:
             loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", True)
             loader_kwargs["prefetch_factor"] = getattr(train_loader, "prefetch_factor", 2)
-        collate_fn = getattr(train_loader, "collate_fn", None)
-        if collate_fn is not None:
-            loader_kwargs["collate_fn"] = collate_fn
 
-        return DataLoader(dataset, **loader_kwargs)
+        augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
+        
+        spinner.stop_and_persist(symbol="✓", text="SMOTE augmentation completed")
+        return augmented_loader
 
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Resampling failed: {exc}")
-        spinner.stop_and_persist(text="Resampling failed (fallback to original loader)")
+    except Exception as exc:
+        import traceback
+        print(f"\nSMOTE failed: {exc}")
+        traceback.print_exc()
+        spinner.stop_and_persist(text="SMOTE failed (fallback to original loader)")
         return train_loader
+
+
+def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
+    """Fallback SMOTE implementation using label-wise oversampling with multi-label awareness."""
+    
+    from sklearn.neighbors import NearestNeighbors
+    
+    n_samples = X.shape[0]
+    n_labels = y.shape[1]
+    
+    # Identify minority classes
+    class_counts = y.sum(axis=0)
+    max_count = class_counts.max()
+    
+    # Target count for balancing - make all classes equal to max
+    target_count = int(max_count)
+    
+    synthetic_X = []
+    synthetic_y = []
+    
+    for label_idx in range(n_labels):
+        class_mask = y[:, label_idx] == 1
+        class_count = class_mask.sum()
+        
+        if class_count == 0 or class_count >= target_count:
+            continue
+        
+        # Get samples for this class
+        class_samples = X[class_mask]
+        class_labels = y[class_mask]
+        
+        n_synthetic = target_count - class_count
+        
+        # Use k-NN to find neighbors
+        k = min(5, class_count - 1) if class_count > 1 else 1
+        if k < 1:
+            continue
+            
+        nn = NearestNeighbors(n_neighbors=k + 1)
+        nn.fit(class_samples)
+        
+        for _ in range(n_synthetic):
+            # Random sample from class
+            idx = np.random.randint(0, class_count)
+            sample = class_samples[idx]
+            
+            # Find neighbors
+            distances, indices = nn.kneighbors([sample])
+            
+            # Pick random neighbor (skip first as it's the sample itself)
+            neighbor_idx = np.random.randint(1, k + 1)
+            neighbor = class_samples[indices[0, neighbor_idx]]
+            
+            # Generate synthetic sample (random interpolation)
+            alpha = np.random.random()
+            synthetic_sample = sample + alpha * (neighbor - sample)
+            
+            # Use union of labels from both samples
+            synthetic_label = np.maximum(class_labels[idx], class_labels[indices[0, neighbor_idx]])
+            
+            synthetic_X.append(synthetic_sample)
+            synthetic_y.append(synthetic_label)
+    
+    if synthetic_X:
+        synthetic_X = np.array(synthetic_X, dtype=np.float32)
+        synthetic_y = np.array(synthetic_y, dtype=np.int32)
+        
+        X_combined = np.vstack([X, synthetic_X])
+        y_combined = np.vstack([y, synthetic_y])
+    else:
+        X_combined = X
+        y_combined = y
+    
+    return X_combined, y_combined
 
 
 def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> Optional[np.ndarray]:
@@ -942,18 +904,22 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
     spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
     spinner.start()
 
-    # Get label names and compute class weights from original training data
+    # Get label names and compute class weights from augmented (SMOTE) training data
     with torch.no_grad():
-        c0, m0, x0, a0, _ = next(iter(train_loader))
+        c0, m0, x0, a0, _ = next(iter(train))
         c0, m0, x0, a0 = c0.to(device), m0.to(device), x0.to(device), a0.to(device)
         _, _, outs0 = model(c0, m0, x0, a0)
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(len(outs0))]
+        
+        # Collect all targets from augmented dataset to compute accurate class weights
+        print("Computing class weights from augmented dataset...")
         all_targets = []
-        for _, _, _, _, targets in train:  # Use SMOTE-augmented data for weights
+        for _, _, _, _, targets in train:
             all_targets.append(targets.cpu())
         Y = torch.cat(all_targets)
 
         class_counts = torch.clamp(Y.sum(dim=0), min=1.0)
+        print(f"  Class counts (augmented): min={class_counts.min():.0f}, max={class_counts.max():.0f}, mean={class_counts.mean():.1f}")
 
         class ClassBalancedEntropyLoss(nn.Module):
             """Class-balanced entropy loss with focal modulation for multi-label targets."""
