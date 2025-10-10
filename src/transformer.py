@@ -574,6 +574,17 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             spinner.stop_and_persist(text="SMOTE requires TensorDataset with 5 tensors; using original loader")
             return train_loader
 
+        # Check dataset size BEFORE loading to prevent memory issues
+        dataset_size = len(dataset)
+        MAX_SAFE_SIZE = 50000  # Maximum safe size for SMOTE processing
+        
+        if dataset_size > MAX_SAFE_SIZE:
+            print(f"\n  Warning: Dataset too large ({dataset_size} samples) for SMOTE")
+            print(f"  Skipping SMOTE to prevent memory issues")
+            print(f"  (SMOTE works best with datasets < {MAX_SAFE_SIZE} samples)")
+            spinner.stop_and_persist(text="SMOTE skipped (dataset too large)")
+            return train_loader
+
         # Extract all tensors
         cls_tensor = base_dataset.tensors[0].detach().cpu()
         mean_tensor = base_dataset.tensors[1].detach().cpu()
