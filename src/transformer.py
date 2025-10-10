@@ -22,7 +22,12 @@ try:
     from skmultilearn.adapt import MLSMOTE
     MLSMOTE_AVAILABLE = True
 except ImportError:
-    MLSMOTE_AVAILABLE = False
+    try:
+        # Try alternative import path
+        from skmultilearn.problem_transform import MLSMOTE
+        MLSMOTE_AVAILABLE = True
+    except ImportError:
+        MLSMOTE_AVAILABLE = False
 
 warnings.filterwarnings(
     "ignore",
@@ -763,16 +768,21 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
     n_samples = X.shape[0]
     n_labels = y.shape[1]
     
-    # Identify minority classes
+    # Identify minority classes (attack classes)
     class_counts = y.sum(axis=0)
-    max_count = class_counts.max()
     
-    # Target count for balancing - make all classes equal to max
+    # Also count normal samples (samples with no labels)
+    normal_mask = y.sum(axis=1) == 0
+    normal_count = normal_mask.sum()
+    
+    # Determine target count: max of all classes including normal
+    max_count = max(class_counts.max(), normal_count)
     target_count = int(max_count)
     
     synthetic_X = []
     synthetic_y = []
     
+    # Balance attack classes
     for label_idx in range(n_labels):
         class_mask = y[:, label_idx] == 1
         class_count = class_mask.sum()
@@ -815,6 +825,36 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
             
             synthetic_X.append(synthetic_sample)
             synthetic_y.append(synthetic_label)
+    
+    # Balance normal class
+    if normal_count > 0 and normal_count < target_count:
+        normal_samples = X[normal_mask]
+        normal_labels = y[normal_mask]
+        
+        n_synthetic_normal = target_count - normal_count
+        
+        # Use k-NN for normal samples
+        k = min(5, normal_count - 1) if normal_count > 1 else 1
+        if k >= 1:
+            nn_normal = NearestNeighbors(n_neighbors=k + 1)
+            nn_normal.fit(normal_samples)
+            
+            for _ in range(n_synthetic_normal):
+                idx = np.random.randint(0, normal_count)
+                sample = normal_samples[idx]
+                
+                distances, indices = nn_normal.kneighbors([sample])
+                neighbor_idx = np.random.randint(1, k + 1)
+                neighbor = normal_samples[indices[0, neighbor_idx]]
+                
+                alpha = np.random.random()
+                synthetic_sample = sample + alpha * (neighbor - sample)
+                
+                # Keep as normal (all zeros)
+                synthetic_label = np.zeros(n_labels, dtype=np.int32)
+                
+                synthetic_X.append(synthetic_sample)
+                synthetic_y.append(synthetic_label)
     
     if synthetic_X:
         synthetic_X = np.array(synthetic_X, dtype=np.float32)
