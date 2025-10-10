@@ -51,7 +51,13 @@ print("=" * 60)
 try:
     import skmultilearn
     print(f"✓ scikit-multilearn installed")
-    print(f"  Version: {skmultilearn.__version__}")
+    
+    # Try to get version, but don't fail if it doesn't exist
+    try:
+        print(f"  Version: {skmultilearn.__version__}")
+    except AttributeError:
+        print(f"  Version: (version info not available)")
+    
     print(f"  Location: {skmultilearn.__file__}")
     
     # Check what's available in skmultilearn
@@ -59,6 +65,21 @@ try:
     import pkgutil
     for importer, modname, ispkg in pkgutil.iter_modules(skmultilearn.__path__):
         print(f"    - {modname}")
+    
+    # Check specifically for adapt and problem_transform
+    print("\n  Checking adapt module:")
+    try:
+        from skmultilearn import adapt
+        print(f"    Contents: {[x for x in dir(adapt) if not x.startswith('_')]}")
+    except ImportError:
+        print("    ✗ adapt module not found")
+    
+    print("\n  Checking problem_transform module:")
+    try:
+        from skmultilearn import problem_transform
+        print(f"    Contents: {[x for x in dir(problem_transform) if not x.startswith('_')]}")
+    except ImportError:
+        print("    ✗ problem_transform module not found")
         
 except ImportError:
     print("✗ scikit-multilearn is NOT installed")
