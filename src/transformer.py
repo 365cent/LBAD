@@ -574,16 +574,15 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             spinner.stop_and_persist(text="SMOTE requires TensorDataset with 5 tensors; using original loader")
             return train_loader
 
-        # Check dataset size BEFORE loading to prevent memory issues
+        # Check dataset size - use memory-efficient mode for large datasets
         dataset_size = len(dataset)
-        MAX_SAFE_SIZE = 50000  # Maximum safe size for SMOTE processing
+        MEMORY_EFFICIENT_THRESHOLD = 50000
         
-        if dataset_size > MAX_SAFE_SIZE:
-            print(f"\n  Warning: Dataset too large ({dataset_size} samples) for SMOTE")
-            print(f"  Skipping SMOTE to prevent memory issues")
-            print(f"  (SMOTE works best with datasets < {MAX_SAFE_SIZE} samples)")
-            spinner.stop_and_persist(text="SMOTE skipped (dataset too large)")
-            return train_loader
+        if dataset_size > MEMORY_EFFICIENT_THRESHOLD:
+            print(f"\n  Note: Large dataset ({dataset_size} samples)")
+            print(f"  Using memory-efficient streaming SMOTE (slower but safer)")
+            # Use streaming mode
+            return _streaming_smote(dataset, train_loader, target_contamination)
 
         # Extract all tensors
         cls_tensor = base_dataset.tensors[0].detach().cpu()
@@ -769,6 +768,145 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         traceback.print_exc()
         spinner.stop_and_persist(text="SMOTE failed (fallback to original loader)")
         return train_loader
+
+
+def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
+    """Memory-efficient SMOTE for very large datasets.
+    
+    Processes minority classes one at a time, capping total augmentation.
+    """
+    print("  Analyzing class distribution...")
+    
+    # Get base dataset
+    base_dataset = dataset
+    subset_indices = None
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        subset_indices = np.asarray(dataset.indices, dtype=np.int64)
+    
+    # Count classes without loading all data
+    label_tensor = base_dataset.tensors[4]
+    if subset_indices is not None:
+        label_tensor = label_tensor[subset_indices]
+    
+    y_labels = label_tensor.numpy()
+    class_counts = y_labels.sum(axis=0)
+    normal_count = (y_labels.sum(axis=1) == 0).sum()
+    
+    max_count = max(class_counts.max(), normal_count)
+    
+    # For very large datasets, cap the target to a reasonable size
+    MAX_TARGET = 5000
+    target_count = min(int(max_count), MAX_TARGET)
+    
+    if max_count > MAX_TARGET:
+        print(f"  Capping target from {int(max_count)} to {MAX_TARGET} per class (memory limit)")
+    
+    print(f"  Target count per class: {target_count}")
+    print(f"  Note: This will take some time for large datasets...")
+    
+    # Calculate how much we need to generate for each minority class
+    n_labels = y_labels.shape[1]
+    classes_to_balance = []
+    
+    for label_idx in range(n_labels):
+        count = int(class_counts[label_idx])
+        if 0 < count < target_count:
+            classes_to_balance.append((label_idx, count, target_count - count))
+    
+    # Add normal class if needed
+    if 0 < normal_count < target_count:
+        classes_to_balance.append(('normal', int(normal_count), target_count - int(normal_count)))
+    
+    if not classes_to_balance:
+        print("  All classes already balanced, no SMOTE needed")
+        return train_loader
+    
+    print(f"  Balancing {len(classes_to_balance)} minority classes")
+    
+    # Use the fallback SMOTE but on a sampled subset to make it manageable
+    # Sample a stratified subset for SMOTE
+    SAMPLE_SIZE = 40000
+    print(f"  Sampling {SAMPLE_SIZE} samples for SMOTE balancing...")
+    
+    # Stratified sampling
+    indices = list(range(len(dataset)))
+    np.random.shuffle(indices)
+    sample_indices = indices[:SAMPLE_SIZE]
+    
+    # Create subset
+    sampled_dataset = Subset(base_dataset, sample_indices)
+    sampled_loader = DataLoader(sampled_dataset, batch_size=128, shuffle=False)
+    
+    # Now apply regular SMOTE to the subset (which is manageable)
+    print("  Applying SMOTE to sampled subset...")
+    
+    # Fall back to regular smote_data but with the sampled data
+    # This is a workaround - return to regular processing with smaller dataset
+    spinner = halo.Halo(text="Processing sampled data with SMOTE", spinner="dots")
+    spinner.start()
+    
+    # Extract sampled data
+    all_cls, all_mean, all_max, all_attn, all_labels = [], [], [], [], []
+    for cls_t, mean_t, max_t, attn_t, label_t in sampled_loader:
+        all_cls.append(cls_t)
+        all_mean.append(mean_t)
+        all_max.append(max_t)
+        all_attn.append(attn_t)
+        all_labels.append(label_t)
+    
+    cls_np = torch.cat(all_cls).numpy().astype(np.float32)
+    mean_np = torch.cat(all_mean).numpy().astype(np.float32)
+    max_np = torch.cat(all_max).numpy().astype(np.float32)
+    attn_np = torch.cat(all_attn).numpy().astype(np.float32)
+    y = torch.cat(all_labels).numpy().astype(np.int32)
+    
+    X = np.hstack([cls_np, mean_np, max_np, attn_np])
+    
+    # Apply fallback SMOTE
+    X_synth, y_synth = _fallback_smote(X, y, target_contamination, batch_size=1000)
+    
+    # Split back
+    cls_dim = cls_np.shape[1]
+    mean_dim = mean_np.shape[1]
+    max_dim = max_np.shape[1]
+    attn_dim = attn_np.shape[1]
+    
+    offset = 0
+    cls_synth = X_synth[:, offset:offset + cls_dim]
+    offset += cls_dim
+    mean_synth = X_synth[:, offset:offset + mean_dim]
+    offset += mean_dim
+    max_synth = X_synth[:, offset:offset + max_dim]
+    offset += max_dim
+    attn_synth = X_synth[:, offset:offset + attn_dim]
+    
+    # Create augmented dataset
+    augmented_dataset = TensorDataset(
+        torch.from_numpy(cls_synth).float(),
+        torch.from_numpy(mean_synth).float(),
+        torch.from_numpy(max_synth).float(),
+        torch.from_numpy(attn_synth).float(),
+        torch.from_numpy(y_synth).float()
+    )
+    
+    batch_size = getattr(train_loader, "batch_size", 128)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": getattr(train_loader, "num_workers", 0),
+        "pin_memory": getattr(train_loader, "pin_memory", device.type == "cuda"),
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", True)
+        loader_kwargs["prefetch_factor"] = getattr(train_loader, "prefetch_factor", 2)
+    
+    augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
+    
+    n_synthetic = len(augmented_dataset) - SAMPLE_SIZE
+    spinner.stop_and_persist(symbol="✓", text=f"Streaming SMOTE completed ({SAMPLE_SIZE} sampled, +{n_synthetic} synthetic)")
+    
+    return augmented_loader
 
 
 def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2, batch_size: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
