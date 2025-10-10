@@ -760,8 +760,11 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         return train_loader
 
 
-def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
-    """Fallback SMOTE implementation using label-wise oversampling with multi-label awareness."""
+def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2, batch_size: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+    """Fallback SMOTE implementation using label-wise oversampling with multi-label awareness.
+    
+    Uses batched processing to reduce memory usage.
+    """
     
     from sklearn.neighbors import NearestNeighbors
     
@@ -779,8 +782,17 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
     max_count = max(class_counts.max(), normal_count)
     target_count = int(max_count)
     
-    synthetic_X = []
-    synthetic_y = []
+    # Limit target to prevent memory issues
+    # If target is too large, cap it at a reasonable size
+    max_synthetic_per_class = 5000
+    if target_count > max_synthetic_per_class:
+        print(f"    Note: Capping target from {target_count} to {max_synthetic_per_class} per class (memory limit)")
+        target_count = max_synthetic_per_class
+    
+    # Process in batches to save memory
+    # Instead of keeping all synthetic samples, write them incrementally
+    all_synthetic_X = []
+    all_synthetic_y = []
     
     # Balance attack classes
     for label_idx in range(n_labels):
@@ -804,27 +816,40 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
         nn = NearestNeighbors(n_neighbors=k + 1)
         nn.fit(class_samples)
         
-        for _ in range(n_synthetic):
-            # Random sample from class
-            idx = np.random.randint(0, class_count)
-            sample = class_samples[idx]
+        # Generate in batches
+        for batch_start in range(0, n_synthetic, batch_size):
+            batch_end = min(batch_start + batch_size, n_synthetic)
+            batch_synthetic_X = []
+            batch_synthetic_y = []
             
-            # Find neighbors
-            distances, indices = nn.kneighbors([sample])
+            for _ in range(batch_end - batch_start):
+                # Random sample from class
+                idx = np.random.randint(0, class_count)
+                sample = class_samples[idx]
+                
+                # Find neighbors
+                distances, indices = nn.kneighbors([sample])
+                
+                # Pick random neighbor (skip first as it's the sample itself)
+                neighbor_idx = np.random.randint(1, k + 1)
+                neighbor = class_samples[indices[0, neighbor_idx]]
+                
+                # Generate synthetic sample (random interpolation)
+                alpha = np.random.random()
+                synthetic_sample = sample + alpha * (neighbor - sample)
+                
+                # Use union of labels from both samples
+                synthetic_label = np.maximum(class_labels[idx], class_labels[indices[0, neighbor_idx]])
+                
+                batch_synthetic_X.append(synthetic_sample)
+                batch_synthetic_y.append(synthetic_label)
             
-            # Pick random neighbor (skip first as it's the sample itself)
-            neighbor_idx = np.random.randint(1, k + 1)
-            neighbor = class_samples[indices[0, neighbor_idx]]
-            
-            # Generate synthetic sample (random interpolation)
-            alpha = np.random.random()
-            synthetic_sample = sample + alpha * (neighbor - sample)
-            
-            # Use union of labels from both samples
-            synthetic_label = np.maximum(class_labels[idx], class_labels[indices[0, neighbor_idx]])
-            
-            synthetic_X.append(synthetic_sample)
-            synthetic_y.append(synthetic_label)
+            if batch_synthetic_X:
+                all_synthetic_X.append(np.array(batch_synthetic_X, dtype=np.float32))
+                all_synthetic_y.append(np.array(batch_synthetic_y, dtype=np.int32))
+                
+                # Free memory
+                del batch_synthetic_X, batch_synthetic_y
     
     # Balance normal class
     if normal_count > 0 and normal_count < target_count:
@@ -839,26 +864,43 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
             nn_normal = NearestNeighbors(n_neighbors=k + 1)
             nn_normal.fit(normal_samples)
             
-            for _ in range(n_synthetic_normal):
-                idx = np.random.randint(0, normal_count)
-                sample = normal_samples[idx]
+            # Generate in batches
+            for batch_start in range(0, n_synthetic_normal, batch_size):
+                batch_end = min(batch_start + batch_size, n_synthetic_normal)
+                batch_synthetic_X = []
+                batch_synthetic_y = []
                 
-                distances, indices = nn_normal.kneighbors([sample])
-                neighbor_idx = np.random.randint(1, k + 1)
-                neighbor = normal_samples[indices[0, neighbor_idx]]
+                for _ in range(batch_end - batch_start):
+                    idx = np.random.randint(0, normal_count)
+                    sample = normal_samples[idx]
+                    
+                    distances, indices = nn_normal.kneighbors([sample])
+                    neighbor_idx = np.random.randint(1, k + 1)
+                    neighbor = normal_samples[indices[0, neighbor_idx]]
+                    
+                    alpha = np.random.random()
+                    synthetic_sample = sample + alpha * (neighbor - sample)
+                    
+                    # Keep as normal (all zeros)
+                    synthetic_label = np.zeros(n_labels, dtype=np.int32)
+                    
+                    batch_synthetic_X.append(synthetic_sample)
+                    batch_synthetic_y.append(synthetic_label)
                 
-                alpha = np.random.random()
-                synthetic_sample = sample + alpha * (neighbor - sample)
-                
-                # Keep as normal (all zeros)
-                synthetic_label = np.zeros(n_labels, dtype=np.int32)
-                
-                synthetic_X.append(synthetic_sample)
-                synthetic_y.append(synthetic_label)
+                if batch_synthetic_X:
+                    all_synthetic_X.append(np.array(batch_synthetic_X, dtype=np.float32))
+                    all_synthetic_y.append(np.array(batch_synthetic_y, dtype=np.int32))
+                    
+                    # Free memory
+                    del batch_synthetic_X, batch_synthetic_y
     
-    if synthetic_X:
-        synthetic_X = np.array(synthetic_X, dtype=np.float32)
-        synthetic_y = np.array(synthetic_y, dtype=np.int32)
+    if all_synthetic_X:
+        # Combine all batches
+        synthetic_X = np.vstack(all_synthetic_X)
+        synthetic_y = np.vstack(all_synthetic_y)
+        
+        # Free intermediate arrays
+        del all_synthetic_X, all_synthetic_y
         
         X_combined = np.vstack([X, synthetic_X])
         y_combined = np.vstack([y, synthetic_y])
