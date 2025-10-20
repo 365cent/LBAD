@@ -20,18 +20,20 @@ from torch.utils.data import DataLoader, TensorDataset, Sampler, Subset
 # SMOTE imports
 try:
     from skmultilearn.adapt import MLSMOTE
+
     MLSMOTE_AVAILABLE = True
 except ImportError:
     try:
         # Try alternative import path
         from skmultilearn.problem_transform import MLSMOTE
+
         MLSMOTE_AVAILABLE = True
     except ImportError:
         MLSMOTE_AVAILABLE = False
 
 # Suppress all warnings for clean console output
 warnings.filterwarnings("ignore")
-os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 try:
@@ -45,7 +47,13 @@ try:
 except Exception:  # pragma: no cover - best effort only
     pass
 
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 print(f"Using device: {device}")
 
 if device.type == "mps":
@@ -53,36 +61,46 @@ if device.type == "mps":
     print("Enabled MPS optimizations for Silicon GPU")
 elif device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high") 
+    torch.set_float32_matmul_precision("high")
     print("Enabled CUDA optimizations for NVIDIA GPU")
     torch.backends.cudnn.benchmark = True
 
+
 def safe_load(path):
     try:
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             return pickle.load(f)
     except (EOFError, pickle.PickleError, Exception) as e:
         print(f"✗ {Path(path).name}: {e}")
         return None
 
+
 hierarchy = {
     "foothold": {"attacker_http": ["dirb", "webshell_cmd", "webshell_upload"]},
-    "escalate": {"escalated_command": ["escalated_sudo_session"], "attacker_change_user": [], "reverse_shell": []},
+    "escalate": {
+        "escalated_command": ["escalated_sudo_session"],
+        "attacker_change_user": [],
+        "reverse_shell": [],
+    },
     "attacker_vpn": {},
-    "dnsteal": {"dnsteal-received": [], "dnsteal-dropped": [], "exfiltration-service": []}
+    "dnsteal": {
+        "dnsteal-received": [],
+        "dnsteal-dropped": [],
+        "exfiltration-service": [],
+    },
 }
 
 TARGET_CONTAMINATION = 0.2  # Desired attack proportion in the balanced training set
-MIN_TRAIN_ANOMALIES = 400   # Ensure sufficient anomaly diversity during SMOTE
+MIN_TRAIN_ANOMALIES = 400  # Ensure sufficient anomaly diversity during SMOTE
 RARE_CLASS_THRESHOLD = 512  # Upper bound for rare-class synthetic targets
-MIN_SYNTHETIC_TARGET = 64   # Floor for minority examples after augmentation
+MIN_SYNTHETIC_TARGET = 64  # Floor for minority examples after augmentation
 MAX_SYNTHETIC_MULTIPLIER = 2.0  # Cap synthetic growth relative to originals
 HARD_NEGATIVE_MULTIPLIER = 1.5  # Contrastive negatives boost for rare classes
-MIN_CLASS_TRAIN_SAMPLES = 128    # Minimum anomaly samples per class retained in training
-MAX_CLASS_TRAIN_FRACTION = 0.8   # Max proportion of a class allocated to training split
-TRAIN_SPLIT_RATIO = 0.8          # Target fraction of samples allocated to training
-PARENT_EXTRA_FRACTION = 1.0      # Additional parent-only quota relative to leaf share
-BALANCE_TARGET_GROWTH = 1.2      # Modest scaling factor for adaptive per-class quotas
+MIN_CLASS_TRAIN_SAMPLES = 128  # Minimum anomaly samples per class retained in training
+MAX_CLASS_TRAIN_FRACTION = 0.8  # Max proportion of a class allocated to training split
+TRAIN_SPLIT_RATIO = 0.8  # Target fraction of samples allocated to training
+PARENT_EXTRA_FRACTION = 1.0  # Additional parent-only quota relative to leaf share
+BALANCE_TARGET_GROWTH = 1.2  # Modest scaling factor for adaptive per-class quotas
 
 
 @dataclass(frozen=True)
@@ -94,6 +112,7 @@ class TransformerConfig:
     num_heads: int = 4
     dropout: float = 0.1
     attn_input_dim: int = 10
+
 
 class HierarchicalTransformer(nn.Module):
     """Hierarchical transformer with single-layer encoder and DP smoothing."""
@@ -198,7 +217,9 @@ class HierarchicalTransformer(nn.Module):
             elif children is None:
                 continue
             else:
-                raise TypeError(f"Unsupported hierarchy type for node '{node}': {type(children)}")
+                raise TypeError(
+                    f"Unsupported hierarchy type for node '{node}': {type(children)}"
+                )
 
     def forward(
         self,
@@ -228,7 +249,9 @@ class HierarchicalTransformer(nn.Module):
         z = F.gelu(self.bottleneck(pooled))
         recon = self.decoder(z)
 
-        outputs = {name: torch.clamp(head(z), -10.0, 10.0) for name, head in self.heads.items()}
+        outputs = {
+            name: torch.clamp(head(z), -10.0, 10.0) for name, head in self.heads.items()
+        }
         return recon, z, outputs
 
     def _dp_probabilities(
@@ -250,7 +273,9 @@ class HierarchicalTransformer(nn.Module):
             prob = base_probs[name]
             children = self.children_map.get(name, [])
             if children:
-                child_probs = [aggregated[child] for child in children if child in aggregated]
+                child_probs = [
+                    aggregated[child] for child in children if child in aggregated
+                ]
                 if child_probs:
                     child_stack = torch.stack(child_probs, dim=0)
                     child_summary = child_stack.max(dim=0).values
@@ -262,7 +287,9 @@ class HierarchicalTransformer(nn.Module):
 
         return base_probs, aggregated
 
-    def hierarchy_consistency_loss(self, outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def hierarchy_consistency_loss(
+        self, outputs: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
         """Encourages logits to respect the hierarchy using DP smoothing."""
 
         if not outputs:
@@ -275,19 +302,25 @@ class HierarchicalTransformer(nn.Module):
             losses.append(F.smooth_l1_loss(base, target, beta=0.05, reduction="mean"))
         return torch.stack(losses).mean()
 
-    def propagate_labels(self, outputs: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def propagate_labels(
+        self, outputs: Mapping[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
         """Returns hierarchy-consistent probabilities for inference."""
 
         _, aggregated = self._dp_probabilities(outputs)
         return aggregated
 
 
-def build_parent_lookup(tree: Mapping[str, Mapping[str, Sequence[str]]]) -> Dict[str, Optional[str]]:
+def build_parent_lookup(
+    tree: Mapping[str, Mapping[str, Sequence[str]]],
+) -> Dict[str, Optional[str]]:
     """Creates a lookup from each node to its parent in the hierarchy."""
 
     parents: Dict[str, Optional[str]] = {}
 
-    def recurse(current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]) -> None:
+    def recurse(
+        current: Mapping[str, Mapping[str, Sequence[str]]], parent: Optional[str]
+    ) -> None:
         for node, children in current.items():
             parents.setdefault(node, parent)
             if isinstance(children, Mapping):
@@ -379,7 +412,9 @@ def _load_embeddings_from_roots(
 
 def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]):
     roots, search_order = _resolve_embedding_roots(embedding_type)
-    embeddings, labels, skipped = _load_embeddings_from_roots(embedding_type, roots, target_log_type)
+    embeddings, labels, skipped = _load_embeddings_from_roots(
+        embedding_type, roots, target_log_type
+    )
 
     if target_log_type and target_log_type not in embeddings:
         searched = [str((root / target_log_type).resolve()) for root in search_order]
@@ -388,7 +423,9 @@ def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]
         )
 
     if not embeddings:
-        searched = ", ".join(str(path.resolve()) if path.exists() else str(path) for path in search_order)
+        searched = ", ".join(
+            str(path.resolve()) if path.exists() else str(path) for path in search_order
+        )
         generate_hint = {
             "fasttext": "python src/fasttext_embedding.py --output-subdir fasttext",
             "word2vec": "python src/word2vec_embedding.py --output-subdir word2vec",
@@ -400,8 +437,8 @@ def _load_embedding_dispatch(embedding_type: str, target_log_type: Optional[str]
         )
 
     print(
-        f"Loaded {len(embeddings)} log types for {embedding_type}" +
-        (f" (skipped {len(skipped)})" if skipped else "")
+        f"Loaded {len(embeddings)} log types for {embedding_type}"
+        + (f" (skipped {len(skipped)})" if skipped else "")
     )
     return embeddings, labels
 
@@ -417,6 +454,7 @@ def load_fasttext_embeddings(target_log_type: str = None):
 def load_word2vec_embeddings(target_log_type: str = None):
     return _load_embedding_dispatch("word2vec", target_log_type)
 
+
 def flatten_hierarchy(h, parent=None):
     """Yields each node in the hierarchy in a flat traversal."""
     for node, children in h.items():
@@ -427,26 +465,28 @@ def flatten_hierarchy(h, parent=None):
                 for leaf in leaves:
                     yield leaf
 
+
 def create_multilabel_targets(labels_dict, hierarchy):
     """Aligns label vectors with the flattened hierarchy layout."""
-    if 'vectors' not in labels_dict:
+    if "vectors" not in labels_dict:
         return None
-    
-    label_matrix = labels_dict['vectors']
+
+    label_matrix = labels_dict["vectors"]
     n_samples = label_matrix.shape[0]
-    
+
     # create mapping from flat index to node name
     node_list = list(flatten_hierarchy(hierarchy))
     n_nodes = len(node_list)
-    
+
     # create aligned multi-label matrix
     targets = np.zeros((n_samples, n_nodes), dtype=np.float32)
-    
+
     # map existing labels to new structure (if dimensions match)
     if label_matrix.shape[1] <= n_nodes:
-        targets[:, :label_matrix.shape[1]] = label_matrix
-    
+        targets[:, : label_matrix.shape[1]] = label_matrix
+
     return targets
+
 
 def _slice_and_pad(
     array: np.ndarray,
@@ -462,7 +502,7 @@ def _slice_and_pad(
     if start >= array.shape[1]:
         return np.zeros((array.shape[0], width), dtype=array.dtype)
 
-    chunk = array[:, start:min(end, array.shape[1])]
+    chunk = array[:, start : min(end, array.shape[1])]
     cur_width = chunk.shape[1]
     if cur_width == width:
         return chunk
@@ -474,7 +514,9 @@ def _slice_and_pad(
     return np.hstack([chunk, padding])
 
 
-def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[str] = None):
+def load_datasets(
+    embeddings, labels, batch_size=128, embedding_type: Optional[str] = None
+):
     datasets = {}
     base_config = TransformerConfig()
     cls_dim = 768
@@ -508,12 +550,17 @@ def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[s
         if has_attn:
             attn = _slice_and_pad(log_vectors, cls_dim + mean_dim + max_dim, attn_dim)
         else:
-            attn = np.zeros((log_vectors.shape[0], attn_dim), dtype=log_vectors.dtype if log_vectors.size else np.float32)
+            attn = np.zeros(
+                (log_vectors.shape[0], attn_dim),
+                dtype=log_vectors.dtype if log_vectors.size else np.float32,
+            )
 
         detected = embedding_type or (
             "logbert" if has_mean and has_max and has_attn else "fasttext/word2vec"
         )
-        print(f"Detected {detected} embedding layout for '{log_type}' (dim={feature_dim})")
+        print(
+            f"Detected {detected} embedding layout for '{log_type}' (dim={feature_dim})"
+        )
 
         if log_type in labels:
             targets = create_multilabel_targets(labels[log_type], hierarchy)
@@ -522,32 +569,82 @@ def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[s
 
         if targets is None:
             targets = np.zeros((log_vectors.shape[0], num_nodes))
-        
+
         dataset = TensorDataset(
             torch.from_numpy(cls_tokens).float(),
             torch.from_numpy(mean_pooling).float(),
             torch.from_numpy(max_pooling).float(),
             torch.from_numpy(attn).float(),
-            torch.from_numpy(targets).float()
+            torch.from_numpy(targets).float(),
         )
-        
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-        datasets[log_type] = {'loader': loader, 'num_samples': log_vectors.shape[0]}
-        
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=True,
+            prefetch_factor=4,
+        )
+        datasets[log_type] = {"loader": loader, "num_samples": log_vectors.shape[0]}
+
         total = log_vectors.shape[0]
         anomalies = (targets.sum(axis=1) > 0).sum()
-        print(f"[{log_type}] {total} samples | anomalies: {anomalies} ({anomalies/total:.2%})")
-        
+        print(
+            f"[{log_type}] {total} samples | anomalies: {anomalies} ({anomalies / total:.2%})"
+        )
+
         normal_count = total - anomalies
         print("Per-class distribution:")
-        print(f"  normal: {normal_count} ({normal_count/total:.2%})")
+        print(f"  normal: {normal_count} ({normal_count / total:.2%})")
         for i, name in enumerate(node_names):
             if i < targets.shape[1]:
                 count = int(targets[:, i].sum())
                 if count > 0:
-                    print(f"  {name}: {count} ({count/total:.2%})")
-    
+                    print(f"  {name}: {count} ({count / total:.2%})")
+
     return datasets
+
+
+def _report_class_distribution(
+    label_matrix: np.ndarray, label_names: Sequence[str], context: str
+) -> None:
+    """Log post-SMOTE class counts including the implicit normal class."""
+
+    if label_matrix.size == 0:
+        print(f"{context} class distribution: (empty)")
+        return
+
+    binary_labels = (label_matrix > 0.5).astype(np.int32)
+    total = binary_labels.shape[0]
+    if total == 0:
+        print(f"{context} class distribution: (empty)")
+        return
+
+    normal_count = int((binary_labels.sum(axis=1) == 0).sum())
+    print(f"{context} class distribution:")
+    print(f"  normal: {normal_count} ({normal_count / total:.2%})")
+
+    class_counts = [normal_count]
+    for idx, name in enumerate(label_names):
+        if idx >= binary_labels.shape[1]:
+            break
+        count = int(binary_labels[:, idx].sum())
+        class_counts.append(count)
+        print(f"  {name}: {count} ({count / total:.2%})")
+
+    unique_counts = set(class_counts)
+    if len(unique_counts) == 1:
+        uniform_count = unique_counts.pop()
+        print(
+            f"  -> Balanced evenly: {uniform_count} samples per class (including normal)."
+        )
+    else:
+        print(
+            "  -> Warning: class counts are not uniform; consider inspecting SMOTE balancing."
+        )
+
 
 def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2):
     """Applies multi-label SMOTE to generate synthetic samples and returns augmented dataset."""
@@ -564,16 +661,28 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             subset_indices = np.asarray(dataset.indices, dtype=np.int64)
 
         if not isinstance(base_dataset, TensorDataset) or len(base_dataset.tensors) < 5:
-            spinner.stop_and_persist(text="SMOTE requires TensorDataset with 5 tensors; using original loader")
+            spinner.stop_and_persist(
+                text="SMOTE requires TensorDataset with 5 tensors; using original loader"
+            )
             return train_loader
+
+        # Determine label names up front
+        label_dim = base_dataset.tensors[4].shape[1]
+        label_names = list(flatten_hierarchy(hierarchy))[:label_dim]
 
         # Check dataset size - use memory-efficient mode for large datasets
         dataset_size = len(dataset)
         MEMORY_EFFICIENT_THRESHOLD = 50000
-        
+
         if dataset_size > MEMORY_EFFICIENT_THRESHOLD:
             # Use streaming mode for large datasets
-            return _streaming_smote(dataset, train_loader, target_contamination, spinner)
+            return _streaming_smote(
+                dataset,
+                train_loader,
+                target_contamination,
+                spinner,
+                label_names=label_names,
+            )
 
         # Extract all tensors
         cls_tensor = base_dataset.tensors[0].detach().cpu()
@@ -597,59 +706,97 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         y = label_tensor.numpy().astype(np.int32)
 
         if int(y.sum()) == 0:
-            spinner.stop_and_persist(text="Skipping SMOTE (only normal samples detected)")
+            spinner.stop_and_persist(
+                text="Skipping SMOTE (only normal samples detected)"
+            )
             return train_loader
 
         # Concatenate all embeddings: X = concat(cls, mean, max, attn)
         X = np.hstack([cls_np, mean_np, max_np, attn_np])
-        
+
         n_samples, n_features = X.shape
         n_labels = y.shape[1]
-        
+
         # Per-class counts before SMOTE
         class_counts_before = y.sum(axis=0)
+        normal_count_before = int((y.sum(axis=1) == 0).sum())
+        max_label_count = (
+            int(class_counts_before.max()) if class_counts_before.size else 0
+        )
+        balance_target = max(max_label_count, normal_count_before)
 
         # Apply MLSMOTE if available, otherwise use fallback
         if MLSMOTE_AVAILABLE:
             try:
                 # Convert to sparse format for MLSMOTE
                 from scipy.sparse import csr_matrix, lil_matrix
-                
+
                 # Determine k based on minority class size
-                min_minority_samples = class_counts_before[class_counts_before > 0].min() if (class_counts_before > 0).any() else 5
+                min_minority_samples = (
+                    class_counts_before[class_counts_before > 0].min()
+                    if (class_counts_before > 0).any()
+                    else 5
+                )
                 k = min(5, max(1, int(min_minority_samples) - 1))
-                
+
                 # MLSMOTE performs iterative balancing - run multiple passes for full balancing
                 X_current = X.copy()
                 y_current = y.copy()
-                
+
                 max_iterations = 5
                 for iteration in range(max_iterations):
                     current_counts = y_current.sum(axis=0)
                     max_count = current_counts.max()
-                    min_count = current_counts[current_counts > 0].min() if (current_counts > 0).any() else max_count
-                    
+                    min_count = (
+                        current_counts[current_counts > 0].min()
+                        if (current_counts > 0).any()
+                        else max_count
+                    )
+
                     # Stop if already balanced
                     if min_count >= max_count * 0.95:
                         break
-                    
+
                     # Apply MLSMOTE
                     X_sparse = csr_matrix(X_current)
                     y_sparse = lil_matrix(y_current)
-                    
+
                     mlsmote = MLSMOTE(k=k)
                     X_resampled, y_resampled = mlsmote.fit_resample(X_sparse, y_sparse)
-                    
+
                     X_current = X_resampled.toarray().astype(np.float32)
                     y_current = y_resampled.toarray().astype(np.int32)
-                
+
                 X_synth = X_current
                 y_synth = y_current
-                
+                if balance_target > 0:
+                    X_synth, y_synth = _fallback_smote(
+                        X_synth,
+                        y_synth,
+                        target_contamination,
+                        spinner=spinner,
+                        target_count=balance_target,
+                        label_names=label_names,
+                    )
+
             except Exception as e:
-                X_synth, y_synth = _fallback_smote(X, y, target_contamination, spinner=spinner)
+                X_synth, y_synth = _fallback_smote(
+                    X,
+                    y,
+                    target_contamination,
+                    spinner=spinner,
+                    target_count=balance_target,
+                    label_names=label_names,
+                )
         else:
-            X_synth, y_synth = _fallback_smote(X, y, target_contamination, spinner=spinner)
+            X_synth, y_synth = _fallback_smote(
+                X,
+                y,
+                target_contamination,
+                spinner=spinner,
+                target_count=balance_target,
+                label_names=label_names,
+            )
 
         n_synth = X_synth.shape[0]
         n_synthetic_new = n_synth - n_samples
@@ -659,15 +806,15 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         mean_dim = mean_np.shape[1]
         max_dim = max_np.shape[1]
         attn_dim = attn_np.shape[1]
-        
+
         offset = 0
-        cls_synth = X_synth[:, offset:offset + cls_dim]
+        cls_synth = X_synth[:, offset : offset + cls_dim]
         offset += cls_dim
-        mean_synth = X_synth[:, offset:offset + mean_dim]
+        mean_synth = X_synth[:, offset : offset + mean_dim]
         offset += mean_dim
-        max_synth = X_synth[:, offset:offset + max_dim]
+        max_synth = X_synth[:, offset : offset + max_dim]
         offset += max_dim
-        attn_synth = X_synth[:, offset:offset + attn_dim]
+        attn_synth = X_synth[:, offset : offset + attn_dim]
 
         # Create new augmented dataset
         augmented_dataset = TensorDataset(
@@ -675,7 +822,7 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             torch.from_numpy(mean_synth).float(),
             torch.from_numpy(max_synth).float(),
             torch.from_numpy(attn_synth).float(),
-            torch.from_numpy(y_synth).float()
+            torch.from_numpy(y_synth).float(),
         )
 
         # Create new loader with same settings
@@ -687,12 +834,21 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
             "pin_memory": getattr(train_loader, "pin_memory", device.type == "cuda"),
         }
         if loader_kwargs["num_workers"] > 0:
-            loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", True)
-            loader_kwargs["prefetch_factor"] = getattr(train_loader, "prefetch_factor", 2)
+            loader_kwargs["persistent_workers"] = getattr(
+                train_loader, "persistent_workers", True
+            )
+            loader_kwargs["prefetch_factor"] = getattr(
+                train_loader, "prefetch_factor", 2
+            )
 
         augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
-        
-        spinner.stop_and_persist(symbol="✓", text=f"SMOTE completed (+{n_synthetic_new} synthetic samples)")
+
+        spinner.stop_and_persist(
+            symbol="✓", text=f"SMOTE completed (+{n_synthetic_new} synthetic samples)"
+        )
+        _report_class_distribution(
+            y_synth, label_names, context="Post-SMOTE distribution"
+        )
         return augmented_loader
 
     except Exception as exc:
@@ -700,64 +856,77 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         return train_loader
 
 
-def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2, spinner=None):
-    """Memory-efficient SMOTE for very large datasets.
-    
-    Processes minority classes one at a time, capping total augmentation.
-    """
+def _streaming_smote(
+    dataset,
+    train_loader,
+    target_contamination: float = 0.2,
+    spinner=None,
+    label_names: Optional[Sequence[str]] = None,
+):
+    """Memory-efficient SMOTE for very large datasets while preserving class balance."""
+
     # Get base dataset
     base_dataset = dataset
     subset_indices = None
     if isinstance(dataset, Subset):
         base_dataset = dataset.dataset
         subset_indices = np.asarray(dataset.indices, dtype=np.int64)
-    
+
     # Count classes without loading all data
     label_tensor = base_dataset.tensors[4]
     if subset_indices is not None:
         label_tensor = label_tensor[subset_indices]
-    
+
     y_labels = label_tensor.numpy()
     class_counts = y_labels.sum(axis=0)
-    normal_count = (y_labels.sum(axis=1) == 0).sum()
-    
-    max_count = max(class_counts.max(), normal_count)
-    
-    # For very large datasets, cap the target to a reasonable size
-    MAX_TARGET = 5000
-    target_count = min(int(max_count), MAX_TARGET)
-    
+    normal_count = int((y_labels.sum(axis=1) == 0).sum())
+    balance_target = int(max(class_counts.max(), normal_count))
+
+    if balance_target <= 0:
+        if spinner:
+            spinner.stop_and_persist(
+                symbol="✓", text="Skipping SMOTE (no positive labels detected)"
+            )
+        return train_loader
+
+    if label_names is None:
+        label_dim = y_labels.shape[1]
+        label_names = list(flatten_hierarchy(hierarchy))[:label_dim]
+
     # Calculate how much we need to generate for each minority class
     n_labels = y_labels.shape[1]
     classes_to_balance = []
-    
+
     for label_idx in range(n_labels):
         count = int(class_counts[label_idx])
-        if 0 < count < target_count:
-            classes_to_balance.append((label_idx, count, target_count - count))
-    
+        if 0 < count < balance_target:
+            classes_to_balance.append((label_idx, count, balance_target - count))
+
     # Add normal class if needed
-    if 0 < normal_count < target_count:
-        classes_to_balance.append(('normal', int(normal_count), target_count - int(normal_count)))
-    
+    if 0 <= normal_count < balance_target:
+        classes_to_balance.append(
+            ("normal", int(normal_count), balance_target - int(normal_count))
+        )
+
     if not classes_to_balance:
         if spinner:
-            spinner.stop_and_persist(symbol="✓", text="Classes already balanced, skipping SMOTE")
+            spinner.stop_and_persist(
+                symbol="✓", text="Classes already balanced, skipping SMOTE"
+            )
         return train_loader
-    
+
     # Use the fallback SMOTE but on a sampled subset to make it manageable
-    # Sample a stratified subset for SMOTE
     SAMPLE_SIZE = 40000
-    
+
     # Stratified sampling
-    indices = list(range(len(dataset)))
+    indices = np.arange(len(dataset))
     np.random.shuffle(indices)
     sample_indices = indices[:SAMPLE_SIZE]
-    
+
     # Create subset
     sampled_dataset = Subset(base_dataset, sample_indices)
     sampled_loader = DataLoader(sampled_dataset, batch_size=128, shuffle=False)
-    
+
     # Extract sampled data
     all_cls, all_mean, all_max, all_attn, all_labels = [], [], [], [], []
     for cls_t, mean_t, max_t, attn_t, label_t in sampled_loader:
@@ -766,47 +935,55 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2, s
         all_max.append(max_t)
         all_attn.append(attn_t)
         all_labels.append(label_t)
-    
+
     cls_np = torch.cat(all_cls).numpy().astype(np.float32)
     mean_np = torch.cat(all_mean).numpy().astype(np.float32)
     max_np = torch.cat(all_max).numpy().astype(np.float32)
     attn_np = torch.cat(all_attn).numpy().astype(np.float32)
     y = torch.cat(all_labels).numpy().astype(np.int32)
-    
+
     X = np.hstack([cls_np, mean_np, max_np, attn_np])
-    
-    # Apply fallback SMOTE
+
+    # Apply fallback SMOTE with explicit balancing target
     try:
-        X_synth, y_synth = _fallback_smote(X, y, target_contamination, batch_size=1000, spinner=spinner)
-    except Exception as e:
+        X_synth, y_synth = _fallback_smote(
+            X,
+            y,
+            target_contamination,
+            batch_size=1000,
+            spinner=spinner,
+            target_count=balance_target,
+            label_names=label_names,
+        )
+    except Exception:
         if spinner:
-            spinner.stop_and_persist(text=f"SMOTE failed (fallback to original loader)")
+            spinner.stop_and_persist(text="SMOTE failed (fallback to original loader)")
         return train_loader
-    
+
     # Split back
     cls_dim = cls_np.shape[1]
     mean_dim = mean_np.shape[1]
     max_dim = max_np.shape[1]
     attn_dim = attn_np.shape[1]
-    
+
     offset = 0
-    cls_synth = X_synth[:, offset:offset + cls_dim]
+    cls_synth = X_synth[:, offset : offset + cls_dim]
     offset += cls_dim
-    mean_synth = X_synth[:, offset:offset + mean_dim]
+    mean_synth = X_synth[:, offset : offset + mean_dim]
     offset += mean_dim
-    max_synth = X_synth[:, offset:offset + max_dim]
+    max_synth = X_synth[:, offset : offset + max_dim]
     offset += max_dim
-    attn_synth = X_synth[:, offset:offset + attn_dim]
-    
+    attn_synth = X_synth[:, offset : offset + attn_dim]
+
     # Create augmented dataset
     augmented_dataset = TensorDataset(
         torch.from_numpy(cls_synth).float(),
         torch.from_numpy(mean_synth).float(),
         torch.from_numpy(max_synth).float(),
         torch.from_numpy(attn_synth).float(),
-        torch.from_numpy(y_synth).float()
+        torch.from_numpy(y_synth).float(),
     )
-    
+
     batch_size = getattr(train_loader, "batch_size", 128)
     loader_kwargs = {
         "batch_size": batch_size,
@@ -815,169 +992,260 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2, s
         "pin_memory": getattr(train_loader, "pin_memory", device.type == "cuda"),
     }
     if loader_kwargs["num_workers"] > 0:
-        loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", True)
+        loader_kwargs["persistent_workers"] = getattr(
+            train_loader, "persistent_workers", True
+        )
         loader_kwargs["prefetch_factor"] = getattr(train_loader, "prefetch_factor", 2)
-    
+
     augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
-    
+
     n_synthetic = len(augmented_dataset) - SAMPLE_SIZE
     if spinner:
-        spinner.stop_and_persist(symbol="✓", text=f"SMOTE completed (+{n_synthetic} synthetic samples)")
-    
+        spinner.stop_and_persist(
+            symbol="✓", text=f"SMOTE completed (+{n_synthetic} synthetic samples)"
+        )
+
+    _report_class_distribution(
+        augmented_dataset.tensors[4].cpu().numpy(),
+        label_names,
+        context="Post-SMOTE distribution",
+    )
+
     return augmented_loader
 
 
-def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2, batch_size: int = 1000, spinner=None) -> Tuple[np.ndarray, np.ndarray]:
+def _fallback_smote(
+    X: np.ndarray,
+    y: np.ndarray,
+    target_contamination: float = 0.2,
+    batch_size: int = 1000,
+    spinner=None,
+    target_count: Optional[int] = None,
+    label_names: Optional[Sequence[str]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """Fallback SMOTE implementation using label-wise oversampling with multi-label awareness.
-    
+
     Uses batched processing to reduce memory usage.
     """
-    
+
     from sklearn.neighbors import NearestNeighbors
-    
+
     n_samples = X.shape[0]
     n_labels = y.shape[1]
-    
+
     # Identify minority classes (attack classes)
-    class_counts = y.sum(axis=0)
-    
+    class_counts = y.sum(axis=0).astype(np.int64)
+
     # Also count normal samples (samples with no labels)
     normal_mask = y.sum(axis=1) == 0
-    normal_count = normal_mask.sum()
-    
+    normal_count = int(normal_mask.sum())
+
     # Determine target count: max of all classes including normal
-    max_count = max(class_counts.max(), normal_count)
-    target_count = int(max_count)
-    
-    # Limit target to prevent memory issues
-    # If target is too large, cap it at a reasonable size
-    max_synthetic_per_class = 5000
-    if target_count > max_synthetic_per_class:
-        target_count = max_synthetic_per_class
-    
+    if target_count is None:
+        positive_max = int(class_counts.max()) if class_counts.size > 0 else 0
+        target_count = max(positive_max, normal_count)
+    target_count = int(target_count)
+
+    if target_count <= 0:
+        return X, y
+
     # Process in batches to save memory
     # Instead of keeping all synthetic samples, write them incrementally
     all_synthetic_X = []
     all_synthetic_y = []
-    
+
+    current_counts = class_counts.copy()
+    current_normal = normal_count
+    parent_indices: Dict[int, List[int]] = {}
+    if label_names is not None:
+        name_to_idx = {name: idx for idx, name in enumerate(label_names)}
+        parent_lookup = build_parent_lookup(hierarchy)
+        for idx, name in enumerate(label_names):
+            ancestors: List[int] = []
+            current_name = name
+            while True:
+                parent_name = parent_lookup.get(current_name)
+                if parent_name is None:
+                    break
+                ancestor_idx = name_to_idx.get(parent_name)
+                if ancestor_idx is None:
+                    break
+                ancestors.append(ancestor_idx)
+                current_name = parent_name
+            if ancestors:
+                parent_indices[idx] = ancestors
+
     # Balance attack classes
     for label_idx in range(n_labels):
         class_mask = y[:, label_idx] == 1
-        class_count = class_mask.sum()
-        
-        if class_count == 0 or class_count >= target_count:
+        class_count = int(class_mask.sum())
+
+        deficit = target_count - int(current_counts[label_idx])
+        if class_count == 0 or deficit <= 0:
             continue
-        
+
         # Get samples for this class
         class_samples = X[class_mask]
         class_labels = y[class_mask]
-        
-        n_synthetic = target_count - class_count
-        
+
+        n_synthetic = deficit
+
         # Use k-NN to find neighbors
-        k = min(5, class_count - 1) if class_count > 1 else 1
+        k = min(5, class_count - 1) if class_count > 1 else 0
         if k < 1:
+            # Only a single example exists; duplicate with small noise to maintain diversity
+            base_sample = class_samples[0]
+            base_label = class_labels[0]
+            for batch_start in range(0, n_synthetic, batch_size):
+                batch_end = min(batch_start + batch_size, n_synthetic)
+                batch_len = batch_end - batch_start
+                noise = np.random.normal(
+                    scale=1e-3, size=(batch_len, base_sample.shape[0])
+                ).astype(np.float32)
+                synthetic_batch = base_sample + noise
+                batch_labels = []
+                for _ in range(batch_len):
+                    synthetic_label = np.zeros(n_labels, dtype=np.int32)
+                    synthetic_label[label_idx] = 1
+                    for ancestor_idx in parent_indices.get(label_idx, []):
+                        if current_counts[ancestor_idx] < target_count:
+                            synthetic_label[ancestor_idx] = 1
+                    eligible_mask = current_counts < target_count
+                    eligible_mask[label_idx] = True
+                    synthetic_label = synthetic_label * eligible_mask.astype(np.int32)
+                    current_counts += synthetic_label
+                    batch_labels.append(synthetic_label)
+                all_synthetic_X.append(synthetic_batch.astype(np.float32))
+                all_synthetic_y.append(np.array(batch_labels, dtype=np.int32))
             continue
-            
+
         nn = NearestNeighbors(n_neighbors=k + 1)
         nn.fit(class_samples)
-        
+
         # Generate in batches
         for batch_start in range(0, n_synthetic, batch_size):
             batch_end = min(batch_start + batch_size, n_synthetic)
             batch_synthetic_X = []
             batch_synthetic_y = []
-            
+
             for _ in range(batch_end - batch_start):
                 # Random sample from class
                 idx = np.random.randint(0, class_count)
                 sample = class_samples[idx]
-                
+
                 # Find neighbors
                 distances, indices = nn.kneighbors([sample])
-                
+
                 # Pick random neighbor (skip first as it's the sample itself)
                 neighbor_idx = np.random.randint(1, k + 1)
                 neighbor = class_samples[indices[0, neighbor_idx]]
-                
+
                 # Generate synthetic sample (random interpolation)
                 alpha = np.random.random()
                 synthetic_sample = sample + alpha * (neighbor - sample)
-                
+
                 # Use union of labels from both samples
-                synthetic_label = np.maximum(class_labels[idx], class_labels[indices[0, neighbor_idx]])
-                
+                synthetic_label = np.maximum(
+                    class_labels[idx], class_labels[indices[0, neighbor_idx]]
+                ).astype(np.int32)
+                synthetic_label[label_idx] = 1
+                for ancestor_idx in parent_indices.get(label_idx, []):
+                    if current_counts[ancestor_idx] < target_count:
+                        synthetic_label[ancestor_idx] = 1
+                eligible_mask = current_counts < target_count
+                eligible_mask[label_idx] = True
+                synthetic_label = synthetic_label * eligible_mask.astype(np.int32)
+                current_counts += synthetic_label
                 batch_synthetic_X.append(synthetic_sample)
                 batch_synthetic_y.append(synthetic_label)
-            
+
             if batch_synthetic_X:
                 all_synthetic_X.append(np.array(batch_synthetic_X, dtype=np.float32))
                 all_synthetic_y.append(np.array(batch_synthetic_y, dtype=np.int32))
-                
+
                 # Free memory
                 del batch_synthetic_X, batch_synthetic_y
-    
+
     # Balance normal class
-    if normal_count > 0 and normal_count < target_count:
+    if normal_count >= 0 and current_normal < target_count and normal_mask.any():
         normal_samples = X[normal_mask]
         normal_labels = y[normal_mask]
-        
-        n_synthetic_normal = target_count - normal_count
-        
+
+        n_synthetic_normal = target_count - current_normal
+
         # Use k-NN for normal samples
-        k = min(5, normal_count - 1) if normal_count > 1 else 1
+        normal_sample_count = normal_samples.shape[0]
+        k = min(5, normal_sample_count - 1) if normal_sample_count > 1 else 0
         if k >= 1:
             nn_normal = NearestNeighbors(n_neighbors=k + 1)
             nn_normal.fit(normal_samples)
-            
+
             # Generate in batches
             for batch_start in range(0, n_synthetic_normal, batch_size):
                 batch_end = min(batch_start + batch_size, n_synthetic_normal)
                 batch_synthetic_X = []
                 batch_synthetic_y = []
-                
+
                 for _ in range(batch_end - batch_start):
                     idx = np.random.randint(0, normal_count)
                     sample = normal_samples[idx]
-                    
+
                     distances, indices = nn_normal.kneighbors([sample])
                     neighbor_idx = np.random.randint(1, k + 1)
                     neighbor = normal_samples[indices[0, neighbor_idx]]
-                    
+
                     alpha = np.random.random()
                     synthetic_sample = sample + alpha * (neighbor - sample)
-                    
+
                     # Keep as normal (all zeros)
                     synthetic_label = np.zeros(n_labels, dtype=np.int32)
-                    
+
                     batch_synthetic_X.append(synthetic_sample)
                     batch_synthetic_y.append(synthetic_label)
-                
+
                 if batch_synthetic_X:
-                    all_synthetic_X.append(np.array(batch_synthetic_X, dtype=np.float32))
-                    all_synthetic_y.append(np.array(batch_synthetic_y, dtype=np.int32))
-                    
+                    batch_arr = np.array(batch_synthetic_X, dtype=np.float32)
+                    label_arr = np.array(batch_synthetic_y, dtype=np.int32)
+                    all_synthetic_X.append(batch_arr)
+                    all_synthetic_y.append(label_arr)
+                    current_normal += batch_end - batch_start
                     # Free memory
                     del batch_synthetic_X, batch_synthetic_y
-    
+        else:
+            # Only one normal sample available; duplicate with noise
+            base_sample = normal_samples[0]
+            for batch_start in range(0, n_synthetic_normal, batch_size):
+                batch_end = min(batch_start + batch_size, n_synthetic_normal)
+                batch_len = batch_end - batch_start
+                noise = np.random.normal(
+                    scale=1e-3, size=(batch_len, base_sample.shape[0])
+                ).astype(np.float32)
+                synthetic_batch = base_sample + noise
+                label_batch = np.zeros((batch_len, n_labels), dtype=np.int32)
+                all_synthetic_X.append(synthetic_batch)
+                all_synthetic_y.append(label_batch)
+                current_normal += batch_len
+
     if all_synthetic_X:
         # Combine all batches
         synthetic_X = np.vstack(all_synthetic_X)
         synthetic_y = np.vstack(all_synthetic_y)
-        
+
         # Free intermediate arrays
         del all_synthetic_X, all_synthetic_y
-        
+
         X_combined = np.vstack([X, synthetic_X])
         y_combined = np.vstack([y, synthetic_y])
     else:
         X_combined = X
         y_combined = y
-    
+
     return X_combined, y_combined
 
 
-def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> Optional[np.ndarray]:
+def calibrate_thresholds(
+    model: HierarchicalTransformer, loader: DataLoader
+) -> Optional[np.ndarray]:
     """Calibrates per-class decision thresholds using validation predictions."""
 
     node_names = list(model.node_to_index.keys())
@@ -997,7 +1265,9 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
 
             _, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
             aggregated = model.propagate_labels(outputs)
-            batch_probs = torch.zeros((cls_tokens.size(0), len(node_names)), device=device)
+            batch_probs = torch.zeros(
+                (cls_tokens.size(0), len(node_names)), device=device
+            )
             for name, prob in aggregated.items():
                 idx = model.node_to_index[name]
                 batch_probs[:, idx] = prob.view(-1)
@@ -1029,7 +1299,11 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
             fn = np.logical_and(y_pred == 0, y_true == 1).sum()
             precision = tp / max(tp + fp, 1)
             recall = tp / max(tp + fn, 1)
-            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+            f1 = (
+                0.0
+                if precision + recall == 0
+                else 2 * precision * recall / (precision + recall)
+            )
             if f1 > best_f1 or (f1 == best_f1 and thr > best_threshold):
                 best_f1 = f1
                 best_threshold = thr
@@ -1038,13 +1312,21 @@ def calibrate_thresholds(model: HierarchicalTransformer, loader: DataLoader) -> 
     return thresholds
 
 
-def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.05, lambda_hier=0.02):
+def train_model(
+    model, train_loader, val_loader=None, epochs=10, lambda_recon=0.05, lambda_hier=0.02
+):
     """Trains the transformer with reconstruction and hierarchy regularizers."""
-    train = smote_data(train_loader, val_loader, target_contamination=TARGET_CONTAMINATION)
+    train = smote_data(
+        train_loader, val_loader, target_contamination=TARGET_CONTAMINATION
+    )
     if len(train) == 0:
         train = train_loader
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type=="cuda"))
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train))
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=1e-4, fused=(device.type == "cuda")
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train)
+    )
     mse_loss = nn.MSELoss()
     use_amp = device.type in ["cuda", "mps"]
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -1057,8 +1339,12 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
         c0, m0, x0, a0, _ = next(iter(train))
         c0, m0, x0, a0 = c0.to(device), m0.to(device), x0.to(device), a0.to(device)
         _, _, outs0 = model(c0, m0, x0, a0)
-        label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(len(outs0))]
-        
+        label_names = (
+            list(outs0.keys())
+            if isinstance(outs0, dict)
+            else [f"label_{i}" for i in range(len(outs0))]
+        )
+
         # Collect all targets from augmented dataset to compute accurate class weights
         all_targets = []
         for _, _, _, _, targets in train:
@@ -1079,22 +1365,30 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
             ) -> None:
                 super().__init__()
                 samples = torch.as_tensor(samples_per_class, dtype=torch.float32)
-                self.register_buffer("class_weights", self._compute_weights(samples, beta, eps))
+                self.register_buffer(
+                    "class_weights", self._compute_weights(samples, beta, eps)
+                )
                 self.gamma = float(gamma)
                 self.eps = float(eps)
 
             @staticmethod
-            def _compute_weights(samples: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
+            def _compute_weights(
+                samples: torch.Tensor, beta: float, eps: float
+            ) -> torch.Tensor:
                 samples = torch.clamp(samples, min=1.0)
                 effective_num = 1.0 - torch.pow(beta, samples)
                 weights = (1.0 - beta) / torch.clamp(effective_num, min=eps)
                 weights = weights / torch.clamp(weights.mean(), min=eps)
                 return weights.view(1, -1)
 
-            def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            def forward(
+                self, logits: torch.Tensor, targets: torch.Tensor
+            ) -> torch.Tensor:
                 logits = logits.float()
                 targets = targets.float()
-                ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+                ce_loss = F.binary_cross_entropy_with_logits(
+                    logits, targets, reduction="none"
+                )
                 if self.gamma > 0.0:
                     pt = torch.exp(-ce_loss)
                     ce_loss = ce_loss * torch.pow(1.0 - pt, self.gamma)
@@ -1116,8 +1410,10 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
 
     model.apply(init_weights)
 
-    best_val_loss = float('inf')
-    torch.set_float32_matmul_precision('high') if hasattr(torch, "set_float32_matmul_precision") else None
+    best_val_loss = float("inf")
+    torch.set_float32_matmul_precision("high") if hasattr(
+        torch, "set_float32_matmul_precision"
+    ) else None
 
     for epoch in range(epochs):
         model.train()
@@ -1130,7 +1426,9 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
             targets = targets.to(device, non_blocking=True)
 
             autocast_ctx = (
-                torch.amp.autocast(device_type="cuda") if device.type == "cuda" else nullcontext()
+                torch.amp.autocast(device_type="cuda")
+                if device.type == "cuda"
+                else nullcontext()
             )
             with autocast_ctx:
                 recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
@@ -1141,10 +1439,14 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
 
                 if isinstance(outputs, dict):
                     if outputs:
-                        logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                        logits = torch.cat(
+                            [v.view(v.size(0), -1) for v in outputs.values()], dim=1
+                        )
                     else:
                         # Fallback for empty outputs dict
-                        logits = torch.zeros(targets.size(0), len(label_names), device=device)
+                        logits = torch.zeros(
+                            targets.size(0), len(label_names), device=device
+                        )
                 else:
                     logits = outputs
 
@@ -1155,18 +1457,24 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
                 hier_loss = model.hierarchy_consistency_loss(outputs)
                 hier_loss = torch.clamp(hier_loss, 0, 10.0)
 
-                total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                total_loss = (
+                    lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                )
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=5.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 total_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=5.0
+                )
                 optimizer.step()
 
             scheduler.step()
@@ -1184,21 +1492,32 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
                     max_pooling = max_pooling.to(device, non_blocking=True)
                     attn = attn.to(device, non_blocking=True)
                     targets = targets.to(device, non_blocking=True)
-                    use_cuda_amp = (device.type=="cuda")
+                    use_cuda_amp = device.type == "cuda"
                     ctx = (
-                        torch.amp.autocast(device_type="cuda") if use_cuda_amp else nullcontext()
+                        torch.amp.autocast(device_type="cuda")
+                        if use_cuda_amp
+                        else nullcontext()
                     )
                     with ctx:
-                        recon, z, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
-                        feats = torch.cat([cls_tokens, mean_pooling, max_pooling, attn], dim=1)
+                        recon, z, outputs = model(
+                            cls_tokens, mean_pooling, max_pooling, attn
+                        )
+                        feats = torch.cat(
+                            [cls_tokens, mean_pooling, max_pooling, attn], dim=1
+                        )
                         recon_loss = mse_loss(recon, feats)
                         recon_loss = torch.clamp(recon_loss, 0, 100.0)
 
                         if isinstance(outputs, dict):
                             if outputs:
-                                logits = torch.cat([v.view(v.size(0), -1) for v in outputs.values()], dim=1)
+                                logits = torch.cat(
+                                    [v.view(v.size(0), -1) for v in outputs.values()],
+                                    dim=1,
+                                )
                             else:
-                                logits = torch.zeros(targets.size(0), len(label_names), device=device)
+                                logits = torch.zeros(
+                                    targets.size(0), len(label_names), device=device
+                                )
                         else:
                             logits = outputs
 
@@ -1210,7 +1529,11 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
                         hier_loss = model.hierarchy_consistency_loss(outputs)
                         hier_loss = torch.clamp(hier_loss, 0, 10.0)
 
-                        total_loss = lambda_recon * recon_loss + ml_loss + lambda_hier * hier_loss
+                        total_loss = (
+                            lambda_recon * recon_loss
+                            + ml_loss
+                            + lambda_hier * hier_loss
+                        )
 
                         val_losses.append(total_loss.item())
 
@@ -1223,30 +1546,38 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
-    calibration_loader = val_loader if val_loader is not None and len(val_loader) > 0 else train
+    calibration_loader = (
+        val_loader if val_loader is not None and len(val_loader) > 0 else train
+    )
     thresholds = calibrate_thresholds(model, calibration_loader)
     if thresholds is not None:
         threshold_tensor = torch.from_numpy(thresholds).to(device)
-        if hasattr(model, "decision_thresholds") and model.decision_thresholds.shape[0] == threshold_tensor.shape[0]:
+        if (
+            hasattr(model, "decision_thresholds")
+            and model.decision_thresholds.shape[0] == threshold_tensor.shape[0]
+        ):
             model.decision_thresholds.data.copy_(threshold_tensor)
         else:
-            model.register_buffer("decision_thresholds", threshold_tensor, persistent=False)
+            model.register_buffer(
+                "decision_thresholds", threshold_tensor, persistent=False
+            )
 
     spinner.stop_and_persist(text="Training completed")
     return model
+
 
 def evaluate_model(model, test_loader, log_type, embedding_type=""):
     model.eval()
     all_preds, all_targets = [], []
     node_names = list(model.node_to_index.keys())
-    
+
     with torch.no_grad():
         for cls_tokens, mean_pooling, max_pooling, attn, targets in test_loader:
             cls_tokens = cls_tokens.to(device)
             mean_pooling = mean_pooling.to(device)
             max_pooling = max_pooling.to(device)
             attn = attn.to(device)
-            
+
             _, _, outputs = model(cls_tokens, mean_pooling, max_pooling, attn)
             propagated = model.propagate_labels(outputs)
             thresholds = getattr(model, "decision_thresholds", None)
@@ -1257,14 +1588,16 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
                     threshold = 0.5
                     if thresholds is not None and idx < thresholds.shape[0]:
                         threshold = float(thresholds[idx].item())
-                    batch_preds[:, idx] = (probs >= threshold).cpu().numpy().astype(int).squeeze()
-            
+                    batch_preds[:, idx] = (
+                        (probs >= threshold).cpu().numpy().astype(int).squeeze()
+                    )
+
             all_preds.append(batch_preds)
             all_targets.append(targets.cpu().numpy())
-    
+
     all_preds = np.vstack(all_preds)
     all_targets = np.vstack(all_targets)
-    
+
     print("\n=== Per-Class Metrics ===")
     print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
     print("-" * 67)
@@ -1277,131 +1610,172 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
 
             if y_true.sum() > 0:
                 prec, rec, f1, _ = precision_recall_fscore_support(
-                    y_true, y_pred, average='binary', zero_division=0
+                    y_true, y_pred, average="binary", zero_division=0
                 )
                 class_metrics.append([prec, rec, f1])
                 support = int(y_true.sum())
-                print(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}")
-    
+                print(
+                    f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}"
+                )
+
     print("\n=== Overall Metrics ===")
 
     micro_prec, micro_rec, micro_f1, _ = precision_recall_fscore_support(
-        all_targets.ravel(), all_preds.ravel(), average='micro', zero_division=0
+        all_targets.ravel(), all_preds.ravel(), average="micro", zero_division=0
     )
-    print(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}")
+    print(
+        f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}"
+    )
 
     if class_metrics:
         macro_metrics = np.mean(class_metrics, axis=0)
-        print(f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}")
+        print(
+            f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}"
+        )
 
-    jaccard = jaccard_score(all_targets, all_preds, average='samples', zero_division=0)
+    jaccard = jaccard_score(all_targets, all_preds, average="samples", zero_division=0)
     print(f"Jaccard Score (samples): {jaccard:.3f}")
 
     any_attack_true = (all_targets.sum(axis=1) > 0).astype(int)
     any_attack_pred = (all_preds.sum(axis=1) > 0).astype(int)
-    
+
     if len(np.unique(any_attack_true)) > 1:
         anomaly_prec, anomaly_rec, anomaly_f1, _ = precision_recall_fscore_support(
-            any_attack_true, any_attack_pred, average='binary', zero_division=0
+            any_attack_true, any_attack_pred, average="binary", zero_division=0
         )
-        print(f"\nAnomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}")
-    
+        print(
+            f"\nAnomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}"
+        )
+
     from datetime import datetime
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    
+
     # Include embedding type in filename if specified
     embedding_suffix = f"_{embedding_type}" if embedding_type else ""
-    report_path = results_dir / f"hierarchical_{log_type}{embedding_suffix}_evaluation_{timestamp}.txt"
-    
-    with open(report_path, 'w') as f:
+    report_path = (
+        results_dir
+        / f"hierarchical_{log_type}{embedding_suffix}_evaluation_{timestamp}.txt"
+    )
+
+    with open(report_path, "w") as f:
         f.write(f"Hierarchical Transformer Evaluation Report\n")
         f.write(f"Log Type: {log_type}\n")
         if embedding_type:
             f.write(f"Embedding Type: {embedding_type}\n")
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Dataset: {len(all_targets)} test samples\n")
-        f.write("="*50 + "\n\n")
-        
+        f.write("=" * 50 + "\n\n")
+
         f.write("Per-Class Metrics:\n")
-        f.write(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n")
+        f.write(
+            f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n"
+        )
         f.write("-" * 67 + "\n")
-        
+
         for i, name in enumerate(node_names):
             if i < all_targets.shape[1]:
                 y_true = all_targets[:, i]
                 y_pred = all_preds[:, i]
                 if y_true.sum() > 0:
                     prec, rec, f1, _ = precision_recall_fscore_support(
-                        y_true, y_pred, average='binary', zero_division=0
+                        y_true, y_pred, average="binary", zero_division=0
                     )
                     support = int(y_true.sum())
-                    f.write(f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}\n")
-        
+                    f.write(
+                        f"{name:<25} {prec:>10.3f} {rec:>10.3f} {f1:>10.3f} {support:>10d}\n"
+                    )
+
         f.write(f"\nOverall Metrics:\n")
-        f.write(f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n")
+        f.write(
+            f"Micro-averaged: Precision={micro_prec:.3f}, Recall={micro_rec:.3f}, F1={micro_f1:.3f}\n"
+        )
         if class_metrics:
             macro_metrics = np.mean(class_metrics, axis=0)
-            f.write(f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}\n")
+            f.write(
+                f"Macro-averaged: Precision={macro_metrics[0]:.3f}, Recall={macro_metrics[1]:.3f}, F1={macro_metrics[2]:.3f}\n"
+            )
         f.write(f"Jaccard Score: {jaccard:.3f}\n")
         if len(np.unique(any_attack_true)) > 1:
-            f.write(f"Anomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}\n")
-    
+            f.write(
+                f"Anomaly Detection: Precision={anomaly_prec:.3f}, Recall={anomaly_rec:.3f}, F1={anomaly_f1:.3f}\n"
+            )
+
     print(f"\nEvaluation report saved: {report_path}")
+
 
 def main():
     import time
     from datetime import datetime
-    
+
     print("Hierarchical Transformer for Log Analysis")
     print("=" * 50)
     print("Note: This script requires pre-generated embeddings.")
     print("If you see 'Embeddings not found' errors, please generate embeddings first:")
     print("  - FastText: python src/fasttext_embedding.py --output-subdir fasttext")
-    print("  - Word2Vec: python src/word2vec_embedding.py --output-subdir word2vec") 
+    print("  - Word2Vec: python src/word2vec_embedding.py --output-subdir word2vec")
     print("  - LogBERT: python src/logbert_embeddings.py --output-subdir logbert")
     print("=" * 50)
-    
-    parser = argparse.ArgumentParser(description='Train hierarchical transformer on log embeddings')
-    parser.add_argument('--embedding-type', type=str, default='all', 
-                       choices=['all', 'logbert', 'fasttext', 'word2vec'],
-                       help='Type of embeddings to use (default: all)')
-    parser.add_argument('--log-type', type=str, default=None,
-                       help='Specific log type to process (processes all if not specified)')
-    parser.add_argument('--sample-size', type=int, default=None,
-                       help='Subsample size for processing (processes full dataset if not specified)')
-    
+
+    parser = argparse.ArgumentParser(
+        description="Train hierarchical transformer on log embeddings"
+    )
+    parser.add_argument(
+        "--embedding-type",
+        type=str,
+        default="all",
+        choices=["all", "logbert", "fasttext", "word2vec"],
+        help="Type of embeddings to use (default: all)",
+    )
+    parser.add_argument(
+        "--log-type",
+        type=str,
+        default=None,
+        help="Specific log type to process (processes all if not specified)",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Subsample size for processing (processes full dataset if not specified)",
+    )
+
     args = parser.parse_args()
-    
+
     # Start timing
     overall_start_time = time.time()
     start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
     print("=" * 70)
     print("Stage: Hierarchical Transformer Training")
     print(f"Started: {start_timestamp}")
     print("=" * 70)
-    
+
     # Define embedding loading order
-    embedding_types = ['fasttext', 'word2vec', 'logbert'] if args.embedding_type == 'all' else [args.embedding_type]
-    
+    embedding_types = (
+        ["fasttext", "word2vec", "logbert"]
+        if args.embedding_type == "all"
+        else [args.embedding_type]
+    )
+
     # Track statistics
     models_trained = 0
     log_types_processed = []
-    
+
     for embedding_type in embedding_types:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Processing with {embedding_type} embeddings")
-        print('='*60)
-        
+        print("=" * 60)
+
         # Load embeddings based on type
         try:
-            if embedding_type == 'logbert':
+            if embedding_type == "logbert":
                 embeddings, labels = load_logbert_embeddings(args.log_type)
-            elif embedding_type == 'fasttext':
+            elif embedding_type == "fasttext":
                 embeddings, labels = load_fasttext_embeddings(args.log_type)
-            elif embedding_type == 'word2vec':
+            elif embedding_type == "word2vec":
                 embeddings, labels = load_word2vec_embeddings(args.log_type)
             else:
                 print(f"Unsupported embedding type: {embedding_type}, skipping...")
@@ -1409,34 +1783,40 @@ def main():
         except Exception as e:
             print(f"Failed to load {embedding_type} embeddings: {e}")
             continue
-        
+
         # If a specific log type was requested but not found, skip
         if args.log_type and args.log_type not in embeddings:
-            print(f"Log type '{args.log_type}' not found in {embedding_type} embeddings: {list(embeddings.keys())}")
+            print(
+                f"Log type '{args.log_type}' not found in {embedding_type} embeddings: {list(embeddings.keys())}"
+            )
             continue
-        
+
         datasets = load_datasets(embeddings, labels, embedding_type=embedding_type)
-        
+
         for log_type, data in datasets.items():
-            print(f"\n{'='*50}")
+            print(f"\n{'=' * 50}")
             print(f"Processing {log_type} with {embedding_type} embeddings")
-            print('='*50)
-            
-            dataset = data['loader'].dataset
-            
+            print("=" * 50)
+
+            dataset = data["loader"].dataset
+
             # Apply subsampling if specified
             if args.sample_size and args.sample_size < len(dataset):
-                print(f"Subsampling {args.sample_size} samples from {len(dataset)} total samples")
-                indices = torch.randperm(len(dataset))[:args.sample_size]
+                print(
+                    f"Subsampling {args.sample_size} samples from {len(dataset)} total samples"
+                )
+                indices = torch.randperm(len(dataset))[: args.sample_size]
                 dataset = torch.utils.data.Subset(dataset, indices)
-            
+
             all_targets = torch.stack([dataset[i][4] for i in range(len(dataset))])
-            anomaly_mask = (all_targets.sum(dim=1) > 0)
+            anomaly_mask = all_targets.sum(dim=1) > 0
 
             normal_idx = torch.nonzero(~anomaly_mask, as_tuple=True)[0]
             anomaly_idx = torch.nonzero(anomaly_mask, as_tuple=True)[0]
 
-            def stratified_split(indices: torch.Tensor, train_ratio: float = TRAIN_SPLIT_RATIO):
+            def stratified_split(
+                indices: torch.Tensor, train_ratio: float = TRAIN_SPLIT_RATIO
+            ):
                 n = len(indices)
                 if n == 0:
                     empty = torch.tensor([], dtype=torch.long)
@@ -1450,7 +1830,11 @@ def main():
 
                 perm = torch.randperm(n)
                 train_split = indices[perm[:n_train]]
-                test_split = indices[perm[n_train:]] if n_train < n else torch.tensor([], dtype=torch.long)
+                test_split = (
+                    indices[perm[n_train:]]
+                    if n_train < n
+                    else torch.tensor([], dtype=torch.long)
+                )
                 return train_split, test_split
 
             def concat_indices(chunks: List[torch.Tensor]) -> torch.Tensor:
@@ -1462,14 +1846,18 @@ def main():
             normal_train, normal_test = stratified_split(normal_idx)
 
             if len(normal_train) == 0:
-                print("Insufficient normal samples for training; defaulting to all normal logs.")
+                print(
+                    "Insufficient normal samples for training; defaulting to all normal logs."
+                )
                 normal_train = normal_idx
 
             if len(anomaly_idx) > 0:
                 anomaly_total = len(anomaly_idx)
                 anomaly_train_target = int(round(TRAIN_SPLIT_RATIO * anomaly_total))
                 if anomaly_total > 1:
-                    anomaly_train_target = max(1, min(anomaly_train_target, anomaly_total - 1))
+                    anomaly_train_target = max(
+                        1, min(anomaly_train_target, anomaly_total - 1)
+                    )
                 else:
                     anomaly_train_target = anomaly_total
 
@@ -1480,38 +1868,66 @@ def main():
                 if all_targets.numel() > 0:
                     label_tensor = all_targets.to(dtype=torch.bool, device="cpu")
                     for class_idx in range(label_tensor.shape[1]):
-                        class_indices = torch.nonzero(label_tensor[:, class_idx], as_tuple=True)[0].cpu().numpy()
+                        class_indices = (
+                            torch.nonzero(label_tensor[:, class_idx], as_tuple=True)[0]
+                            .cpu()
+                            .numpy()
+                        )
                         if class_indices.size == 0:
                             continue
-                        class_anomalies = np.intersect1d(class_indices, anomaly_idx_np, assume_unique=False)
+                        class_anomalies = np.intersect1d(
+                            class_indices, anomaly_idx_np, assume_unique=False
+                        )
                         total_class = class_anomalies.size
                         if total_class == 0:
                             continue
                         max_fractional = int(total_class * MAX_CLASS_TRAIN_FRACTION)
                         quota_target = int(round(TRAIN_SPLIT_RATIO * total_class))
-                        train_quota = min(total_class, max(1, min(quota_target, max_fractional)))
+                        train_quota = min(
+                            total_class, max(1, min(quota_target, max_fractional))
+                        )
                         train_quota = min(train_quota, total_class)
-                        sampled = coverage_rng.choice(class_anomalies, size=train_quota, replace=False)
+                        sampled = coverage_rng.choice(
+                            class_anomalies, size=train_quota, replace=False
+                        )
                         coverage_set.update(int(x) for x in sampled)
 
                 coverage_indices = np.array(sorted(coverage_set), dtype=np.int64)
-                coverage_tensor = torch.from_numpy(coverage_indices).to(dtype=torch.long, device=anomaly_idx.device)
+                coverage_tensor = torch.from_numpy(coverage_indices).to(
+                    dtype=torch.long, device=anomaly_idx.device
+                )
                 if coverage_tensor.numel() > anomaly_train_target:
                     perm = coverage_tensor[torch.randperm(coverage_tensor.numel())]
                     anomaly_train = perm[:anomaly_train_target]
                     overflow = perm[anomaly_train_target:]
                     remaining_base = torch.from_numpy(
-                        np.setdiff1d(anomaly_idx_np, anomaly_train.cpu().numpy(), assume_unique=False)
+                        np.setdiff1d(
+                            anomaly_idx_np,
+                            anomaly_train.cpu().numpy(),
+                            assume_unique=False,
+                        )
                     ).to(dtype=torch.long, device=anomaly_idx.device)
                     remaining_anomalies = torch.cat([overflow, remaining_base])
                 else:
-                    remaining_pool_np = np.setdiff1d(anomaly_idx_np, coverage_indices, assume_unique=False)
-                    remaining_pool = torch.from_numpy(remaining_pool_np).to(dtype=torch.long, device=anomaly_idx.device)
+                    remaining_pool_np = np.setdiff1d(
+                        anomaly_idx_np, coverage_indices, assume_unique=False
+                    )
+                    remaining_pool = torch.from_numpy(remaining_pool_np).to(
+                        dtype=torch.long, device=anomaly_idx.device
+                    )
                     if remaining_pool.numel() > 0:
-                        remaining_pool = remaining_pool[torch.randperm(remaining_pool.numel())]
-                    additional_needed = max(0, anomaly_train_target - coverage_tensor.numel())
+                        remaining_pool = remaining_pool[
+                            torch.randperm(remaining_pool.numel())
+                        ]
+                    additional_needed = max(
+                        0, anomaly_train_target - coverage_tensor.numel()
+                    )
                     additional = remaining_pool[:additional_needed]
-                    anomaly_train = concat_indices([coverage_tensor, additional]) if additional.numel() else coverage_tensor
+                    anomaly_train = (
+                        concat_indices([coverage_tensor, additional])
+                        if additional.numel()
+                        else coverage_tensor
+                    )
                     remaining_anomalies = remaining_pool[additional_needed:]
 
                 anomaly_test = remaining_anomalies
@@ -1523,12 +1939,32 @@ def main():
             test_indices = concat_indices([normal_test, anomaly_test])
 
             if len(train_indices) == 0:
-                raise ValueError("Dataset does not contain normal samples for unsupervised training.")
+                raise ValueError(
+                    "Dataset does not contain normal samples for unsupervised training."
+                )
 
             train_set = torch.utils.data.Subset(dataset, train_indices)
-            test_set = torch.utils.data.Subset(dataset, test_indices if len(test_indices) > 0 else train_indices)
-            train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-            test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            test_set = torch.utils.data.Subset(
+                dataset, test_indices if len(test_indices) > 0 else train_indices
+            )
+            train_loader = DataLoader(
+                train_set,
+                batch_size=128,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=(device.type == "cuda"),
+                persistent_workers=True,
+                prefetch_factor=4,
+            )
+            test_loader = DataLoader(
+                test_set,
+                batch_size=128,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=(device.type == "cuda"),
+                persistent_workers=True,
+                prefetch_factor=4,
+            )
 
             print(f"Train: {len(train_set)}, Test: {len(test_set)}")
 
@@ -1536,6 +1972,7 @@ def main():
             if device.type == "cuda":
                 try:
                     import triton  # type: ignore  # noqa: F401
+
                     model = torch.compile(model, mode="max-autotune")
                 except Exception:
                     pass  # Silently fallback to eager mode
@@ -1547,26 +1984,27 @@ def main():
             model_path = f"models/hierarchical_{log_type}_{embedding_type}.pth"
             torch.save(model.state_dict(), model_path)
             print(f"\nModel saved to {model_path}")
-            
+
             models_trained += 1
             if log_type not in log_types_processed:
                 log_types_processed.append(log_type)
-    
+
     # End timing
     overall_end_time = time.time()
     end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     elapsed = overall_end_time - overall_start_time
-    
+
     print("\n" + "=" * 70)
     print(f"Completed: {end_timestamp}")
     if elapsed < 60:
         print(f"Elapsed: {elapsed:.1f}s")
     else:
-        print(f"Elapsed: {elapsed/60:.1f}m")
+        print(f"Elapsed: {elapsed / 60:.1f}m")
     print(f"Embedding types: {len(embedding_types)}")
     print(f"Log types processed: {len(log_types_processed)}")
     print(f"Models trained: {models_trained}")
     print("=" * 70)
+
 
 if __name__ == "__main__":
     main()
