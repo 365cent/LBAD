@@ -35,7 +35,7 @@ help:
 	@echo "📊 DATA PREPARATION:"
 	@echo "  preprocess          Preprocess all log types"
 	@echo "  preprocess-<type>   Preprocess specific log type"
-	@echo "  embeddings          Generate all embeddings (LogBERT + FastText)"
+	@echo "  embeddings          Generate all embeddings (LogBERT + FastText + Word2Vec)"
 	@echo "  embeddings-<type>   Generate embeddings for specific log type"
 	@echo ""
 	@echo "🤖 MODEL TRAINING:"
