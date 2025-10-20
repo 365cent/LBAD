@@ -1,18 +1,13 @@
 # LBAD - Log-Based Anomaly Detection Pipeline
 # ============================================
-# NOTE: supervised_binary.py temporarily DISABLED due to memory issues with large datasets
-# This affects the binary baseline (SMOTE) evaluation step
 
 # Variables
 PYTHON := python
 PIP := pip
 SRC := ./src
 
-# Available log types (override at runtime: make thesis LOG_TYPES="wp-error")
+# Available log types (override at runtime as needed)
 LOG_TYPES := wp-access wp-error dns monitor share vpn audit auth
-
-# Embedding methods to use (override: make thesis EMBEDDINGS="logbert fasttext")
-EMBEDDINGS ?= logbert fasttext word2vec
 
 # Local HF/transformers/torch/matplotlib cache to avoid $HOME/.cache quota issues
 HF_ENV := HF_HOME="$(PWD)/hf_cache" TRANSFORMERS_CACHE="$(PWD)/hf_cache" HUGGINGFACE_HUB_CACHE="$(PWD)/hf_cache" XDG_CACHE_HOME="$(PWD)/.cache" TORCH_HOME="$(PWD)/.cache/torch" MPLCONFIGDIR="$(PWD)/.mplconfig"
@@ -28,13 +23,9 @@ help:
 	@echo "LBAD - Log-Based Anomaly Detection Pipeline"
 	@echo "==========================================="
 	@echo ""
-	@echo "🧪 Thesis orchestration:"
-	@echo "  thesis             Preprocess → generate all embeddings → run models → summarize"
-	@echo "  thesis-<type>      Run thesis pipeline for a specific log type"
-	@echo "  thesis-fast        ⚡ FAST: Run thesis pipeline with 1/10 subset (quick testing)"
-	@echo "  thesis-fast-<type> ⚡ FAST: Run fast pipeline for specific log type"
-	@echo "  quick-test         🚀⚡ SUPER QUICK: Test with wp-error + logbert only (1/10 subset)"
-	@echo "  vars (override): LOG_TYPES=..., EMBEDDINGS=logbert|fasttext|word2vec"
+	@echo "🧪 Orchestration:"
+	@echo "  all                Preprocess → generate embeddings → train → evaluate"
+	@echo "  vars (override): LOG_TYPES=..."
 	@echo ""
 	@echo "🚀 MAIN PIPELINES:"
 	@echo "  pipeline-all        Complete pipeline: preprocess → embeddings → train → evaluate"
@@ -55,20 +46,19 @@ help:
 	@echo "📈 EVALUATION:"
 	@echo "  evaluate            Evaluate all trained models"
 	@echo "  evaluate-<type>     Evaluate specific log type"
-	@echo "  compare             Compare transformer vs f-AnoGAN models"
+	@echo "  compare             Compare transformer models"
 	@echo "  compare-<type>      Compare models for specific log type"
 	@echo ""
 	@echo "🔧 STANDALONE TOOLS:"
 	@echo "  ml-baseline         Run traditional ML baselines (RF, XGBoost, etc.)"
-	@echo "  gan                 Run f-AnoGAN training and evaluation"
-	@echo "  summarize           Aggregate results into results/thesis_summary.json|.md"
-	@echo "  view-data           View processed data and embeddings"
 	@echo "  test                Run tests"
 	@echo ""
 	@echo "🧹 MAINTENANCE:"
 	@echo "  install             Install dependencies"
 	@echo "  clean               Remove cache files"
 	@echo "  clean-models        Remove trained models"
+	@echo "  clean-results       Remove all evaluation results"
+	@echo "  clean-old-results   Remove duplicate old results (keep latest)"
 	@echo "  clean-all           Remove all generated data"
 	@echo ""
 	@echo "Available log types: $(LOG_TYPES)"
@@ -76,6 +66,9 @@ help:
 # =============================================================================
 # Complete Pipelines
 # =============================================================================
+
+# Default full pipeline target
+all: pipeline-all
 
 # Full pipeline for all log types
 pipeline-all: setup-cache preprocess embeddings train evaluate
@@ -110,41 +103,41 @@ preprocess-%: ensure-cache
 # Embeddings generation
 embeddings:
 	@echo "🔄 Generating all embeddings..."
-	$(MAKE) logbert-thesis
-	$(MAKE) fasttext-thesis
-	$(MAKE) word2vec-thesis
+	$(MAKE) logbert
+	$(MAKE) fasttext
+	$(MAKE) word2vec
 
 embeddings-%:
 	@echo "🔄 Generating embeddings for log type: $*"
-	$(MAKE) logbert-thesis-$*
-	$(MAKE) fasttext-thesis-$*
-	$(MAKE) word2vec-thesis-$*
+	$(MAKE) logbert-$*
+	$(MAKE) fasttext-$*
+	$(MAKE) word2vec-$*
 
 # LogBERT embeddings (write to embeddings/logbert/<type>)
-logbert-thesis: ensure-cache
-	@echo "🧠 Generating LogBERT embeddings for all log types (method=logbert)..."
+logbert: ensure-cache
+	@echo "🧠 Generating LogBERT embeddings for all log types..."
 	$(HF_ENV) $(PYTHON) $(SRC)/logbert_embeddings.py --output-subdir logbert
 
-logbert-thesis-%: ensure-cache
-	@echo "🧠 Generating LogBERT embeddings for log type: $* (method=logbert)"
+logbert-%: ensure-cache
+	@echo "🧠 Generating LogBERT embeddings for log type: $*"
 	$(HF_ENV) $(PYTHON) $(SRC)/logbert_embeddings.py --log-type $* --output-subdir logbert
 
 # FastText embeddings (write to embeddings/fasttext/<type>)
-fasttext-thesis:
-	@echo "📝 Generating FastText embeddings for all log types (method=fasttext)..."
+fasttext:
+	@echo "📝 Generating FastText embeddings for all log types..."
 	$(PYTHON) $(SRC)/fasttext_embedding.py --output-subdir fasttext
 
-fasttext-thesis-%:
-	@echo "📝 Generating FastText embeddings for log type: $* (method=fasttext)"
+fasttext-%:
+	@echo "📝 Generating FastText embeddings for log type: $*"
 	$(PYTHON) $(SRC)/fasttext_embedding.py --log-type $* --output-subdir fasttext
 
 # Word2Vec embeddings (write to embeddings/word2vec/<type>)
-word2vec-thesis:
-	@echo "🔤 Generating Word2Vec embeddings for all log types (method=word2vec)..."
+word2vec:
+	@echo "🔤 Generating Word2Vec embeddings for all log types..."
 	$(PYTHON) $(SRC)/word2vec_embedding_thesis.py --output-subdir word2vec
 
-word2vec-thesis-%:
-	@echo "🔤 Generating Word2Vec embeddings for log type: $* (method=word2vec)"
+word2vec-%:
+	@echo "🔤 Generating Word2Vec embeddings for log type: $*"
 	$(PYTHON) $(SRC)/word2vec_embedding_thesis.py --log-type $* --output-subdir word2vec
 
 # =============================================================================
@@ -204,47 +197,10 @@ ml-baseline-%:
 	@echo "📊 Running ML baselines for log type: $*"
 	$(PYTHON) $(SRC)/ml_models.py --log-type $*
 
-# XGBoost with traditional MultiOutputClassifier approach
-xgboost:
-	@echo "🌲 Running XGBoost traditional models..."
-	$(PYTHON) $(SRC)/ml_models.py --with-xgb
-
-xgboost-%:
-	@echo "🌲 Running XGBoost traditional for log type: $*"
-	$(PYTHON) $(SRC)/ml_models.py --log-type $* --with-xgb
-
-# f-AnoGAN (GAN-based anomaly detection)
-gan:
-	@echo "🎭 Running f-AnoGAN training and evaluation..."
-	$(PYTHON) $(SRC)/gan_augmentation.py
-	$(PYTHON) $(SRC)/gan_evaluation.py
-
-gan-train:
-	@echo "🎭 Training f-AnoGAN models..."
-	$(PYTHON) $(SRC)/gan_augmentation.py
-
-gan-eval:
-	@echo "🎭 Evaluating f-AnoGAN models..."
-	$(PYTHON) $(SRC)/gan_evaluation.py
-
-# Data viewing and analysis
-view-data:
-	@echo "👁️  Viewing processed data and embeddings..."
-	$(PYTHON) $(SRC)/pickle_viewer.py
-
-view-embeddings:
-	@echo "👁️  Viewing embedding statistics..."
-	$(PYTHON) $(SRC)/embedding_testing.py
-
 # Testing
 test:
 	@echo "🧪 Running tests..."
-	$(PYTHON) $(SRC)/test_transformer.py
-	$(PYTHON) $(SRC)/test_combined_transformer.py
-
-test-preprocess:
-	@echo "🧪 Testing preprocessing..."
-	$(PYTHON) $(SRC)/preprocess_testing.py
+	@echo "⚠️  No test suite currently configured"
 
 # =============================================================================
 # Development and Maintenance
@@ -288,6 +244,16 @@ clean-results:
 	rm -rf results/*
 	mkdir -p results
 
+clean-old-results:
+	@echo "🧹 Cleaning old duplicate results (keeping latest per combination)..."
+	@find results -name "*.txt" -type f | \
+		sed 's/_[0-9]\{8\}-[0-9]\{6\}\.txt$$//' | \
+		sort | uniq -d | \
+		while read prefix; do \
+			ls -t $$prefix_*.txt 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true; \
+		done
+	@echo "✅ Old results cleaned"
+
 clean-embeddings:
 	@echo "🧹 Removing embeddings..."
 	rm -rf embeddings/*
@@ -304,83 +270,12 @@ clean-all: clean
 	mkdir -p processed embeddings models results checkpoints augmented
 
 # =============================================================================
-# Thesis Orchestration (replaces src/runner.py)
+# Cache Utilities
 # =============================================================================
 
 ensure-cache:
 	@mkdir -p hf_cache .cache/torch .mplconfig gensim_data
 	@echo "✅ Cache directories ensured in project root"
-
-# Prepare legacy layout for a given log type and embedding method, then run models
-define RUN_FOR_METHOD
-	@echo "➡️  Preparing legacy layout for $(1) [method=$(2)]"
-	@mkdir -p embeddings/$(1)
-	@if [ -f embeddings/$(2)/$(1)/log_$(1).pkl ]; then cp -f embeddings/$(2)/$(1)/log_$(1).pkl embeddings/$(1)/log_$(1).pkl; fi
-	@if [ -f embeddings/$(2)/$(1)/label_$(1).pkl ]; then cp -f embeddings/$(2)/$(1)/label_$(1).pkl embeddings/$(1)/label_$(1).pkl; fi
-	@if [ -f embeddings/$(1)/log_$(1).pkl ]; then cp -f embeddings/$(1)/log_$(1).pkl embeddings/$(1)/embeddings.pkl; fi
-	@if [ -f embeddings/$(1)/label_$(1).pkl ]; then \
-    $(PYTHON) -c "import pickle, os; lt='$(1)'; \
-	src=f'embeddings/{lt}/label_{lt}.pkl'; dst=f'embeddings/{lt}/labels.pkl'; \
-	d=pickle.load(open(src,'rb')); arr = d['vectors'] if isinstance(d,dict) and 'vectors' in d else d; \
-	pickle.dump(arr, open(dst,'wb'))" ; \
-	fi
-	@echo "🤖 Running transformer for $(1) [method=$(2)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(1) --use-enhanced-features || true
-	@echo "📊 Running ML baselines for $(1) [method=$(2)]"
-	@$(PYTHON) $(SRC)/ml_models.py --log-type $(1) --embedding-type $(2) --model all --with-xgb || true
-	@echo "⚑ Running binary baseline (SMOTE) for $(1) [method=$(2)]"
-	@$(PYTHON) $(SRC)/supervised_binary.py --log-type $(1) --embedding-type $(2) --pos-ratio 0.5 || true
-endef
-
-thesis: ensure-cache preprocess embeddings
-	@echo "🚀 Running thesis pipeline across methods: $(EMBEDDINGS)"
-	@for LT in $(LOG_TYPES); do \
-		for E in $(EMBEDDINGS); do \
-			$(MAKE) run-method LOG_TYPE=$$LT METHOD=$$E; \
-		done; \
-	done
-	@$(MAKE) summarize
-	@echo "✅ Thesis pipeline completed"
-
-# FAST SUBSET VERSION - 1/10 size for quick testing
-thesis-fast: ensure-cache preprocess embeddings
-	@echo "🚀⚡ Running FAST thesis pipeline (1/10 subset) across methods: $(EMBEDDINGS)"
-	@for LT in $(LOG_TYPES); do \
-		for E in $(EMBEDDINGS); do \
-			$(MAKE) run-method-fast LOG_TYPE=$$LT METHOD=$$E; \
-		done; \
-	done
-	@$(MAKE) summarize
-	@echo "✅ Fast thesis pipeline completed"
-
-thesis-fast-%: ensure-cache preprocess-% embeddings-%
-	@echo "🚀⚡ Running FAST thesis pipeline for log type: $* (1/10 subset) across methods: $(EMBEDDINGS)"
-	@for E in $(EMBEDDINGS); do \
-		$(MAKE) run-method-fast LOG_TYPE=$* METHOD=$$E; \
-	 done
-	@$(MAKE) summarize
-	@echo "✅ Fast thesis pipeline completed for $*"
-
-# SUPER QUICK TEST - single log type with logbert only (for urgent testing)
-quick-test: ensure-cache
-	@echo "🚀⚡ SUPER QUICK TEST: wp-error with logbert embeddings (1/10 subset)"
-	@echo "📊 This will take ~5-10 minutes instead of hours"
-	@$(MAKE) run-method-fast LOG_TYPE=wp-error METHOD=logbert
-	@$(MAKE) summarize
-	@echo "✅ Super quick test completed!"
-	@echo "📁 Check results/wp-error/ for outputs"
-
-thesis-%: ensure-cache preprocess-% embeddings-%
-	@echo "🚀 Running thesis pipeline for log type: $* across methods: $(EMBEDDINGS)"
-	@for E in $(EMBEDDINGS); do \
-		$(MAKE) run-method LOG_TYPE=$* METHOD=$$E; \
-	 done
-	@$(MAKE) summarize
-	@echo "✅ Thesis pipeline completed for $*"
-
-summarize:
-	@echo "🧾 Summarizing results into results/thesis_summary.json|.md"
-	$(HF_ENV) $(PYTHON) $(SRC)/summarize_results.py || true
 
 # =============================================================================
 # Quick Start Examples
@@ -423,7 +318,6 @@ research:
 	@echo "🔬 Running research workflow..."
 	$(MAKE) pipeline-all
 	$(MAKE) ml-baseline
-	$(MAKE) gan
 	$(MAKE) compare
 	@echo "✅ Research workflow completed"
 
@@ -436,19 +330,9 @@ production-%:
 	$(MAKE) evaluate-$*
 	@echo "✅ Production workflow completed for $*"
 
-# Benchmark all models
-benchmark:
-	@echo "⏱️  Running benchmark of all models..."
-	time $(MAKE) train-sample
-	time $(MAKE) ml-baseline
-	time $(MAKE) gan-train
-	$(MAKE) compare
-	@echo "✅ Benchmark completed"
-
-.PHONY: help pipeline-all pipeline-eval preprocess embeddings logbert fasttext train evaluate compare \
-        ml-baseline xgboost gan gan-train gan-eval view-data view-embeddings test test-preprocess \
-        install status clean clean-models clean-results clean-embeddings clean-processed clean-all \
-        quickstart demo research benchmark \
+.PHONY: all help pipeline-all pipeline-eval preprocess embeddings logbert fasttext word2vec train evaluate compare \
+        ml-baseline test install status clean clean-models clean-results clean-old-results clean-embeddings clean-processed clean-all \
+        quickstart demo research \
         $(addprefix pipeline-,$(LOG_TYPES)) \
         $(addprefix preprocess-,$(LOG_TYPES)) \
         $(addprefix embeddings-,$(LOG_TYPES)) \
@@ -460,37 +344,3 @@ benchmark:
         $(addprefix compare-,$(LOG_TYPES)) \
         $(addprefix ml-baseline-,$(LOG_TYPES)) \
         $(addprefix production-,$(LOG_TYPES))
-
-# New concrete rule replacing callable function style to avoid shell multiline issues
-run-method:
-	@echo "➡️  Checking embeddings for $(LOG_TYPE) [method=$(METHOD)]"
-	@if [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ] || [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
-		echo "❌ Missing embeddings for $(LOG_TYPE) in embeddings/$(METHOD). Skipping model runs for this method."; \
-		exit 0; \
-	fi
-	@echo "🤖 Running transformer for $(LOG_TYPE) [method=$(METHOD)] with correct embedding source"
-	@$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --use-enhanced-features || true
-	@echo "📊 Running ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --with-xgb || true
-	@echo "⚑ Running binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
-	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
-	@echo "🔄 Running quick binary baseline instead..."
-	@$(PYTHON) quick_binary_baseline.py || true
-
-# FAST VERSION with 1/10 subset for quick testing
-run-method-fast:
-	@echo "⚡➡️  FAST: Checking embeddings for $(LOG_TYPE) [method=$(METHOD)] - using 1/10 subset"
-	@if [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl ] || [ ! -f embeddings/$(METHOD)/$(LOG_TYPE)/label_$(LOG_TYPE).pkl ]; then \
-		echo "❌ Missing embeddings for $(LOG_TYPE) in embeddings/$(METHOD). Skipping model runs for this method."; \
-		exit 0; \
-	fi
-	@# Calculate subset size (1/10 of dataset, minimum 1000 samples)
-	@SUBSET_SIZE=$$($(PYTHON) -c "import pickle; import numpy as np; data=pickle.load(open('embeddings/$(METHOD)/$(LOG_TYPE)/log_$(LOG_TYPE).pkl','rb')); print(max(1000, len(data)//10))"); \
-	echo "🤖⚡ Running FAST transformer for $(LOG_TYPE) [method=$(METHOD)] with $$SUBSET_SIZE samples"; \
-	$(HF_ENV) $(PYTHON) $(SRC)/transformer.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --sample-size $$SUBSET_SIZE --simple-mode || true
-	@echo "📊⚡ Running FAST ML baselines for $(LOG_TYPE) [method=$(METHOD)]"
-	@$(HF_ENV) $(PYTHON) $(SRC)/ml_models.py --log-type $(LOG_TYPE) --embedding-type $(METHOD) --model all --with-xgb --max-train-samples 10000 || true
-	@echo "⚑⚡ Running FAST binary baseline (SMOTE) for $(LOG_TYPE) [method=$(METHOD)]"
-	@echo "⚠️  Temporarily DISABLED due to memory issues with large datasets"
-	@echo "🔄 Running quick binary baseline instead..."
-	@$(PYTHON) quick_binary_baseline.py || true

@@ -684,10 +684,22 @@ def save_embeddings_and_labels(df, output_dir, log_type_name):
         spinner.warn(f"No binary labels found for {log_type_name}, saved only log embeddings")
 
 def main():
+    import time
+    from datetime import datetime
+    
     parser = argparse.ArgumentParser(description="Generate FastText embeddings for log data using pre-trained vectors")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/ (e.g., 'fasttext')")
     args = parser.parse_args()
+
+    # Start timing
+    start_time = time.time()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print("=" * 70)
+    print("Stage: FastText Embedding Generation")
+    print(f"Started: {start_timestamp}")
+    print("=" * 70)
 
     # Check if gensim library is available
     if not HAS_GENSIM:
@@ -778,6 +790,16 @@ def main():
             print(f"Error processing log type {log_type}: {e}")
             import traceback
             traceback.print_exc()
+    
+    # Track statistics
+    total_samples = 0
+    for log_type in types_to_process:
+        output_dir = OUTPUT_DIR / log_type
+        log_pkl = output_dir / f"log_{log_type}.pkl"
+        if log_pkl.exists():
+            with open(log_pkl, 'rb') as f:
+                data = pickle.load(f)
+                total_samples += len(data) if hasattr(data, '__len__') else 0
 
     # Process combined model if requested
     if run_combined:
@@ -818,9 +840,26 @@ def main():
             import traceback
             traceback.print_exc()
     
-    spinner = Halo(spinner='dots', text='Completing processing')
-    spinner.start()
-    spinner.succeed("FastText embedding processing complete!")
+    # End timing
+    end_time = time.time()
+    end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = end_time - start_time
+    
+    # Calculate throughput
+    throughput = total_samples / elapsed if elapsed > 0 else 0
+    memory_mb = total_samples * 300 * 4 / (1024 * 1024)  # 300D float32
+    
+    print("=" * 70)
+    print(f"Completed: {end_timestamp}")
+    if elapsed < 60:
+        print(f"Elapsed: {elapsed:.1f}s")
+    else:
+        print(f"Elapsed: {elapsed/60:.1f}m")
+    print(f"Log types processed: {len(types_to_process)}")
+    print(f"Total samples: {total_samples:,}")
+    print(f"Throughput: {throughput:.0f} samples/sec")
+    print(f"Memory: {memory_mb:.1f} MB")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()

@@ -29,11 +29,9 @@ except ImportError:
     except ImportError:
         MLSMOTE_AVAILABLE = False
 
-warnings.filterwarnings(
-    "ignore",
-    message="enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True",
-    category=UserWarning,
-)
+# Suppress all warnings for clean console output
+warnings.filterwarnings("ignore")
+os.environ['PYTHONWARNINGS'] = 'ignore'
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 try:
@@ -533,7 +531,7 @@ def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[s
             torch.from_numpy(targets).float()
         )
         
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
         datasets[log_type] = {'loader': loader, 'num_samples': log_vectors.shape[0]}
         
         total = log_vectors.shape[0]
@@ -554,13 +552,8 @@ def load_datasets(embeddings, labels, batch_size=128, embedding_type: Optional[s
 def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2):
     """Applies multi-label SMOTE to generate synthetic samples and returns augmented dataset."""
 
-    spinner = halo.Halo(text="Applying MLSMOTE oversampling", spinner="dots")
+    spinner = halo.Halo(text="Applying SMOTE oversampling", spinner="dots")
     spinner.start()
-    
-    # Debug: Check MLSMOTE availability
-    if not MLSMOTE_AVAILABLE:
-        print("\n  Note: scikit-multilearn not available, will use fallback SMOTE")
-        print("  Install with: pip install scikit-multilearn==0.2.0")
 
     try:
         dataset = getattr(train_loader, "dataset", None)
@@ -579,10 +572,8 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         MEMORY_EFFICIENT_THRESHOLD = 50000
         
         if dataset_size > MEMORY_EFFICIENT_THRESHOLD:
-            print(f"\n  Note: Large dataset ({dataset_size} samples)")
-            print(f"  Using memory-efficient streaming SMOTE (slower but safer)")
-            # Use streaming mode
-            return _streaming_smote(dataset, train_loader, target_contamination)
+            # Use streaming mode for large datasets
+            return _streaming_smote(dataset, train_loader, target_contamination, spinner)
 
         # Extract all tensors
         cls_tensor = base_dataset.tensors[0].detach().cpu()
@@ -615,14 +606,8 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
         n_samples, n_features = X.shape
         n_labels = y.shape[1]
         
-        print(f"\nOriginal dataset: {n_samples} samples, {n_features} features, {n_labels} labels")
-        original_anomaly_count = int((y.sum(axis=1) > 0).sum())
-        print(f"  Normal: {n_samples - original_anomaly_count}, Anomaly: {original_anomaly_count}")
-        
         # Per-class counts before SMOTE
         class_counts_before = y.sum(axis=0)
-        print(f"  Per-class counts (before): min={class_counts_before[class_counts_before > 0].min() if (class_counts_before > 0).any() else 0}, "
-              f"max={class_counts_before.max()}, mean={class_counts_before[class_counts_before > 0].mean() if (class_counts_before > 0).any() else 0:.1f}")
 
         # Apply MLSMOTE if available, otherwise use fallback
         if MLSMOTE_AVAILABLE:
@@ -633,8 +618,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                 # Determine k based on minority class size
                 min_minority_samples = class_counts_before[class_counts_before > 0].min() if (class_counts_before > 0).any() else 5
                 k = min(5, max(1, int(min_minority_samples) - 1))
-                
-                print(f"  Applying MLSMOTE with k={k}...")
                 
                 # MLSMOTE performs iterative balancing - run multiple passes for full balancing
                 X_current = X.copy()
@@ -648,7 +631,6 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     
                     # Stop if already balanced
                     if min_count >= max_count * 0.95:
-                        print(f"    Converged after {iteration} iterations")
                         break
                     
                     # Apply MLSMOTE
@@ -660,66 +642,17 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
                     
                     X_current = X_resampled.toarray().astype(np.float32)
                     y_current = y_resampled.toarray().astype(np.int32)
-                    
-                    new_counts = y_current.sum(axis=0)
-                    print(f"    Iteration {iteration + 1}: min={new_counts[new_counts > 0].min():.0f}, max={new_counts.max():.0f}")
                 
                 X_synth = X_current
                 y_synth = y_current
                 
             except Exception as e:
-                print(f"  MLSMOTE failed ({e}), using fallback method...")
-                import traceback
-                traceback.print_exc()
-                X_synth, y_synth = _fallback_smote(X, y, target_contamination)
+                X_synth, y_synth = _fallback_smote(X, y, target_contamination, spinner=spinner)
         else:
-            print("  MLSMOTE not available, using fallback method...")
-            X_synth, y_synth = _fallback_smote(X, y, target_contamination)
+            X_synth, y_synth = _fallback_smote(X, y, target_contamination, spinner=spinner)
 
         n_synth = X_synth.shape[0]
         n_synthetic_new = n_synth - n_samples
-        print(f"\nAugmented dataset: {n_synth} samples (+{n_synthetic_new} synthetic)")
-        
-        # Per-class counts after SMOTE
-        class_counts_after = y_synth.sum(axis=0)
-        
-        # Get node names for display
-        node_names = list(flatten_hierarchy(hierarchy))
-        
-        # Calculate normal class (samples with no labels)
-        normal_before = int((y.sum(axis=1) == 0).sum())
-        normal_after = int((y_synth.sum(axis=1) == 0).sum())
-        normal_delta = normal_after - normal_before
-        
-        # Build per-class comparison
-        print("\nPer-class distribution (before → after SMOTE):")
-        class_changes = []
-        
-        # Add attack classes
-        for i in range(min(len(node_names), len(class_counts_before))):
-            before = int(class_counts_before[i])
-            after = int(class_counts_after[i])
-            delta = after - before
-            if before > 0 or after > 0:  # Only show classes that have samples
-                class_changes.append((node_names[i], before, after, delta))
-        
-        # Add normal class
-        class_changes.append(("normal", normal_before, normal_after, normal_delta))
-        
-        # Sort by delta (descending absolute value) to show biggest changes first
-        class_changes.sort(key=lambda x: abs(x[3]), reverse=True)
-        
-        for name, before, after, delta in class_changes:
-            if delta > 0:
-                trend = "++"
-                sign = "+"
-            elif delta < 0:
-                trend = "--"
-                sign = ""
-            else:
-                trend = "→"
-                sign = ""
-            print(f"  {name:<25} {after:>8} ({trend} {sign}{delta})")
 
         # Split X_synth back into 4 components
         cls_dim = cls_np.shape[1]
@@ -759,24 +692,19 @@ def smote_data(train_loader, val_loader=None, target_contamination: float = 0.2)
 
         augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
         
-        spinner.stop_and_persist(symbol="✓", text="SMOTE augmentation completed")
+        spinner.stop_and_persist(symbol="✓", text=f"SMOTE completed (+{n_synthetic_new} synthetic samples)")
         return augmented_loader
 
     except Exception as exc:
-        import traceback
-        print(f"\nSMOTE failed: {exc}")
-        traceback.print_exc()
         spinner.stop_and_persist(text="SMOTE failed (fallback to original loader)")
         return train_loader
 
 
-def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
+def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2, spinner=None):
     """Memory-efficient SMOTE for very large datasets.
     
     Processes minority classes one at a time, capping total augmentation.
     """
-    print("  Analyzing class distribution...")
-    
     # Get base dataset
     base_dataset = dataset
     subset_indices = None
@@ -799,12 +727,6 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
     MAX_TARGET = 5000
     target_count = min(int(max_count), MAX_TARGET)
     
-    if max_count > MAX_TARGET:
-        print(f"  Capping target from {int(max_count)} to {MAX_TARGET} per class (memory limit)")
-    
-    print(f"  Target count per class: {target_count}")
-    print(f"  Note: This will take some time for large datasets...")
-    
     # Calculate how much we need to generate for each minority class
     n_labels = y_labels.shape[1]
     classes_to_balance = []
@@ -819,15 +741,13 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
         classes_to_balance.append(('normal', int(normal_count), target_count - int(normal_count)))
     
     if not classes_to_balance:
-        print("  All classes already balanced, no SMOTE needed")
+        if spinner:
+            spinner.stop_and_persist(symbol="✓", text="Classes already balanced, skipping SMOTE")
         return train_loader
-    
-    print(f"  Balancing {len(classes_to_balance)} minority classes")
     
     # Use the fallback SMOTE but on a sampled subset to make it manageable
     # Sample a stratified subset for SMOTE
     SAMPLE_SIZE = 40000
-    print(f"  Sampling {SAMPLE_SIZE} samples for SMOTE balancing...")
     
     # Stratified sampling
     indices = list(range(len(dataset)))
@@ -837,14 +757,6 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
     # Create subset
     sampled_dataset = Subset(base_dataset, sample_indices)
     sampled_loader = DataLoader(sampled_dataset, batch_size=128, shuffle=False)
-    
-    # Now apply regular SMOTE to the subset (which is manageable)
-    print("  Applying SMOTE to sampled subset...")
-    
-    # Fall back to regular smote_data but with the sampled data
-    # This is a workaround - return to regular processing with smaller dataset
-    spinner = halo.Halo(text="Processing sampled data with SMOTE", spinner="dots")
-    spinner.start()
     
     # Extract sampled data
     all_cls, all_mean, all_max, all_attn, all_labels = [], [], [], [], []
@@ -864,7 +776,12 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
     X = np.hstack([cls_np, mean_np, max_np, attn_np])
     
     # Apply fallback SMOTE
-    X_synth, y_synth = _fallback_smote(X, y, target_contamination, batch_size=1000)
+    try:
+        X_synth, y_synth = _fallback_smote(X, y, target_contamination, batch_size=1000, spinner=spinner)
+    except Exception as e:
+        if spinner:
+            spinner.stop_and_persist(text=f"SMOTE failed (fallback to original loader)")
+        return train_loader
     
     # Split back
     cls_dim = cls_np.shape[1]
@@ -904,12 +821,13 @@ def _streaming_smote(dataset, train_loader, target_contamination: float = 0.2):
     augmented_loader = DataLoader(augmented_dataset, **loader_kwargs)
     
     n_synthetic = len(augmented_dataset) - SAMPLE_SIZE
-    spinner.stop_and_persist(symbol="✓", text=f"Streaming SMOTE completed ({SAMPLE_SIZE} sampled, +{n_synthetic} synthetic)")
+    if spinner:
+        spinner.stop_and_persist(symbol="✓", text=f"SMOTE completed (+{n_synthetic} synthetic samples)")
     
     return augmented_loader
 
 
-def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2, batch_size: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 0.2, batch_size: int = 1000, spinner=None) -> Tuple[np.ndarray, np.ndarray]:
     """Fallback SMOTE implementation using label-wise oversampling with multi-label awareness.
     
     Uses batched processing to reduce memory usage.
@@ -935,7 +853,6 @@ def _fallback_smote(X: np.ndarray, y: np.ndarray, target_contamination: float = 
     # If target is too large, cap it at a reasonable size
     max_synthetic_per_class = 5000
     if target_count > max_synthetic_per_class:
-        print(f"    Note: Capping target from {target_count} to {max_synthetic_per_class} per class (memory limit)")
         target_count = max_synthetic_per_class
     
     # Process in batches to save memory
@@ -1132,7 +1049,7 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
     use_amp = device.type in ["cuda", "mps"]
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    spinner = halo.Halo(text="Training hierarchical model", spinner="dots")
+    spinner = halo.Halo(text="Training model", spinner="dots")
     spinner.start()
 
     # Get label names and compute class weights from augmented (SMOTE) training data
@@ -1143,14 +1060,12 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
         label_names = list(outs0.keys()) if isinstance(outs0, dict) else [f"label_{i}" for i in range(len(outs0))]
         
         # Collect all targets from augmented dataset to compute accurate class weights
-        print("Computing class weights from augmented dataset...")
         all_targets = []
         for _, _, _, _, targets in train:
             all_targets.append(targets.cpu())
         Y = torch.cat(all_targets)
 
         class_counts = torch.clamp(Y.sum(dim=0), min=1.0)
-        print(f"  Class counts (augmented): min={class_counts.min():.0f}, max={class_counts.max():.0f}, mean={class_counts.mean():.1f}")
 
         class ClassBalancedEntropyLoss(nn.Module):
             """Class-balanced entropy loss with focal modulation for multi-label targets."""
@@ -1303,11 +1218,7 @@ def train_model(model, train_loader, val_loader=None, epochs=10, lambda_recon=0.
         else:
             avg_val_loss = avg_train_loss
 
-        if (epoch + 1) % max(1, epochs // 20) == 0:
-            if val_loader is not None and len(val_loader) > 0:
-                spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
-            else:
-                spinner.text = f"Epoch {epoch+1}/{epochs} | Train: {avg_train_loss:.6f}"
+        # Keep spinner simple during training - no frequent updates
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -1440,6 +1351,9 @@ def evaluate_model(model, test_loader, log_type, embedding_type=""):
     print(f"\nEvaluation report saved: {report_path}")
 
 def main():
+    import time
+    from datetime import datetime
+    
     print("Hierarchical Transformer for Log Analysis")
     print("=" * 50)
     print("Note: This script requires pre-generated embeddings.")
@@ -1460,8 +1374,21 @@ def main():
     
     args = parser.parse_args()
     
+    # Start timing
+    overall_start_time = time.time()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print("=" * 70)
+    print("Stage: Hierarchical Transformer Training")
+    print(f"Started: {start_timestamp}")
+    print("=" * 70)
+    
     # Define embedding loading order
     embedding_types = ['fasttext', 'word2vec', 'logbert'] if args.embedding_type == 'all' else [args.embedding_type]
+    
+    # Track statistics
+    models_trained = 0
+    log_types_processed = []
     
     for embedding_type in embedding_types:
         print(f"\n{'='*60}")
@@ -1600,8 +1527,8 @@ def main():
 
             train_set = torch.utils.data.Subset(dataset, train_indices)
             test_set = torch.utils.data.Subset(dataset, test_indices if len(test_indices) > 0 else train_indices)
-            train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
-            test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=8, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
+            test_loader  = DataLoader(test_set,  batch_size=128, shuffle=False, num_workers=4, pin_memory=(device.type=="cuda"), persistent_workers=True, prefetch_factor=4)
 
             print(f"Train: {len(train_set)}, Test: {len(test_set)}")
 
@@ -1611,7 +1538,7 @@ def main():
                     import triton  # type: ignore  # noqa: F401
                     model = torch.compile(model, mode="max-autotune")
                 except Exception:
-                    print("Triton not available or compile failed; using eager mode.")
+                    pass  # Silently fallback to eager mode
             model = train_model(model, train_loader, val_loader=None, epochs=10)
 
             evaluate_model(model, test_loader, log_type, embedding_type)
@@ -1620,6 +1547,26 @@ def main():
             model_path = f"models/hierarchical_{log_type}_{embedding_type}.pth"
             torch.save(model.state_dict(), model_path)
             print(f"\nModel saved to {model_path}")
+            
+            models_trained += 1
+            if log_type not in log_types_processed:
+                log_types_processed.append(log_type)
+    
+    # End timing
+    overall_end_time = time.time()
+    end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = overall_end_time - overall_start_time
+    
+    print("\n" + "=" * 70)
+    print(f"Completed: {end_timestamp}")
+    if elapsed < 60:
+        print(f"Elapsed: {elapsed:.1f}s")
+    else:
+        print(f"Elapsed: {elapsed/60:.1f}m")
+    print(f"Embedding types: {len(embedding_types)}")
+    print(f"Log types processed: {len(log_types_processed)}")
+    print(f"Models trained: {models_trained}")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()

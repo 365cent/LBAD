@@ -401,9 +401,21 @@ class LogPreprocessor:
 
 def main():
     import argparse
+    import time
+    from datetime import datetime
+    
     parser = argparse.ArgumentParser(description="Preprocess log files into TFRecord format")
     parser.add_argument("--log-type", type=str, default=None, help="Process only this specific log type")
     args = parser.parse_args()
+    
+    # Start timing
+    start_time = time.time()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print("=" * 70)
+    print("Stage: Log Preprocessing")
+    print(f"Started: {start_timestamp}")
+    print("=" * 70)
     
     preprocessor = LogPreprocessor()
     
@@ -427,9 +439,26 @@ def main():
                     processed_count += 1
         
         print(f"Processed {processed_count} files for log type '{args.log_type}'")
+        total_files = processed_count
     else:
         # Process all log types
         preprocessor.batch_process()
+        # Count total processed files
+        total_files = sum(1 for _ in preprocessor.output_dir.rglob("*.tfrecord"))
+    
+    # End timing
+    end_time = time.time()
+    end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = end_time - start_time
+    
+    print("=" * 70)
+    print(f"Completed: {end_timestamp}")
+    if elapsed < 60:
+        print(f"Elapsed: {elapsed:.1f}s")
+    else:
+        print(f"Elapsed: {elapsed/60:.1f}m")
+    print(f"Files processed: {total_files}")
+    print("=" * 70)
 
 if __name__ == '__main__':
     main()

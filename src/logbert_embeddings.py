@@ -358,6 +358,9 @@ def display_data_distribution(df: pd.DataFrame, *, log_type: str) -> None:
 
 
 def main() -> None:
+    import time
+    from datetime import datetime
+    
     parser = argparse.ArgumentParser(
         description="Generate BERT CLS embeddings for log data (LogBERT-style)"
     )
@@ -365,6 +368,15 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Embedding batch size")
     parser.add_argument("--output-subdir", type=str, default=None, help="Optional subdirectory under embeddings/")
     args = parser.parse_args()
+
+    # Start timing
+    start_time = time.time()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print("=" * 70)
+    print("Stage: LogBERT Embedding Generation")
+    print(f"Started: {start_timestamp}")
+    print("=" * 70)
 
     if not HAS_TRANSFORMERS:
         print("❌ transformers library not available. Please install it:")
@@ -424,6 +436,37 @@ def main() -> None:
             import traceback
 
             traceback.print_exc()
+    
+    # Track statistics
+    total_samples = 0
+    for log_type in types_to_process:
+        type_output_dir = output_dir / log_type
+        log_pkl = type_output_dir / f"log_{log_type}.pkl"
+        if log_pkl.exists():
+            with open(log_pkl, 'rb') as f:
+                data = pickle.load(f)
+                total_samples += len(data) if hasattr(data, '__len__') else 0
+    
+    # End timing
+    end_time = time.time()
+    end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = end_time - start_time
+    
+    # Calculate throughput
+    throughput = total_samples / elapsed if elapsed > 0 else 0
+    memory_mb = total_samples * 768 * 4 / (1024 * 1024)  # 768D float32
+    
+    print("=" * 70)
+    print(f"Completed: {end_timestamp}")
+    if elapsed < 60:
+        print(f"Elapsed: {elapsed:.1f}s")
+    else:
+        print(f"Elapsed: {elapsed/60:.1f}m")
+    print(f"Log types processed: {len(types_to_process)}")
+    print(f"Total samples: {total_samples:,}")
+    print(f"Throughput: {throughput:.0f} samples/sec")
+    print(f"Memory: {memory_mb:.1f} MB")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

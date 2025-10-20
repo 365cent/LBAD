@@ -641,7 +641,18 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def main() -> None:
+    from datetime import datetime
+    
     args = parse_arguments()
+
+    # Start timing
+    start_time = time.perf_counter()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    print("=" * 70)
+    print("Stage: ML Baseline Models")
+    print(f"Started: {start_timestamp}")
+    print("=" * 70)
 
     any_requested = any(
         [args.xgb, args.random_forest, args.logistic, args.linear]
@@ -680,6 +691,10 @@ def main() -> None:
         "word2vec": load_word2vec_embeddings,
         "logbert": load_logbert_embeddings,
     }
+    
+    # Track statistics
+    models_trained = 0
+    log_types_processed = []
 
     for embedding_type in embedding_order:
         print("\n" + "=" * 60)
@@ -706,6 +721,28 @@ def main() -> None:
             target_log_type=args.log_type,
             sample_size=args.sample_size,
         )
+        
+        # Count models trained
+        model_count = sum([config.include_logistic, config.include_linear, 
+                          config.include_random_forest, config.include_xgb])
+        models_trained += model_count * len(embeddings)
+        log_types_processed.extend([lt for lt in embeddings.keys() if lt not in log_types_processed])
+    
+    # End timing
+    end_time = time.perf_counter()
+    end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = end_time - start_time
+    
+    print("\n" + "=" * 70)
+    print(f"Completed: {end_timestamp}")
+    if elapsed < 60:
+        print(f"Elapsed: {elapsed:.1f}s")
+    else:
+        print(f"Elapsed: {elapsed/60:.1f}m")
+    print(f"Embedding types: {len(embedding_order)}")
+    print(f"Log types processed: {len(log_types_processed)}")
+    print(f"Models trained: {models_trained}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

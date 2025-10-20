@@ -75,10 +75,15 @@ flowchart TD
 
 ```bash
 make install                 # install requirements
-make preprocess-wp-error     # build TFRecords from logs/ + labels/
-make logbert-thesis-wp-error # generate LogBERT embeddings to embeddings/logbert/wp-error
-make train-wp-error          # train transformer (uses legacy layout prepared by Makefile)
-make evaluate-wp-error       # evaluate transformer on embeddings/wp-error
+
+# Run a quick test (5-10 minutes)
+make quick-test              # test with wp-error + logbert (1/10 subset)
+
+# Or run full pipeline for one log type (15-30 minutes)
+make thesis-fast-wp-error    # wp-error with all embeddings (1/10 subset)
+
+# Or run complete thesis pipeline (2-4 hours)
+make thesis                  # all log types, all embeddings, all models
 ```
 
 Tip: Run `make help` for a full command reference.
@@ -107,6 +112,10 @@ The Makefile orchestrates the full workflow. Key targets:
 ```bash
 make pipeline-all              # preprocess → embeddings → train → evaluate (all types)
 make pipeline-<type>           # full pipeline for one type (e.g., wp-error)
+make thesis                    # complete thesis pipeline: all embeddings + all models
+make thesis-<type>             # thesis pipeline for specific log type
+make thesis-fast               # fast pipeline with 1/10 subset (quick testing)
+make thesis-fast-<type>        # fast pipeline for specific log type
 make embeddings                # generate embeddings for all types (logbert, fasttext, word2vec)
 make embeddings-<type>         # embeddings for a single type
 make logbert-thesis[-<type>]   # LogBERT embeddings → embeddings/logbert/<type>
@@ -114,15 +123,15 @@ make fasttext-thesis[-<type>]  # FastText embeddings → embeddings/fasttext/<ty
 make word2vec-thesis[-<type>]  # Word2Vec embeddings → embeddings/word2vec/<type>
 make train[-<type>]            # transformer training
 make train-<type>-sample       # training with sample size (faster)
-make evaluate[-<type>]         # evaluation
 make ml-baseline[-<type>]      # traditional ML baselines
-make summarize                 # aggregate results
 make status                    # show available data/artifacts
+make clean-old-results         # remove duplicate old results (keep latest)
 ```
 
 Notes
 - Thesis runners will also prepare a legacy layout under `embeddings/<type>/` so `src/transformer.py` can auto-discover files.
 - Override variables: `make thesis LOG_TYPES="wp-error" EMBEDDINGS="logbert fasttext"`.
+- All scripts output detailed timing and performance metrics.
 
 ## Data Preparation (TFRecords)
 
@@ -210,14 +219,8 @@ Artifacts:
 
 ## Evaluation
 
-Transformer evaluation: `src/evaluate_models.py`
-```bash
-python src/evaluate_models.py --log-type wp-error [--optimize-thresholds]
-```
-Behavior
-- Uses cached predictions from `results/<type>/predictions.pkl` when present
-- Otherwise loads model + embeddings and evaluates; can auto-optimize per-class thresholds
-- Saves detailed metrics and report to `results/<type>/`
+Transformer evaluation is integrated into the training script (`src/transformer.py`).
+Evaluation metrics are automatically computed and saved to `results/hierarchical_<type>_<embedding>_evaluation_<timestamp>.txt`.
 
 Baselines: `src/ml_models.py`
 ```bash
@@ -227,17 +230,47 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
 - Uses MultiOutputClassifier/MultiOutputRegressor wrappers for multi-label support
 - Generates detailed reports under `results/baseline_<model>_<type>_<embedding>_evaluation_<timestamp>.txt`
 
+## Hardware Requirements
+
+**Minimum:**
+- CPU: 4 cores
+- RAM: 8GB
+- Storage: 5GB free space
+
+**Recommended:**
+- CPU: 8+ cores (Apple M2 or Intel i7/i9)
+- RAM: 16GB+
+- GPU: Apple Silicon (MPS) or NVIDIA GPU with 8GB+ VRAM
+- Storage: 10GB free space
+
+**Supported Devices:**
+- Apple Silicon (M1/M2/M3) with MPS acceleration
+- NVIDIA GPUs with CUDA support
+- CPU-only mode (slower but functional)
+
 ## Performance & Caching
 
 - Hugging Face/torch cache redirected to `hf_cache/` and `.cache/torch/`; gensim/matplotlib use `./gensim_data` and `./.mplconfig`
 - MPS (Apple Silicon) and CUDA supported; batch sizes auto-tuned
 - LogBERT extractor emits CLS-only vectors and can checkpoint progress for long runs
 
+## Performance Benchmarks
+
+Typical execution times on Apple M2 (16GB):
+- **Preprocessing**: ~5-10s per log type (depends on size)
+- **FastText Embeddings**: ~30-60s per log type
+- **Word2Vec Embeddings**: ~30-60s per log type  
+- **LogBERT Embeddings**: ~2-5m per log type (GPU accelerated)
+- **Transformer Training**: ~1-3m per model (10 epochs)
+- **ML Baselines**: ~30s-2m per log type (depends on model)
+
+Full thesis pipeline (all embeddings + all models): ~15-30 minutes for wp-error
+
 ## Troubleshooting
 
 - Embeddings not found: ensure `embeddings/<method>/<type>/log_<type>.pkl` and `label_<type>.pkl` exist
 - Training uses legacy layout under `embeddings/<type>/`; Makefile thesis targets prepare this automatically
-- Shape mismatches on eval: evaluator will attempt safe fixes; regenerate predictions if needed
+- For memory issues with large datasets, use `--sample-size` parameter
 
 ## Technical Specifications & Findings
 
@@ -249,7 +282,6 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
   - fasttext_embedding.py - 300D pre-trained FastText embeddings
   - word2vec_embedding.py - 300D pre-trained Word2Vec embeddings
   - transformer.py - Hierarchical multi-label transformer with balanced sampling
-  - evaluate_models.py - Comprehensive evaluation with threshold optimization
   - ml_models.py - Classical ML baselines (LR, Linear, RF, XGBoost)
 
 ### Embedding Specifications
@@ -313,6 +345,20 @@ python src/ml_models.py [--embedding-type {fasttext,word2vec,logbert,all}] [--lo
 - `TARGET_CONTAMINATION = 0.2`: Desired anomaly ratio (not strictly enforced)
 - `TRAIN_SPLIT_RATIO = 0.8`: Train/test split ratio with stratification
 - `MAX_CLASS_TRAIN_FRACTION = 0.8`: Maximum proportion of any class allocated to training
+
+## Validation
+
+Before running the pipeline, validate your setup:
+```bash
+./validate_pipeline.sh
+```
+
+This script checks:
+- Python installation and version
+- Required directory structure
+- Python package dependencies
+- Existing embeddings and models
+- Estimated pipeline execution times
 
 ## License
 
